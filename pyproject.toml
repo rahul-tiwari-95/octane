@@ -1,0 +1,44 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "octane"
+version = "0.1.0"
+description = "Local-first agentic operating system for Apple Silicon"
+requires-python = ">=3.12"
+dependencies = [
+    "httpx>=0.27",
+    "typer[all]>=0.12",
+    "rich>=13.0",
+    "structlog>=24.0",
+    "pydantic>=2.0",
+    "pydantic-settings>=2.0",
+    "psutil>=5.9",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "ruff>=0.5",
+]
+full = [
+    "asyncpg>=0.29",
+    "trafilatura>=1.8",
+    "shadow-task>=0.3",
+]
+
+[project.scripts]
+octane = "octane.main:app"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+
+[tool.hatch.build.targets.wheel]
+packages = ["octane"]
