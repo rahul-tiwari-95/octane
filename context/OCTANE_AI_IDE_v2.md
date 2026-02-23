@@ -20,6 +20,8 @@ Octane is a **local-first agentic operating system** for Apple Silicon. It is NO
 3. OSA is involved in EVERY state transition (no direct agent-to-agent communication)
 4. Deterministic where possible, LLM-powered where necessary
 5. Every action is traceable via Synapse events
+6. Human-in-the-loop for high-risk/low-confidence decisions — the system knows when to ask
+7. Checkpoints enable revert without losing completed work
 
 ---
 
@@ -28,59 +30,69 @@ Octane is a **local-first agentic operating system** for Apple Silicon. It is NO
 ```
 User Query (CLI)
       ↓
-┌─────────────────────────────────────────────────────────────┐
-│                         O S A                                │
-│            (Orchestrator & Synapse Agent)                     │
-│                                                              │
-│  ┌────────────┐ ┌──────────┐ ┌───────────┐ ┌─────────────┐ │
-│  │ Decomposer │ │  Router  │ │ Evaluator │ │   Guard     │ │
-│  │(big model) │ │(determin)│ │(big model)│ │  (hybrid)   │ │
-│  └─────┬──────┘ └────┬─────┘ └─────┬─────┘ └──────┬──────┘ │
-│        │             │             │               │         │
-│  ┌─────┴─────────────┴─────────────┴───────────────┴──────┐ │
-│  │              Synapse EventBus                           │ │
-│  │   (structured ingress/egress logs, correlation IDs,     │ │
-│  │    reasoning traces, token counts, timing)              │ │
-│  └─────────────────────┬───────────────────────────────────┘ │
-│                        │                                     │
-│  ┌─────────────────────┴───────────────────────────────────┐ │
-│  │           Shadows Task Orchestration                     │ │
-│  │   (Redis Streams, at-least-once delivery, scheduling,   │ │
-│  │    retries, perpetual tasks, idempotent keys)           │ │
-│  └─────────────────────┬───────────────────────────────────┘ │
-│  ┌──────────────┐      │                                     │
-│  │Policy Engine │      │  (deterministic rules,              │
-│  │              │      │   max retries, HITL triggers)       │
-│  └──────────────┘      │                                     │
-└────────────────────────┼─────────────────────────────────────┘
-                         │
-        ┌────────┬───────┼────────┬─────────────┐
-        ↓        ↓       ↓        ↓             ↓
-   ┌────────┐┌───────┐┌───────┐┌────────┐┌──────────┐
-   │  Web   ││ Code  ││Memory ││SysStat ││  P & L   │
-   │ Agent  ││ Agent ││Agent  ││ Agent  ││  Agent   │
-   │        ││       ││       ││        ││          │
-   │ Query  ││Planner││Router ││Monitor ││Pref Mgr  │
-   │ Strat. ││Writer ││(Hot/  ││Model   ││Feedback  │
-   │ Fetch. ││Exec.  ││Warm/  ││Mgr     ││Learner   │
-   │ Browsr ││Debug. ││Cold)  ││Scaler  ││Profile   │
-   │ Synth. ││Valid. ││Writer ││        ││          │
-   │        ││       ││Janitr ││        ││          │
-   └────────┘└───────┘└───────┘└────────┘└──────────┘
+┌──────────────────────────────────────────────────────────────────────┐
+│                              O S A                                    │
+│                 (Orchestrator & Synapse Agent)                         │
+│                                                                       │
+│  ┌────────────┐ ┌──────────┐ ┌───────────┐ ┌─────────┐ ┌──────────┐│
+│  │ Decomposer │ │  Router  │ │ Evaluator │ │  Guard  │ │   HIL    ││
+│  │(big model) │ │(determin)│ │(big model)│ │(hybrid) │ │ Manager  ││
+│  └────────────┘ └──────────┘ └───────────┘ └─────────┘ └──────────┘│
+│  ┌──────────────┐ ┌────────────────────┐                            │
+│  │Policy Engine │ │Checkpoint Manager  │                            │
+│  │(deterministic│ │(snapshots + revert)│                            │
+│  └──────────────┘ └────────────────────┘                            │
+│                                                                      │
+│  ┌──────────────────────────────────────────────────────────────┐   │
+│  │                    Synapse EventBus                           │   │
+│  │   (ingress/egress logs, correlation IDs, reasoning traces,   │   │
+│  │    token counts, timing, decision ledger)                    │   │
+│  └──────────────────────────┬───────────────────────────────────┘   │
+│                              │                                       │
+│  ┌──────────────────────────┴───────────────────────────────────┐   │
+│  │               Shadows Task Orchestration                      │   │
+│  │   (Redis Streams, at-least-once delivery, scheduling,        │   │
+│  │    retries, perpetual tasks, idempotent keys)                │   │
+│  └──────────────────────────┬───────────────────────────────────┘   │
+└─────────────────────────────┼────────────────────────────────────────┘
+                              │
+         ┌────────┬───────────┼──────────┬─────────────┐
+         ↓        ↓           ↓          ↓             ↓
+    ┌────────┐┌───────┐ ┌──────────┐┌────────┐ ┌──────────┐
+    │  Web   ││ Code  │ │  Memory  ││SysStat │ │  P & L   │
+    │ Agent  ││ Agent │ │  Agent   ││ Agent  │ │  Agent   │
+    │        ││       │ │          ││        │ │          │
+    │ Query  ││Planner│ │ Router   ││Monitor │ │Pref Mgr  │
+    │ Strat. ││Writer │ │ (Hot/    ││Model   │ │Feedback  │
+    │ Fetch. ││Exec.  │ │  Warm/   ││Mgr     │ │Learner   │
+    │ Browsr ││Debug. │ │  Cold)   ││Scaler  │ │Profile   │
+    │ Synth. ││Valid. │ │ Writer   ││        │ │          │
+    │        ││       │ │ Janitor  ││        │ │          │
+    └────────┘└───────┘ └──────────┘└────────┘ └──────────┘
 ```
 
 ### Flow Rule
 ```
 User → OSA.Guard (parallel safety check)
      → OSA.Decomposer (query → task DAG)
+     → ★ CHECKPOINT #1 created (plan checkpoint)
+     → OSA.PolicyEngine assigns risk levels to each task
+     → OSA.HILManager reviews high-risk/low-confidence decisions
+        → If BLOCKED: pause, ask human, resume
+        → If HIGH-RISK: present Decision Ledger, await approval
+        → If LOW-RISK + high confidence: auto-approve
      → OSA.Router (task → agent mapping)
      → Shadows dispatch (parallel agent execution)
+     → ★ CHECKPOINT #2 created (pre-execution, per high-risk task)
      → Agents execute (each with internal sub-agents)
      → Results return to OSA via Synapse events
+     → ★ CHECKPOINT #3 created (post-execution, before synthesis)
      → OSA.Evaluator (quality gate)
+        → If user DECLINED a decision: revert to checkpoint, re-plan
+        → If quality insufficient: re-execute failed steps
      → P&L consulted for personalization
      → Output to user
-     → P&L records feedback
+     → P&L records feedback (approve/decline/time-spent signals)
      → Memory.Writer decides what to persist
 ```
 
@@ -343,6 +355,187 @@ class TaskDAG(BaseModel):
     reasoning: str = ""              # Decomposer's reasoning for this decomposition
 ```
 
+### Decision — For the Decision Ledger
+
+```python
+class Decision(BaseModel):
+    """A single decision made by OSA during pipeline execution.
+    Logged in the Decision Ledger. May require human approval."""
+    
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    correlation_id: str
+    timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    
+    # What
+    action: str                          # Human-readable: "Route to Web Agent for AMD comparison"
+    reasoning: str                       # Why the agent made this choice
+    
+    # Risk assessment (set by PolicyEngine)
+    risk_level: str = "low"              # "low" | "medium" | "high" | "critical"
+    confidence: float = 1.0              # 0.0 to 1.0
+    uncertainty_reason: str = ""         # Why confidence < 1.0
+    
+    # Evidence
+    sources: list[str] = Field(default_factory=list)  # URLs, memory IDs, references
+    code_preview: str | None = None      # If Code Agent action, show the code
+    
+    # Status (updated by HIL Manager)
+    status: str = "pending"              # pending | auto_approved | human_approved |
+                                         # human_modified | human_declined
+    human_feedback: str = ""             # User's modification or reason for decline
+    
+    # Linkage
+    task_id: str = ""                    # Which TaskNode in the DAG
+    reversible: bool = True              # Can this be undone after execution?
+
+class DecisionLedger(BaseModel):
+    """All decisions for a single pipeline execution."""
+    correlation_id: str
+    decisions: list[Decision] = Field(default_factory=list)
+    
+    @property
+    def needs_human_review(self) -> list[Decision]:
+        return [d for d in self.decisions if d.status == "pending" 
+                and (d.risk_level in ("high", "critical") or d.confidence < 0.6)]
+    
+    @property
+    def auto_approved(self) -> list[Decision]:
+        return [d for d in self.decisions if d.status == "auto_approved"]
+```
+
+### Checkpoint — For pipeline state snapshots
+
+```python
+class Checkpoint(BaseModel):
+    """Snapshot of pipeline state at a decision point.
+    Enables revert-to-checkpoint when user declines a decision."""
+    
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    correlation_id: str
+    timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    checkpoint_type: str                 # "plan" | "pre_execution" | "post_execution" | "pre_synthesis"
+    
+    # Pipeline state
+    dag: TaskDAG
+    completed_tasks: list[str] = Field(default_factory=list)
+    pending_tasks: list[str] = Field(default_factory=list)
+    
+    # Results so far (preserved on revert — no re-fetching)
+    accumulated_results: dict[str, Any] = Field(default_factory=dict)
+    
+    # Decision state
+    decisions: list[Decision] = Field(default_factory=list)
+    approved_decisions: list[str] = Field(default_factory=list)
+    
+    # Context
+    memory_context: dict[str, Any] = Field(default_factory=dict)
+    pnl_profile: dict[str, Any] = Field(default_factory=dict)
+    synapse_events: list[SynapseEvent] = Field(default_factory=list)
+```
+
+### HIL Manager — Patterns
+
+```python
+class HILManager:
+    """Manages Human-in-the-Loop interactions.
+    
+    Three trigger categories:
+    - BLOCKED: System cannot proceed (captcha, auth, missing info). Must ask.
+    - HIGH-STAKES: Irreversible/consequential action. Should ask.
+    - CONFIDENCE: Accumulated uncertainty exceeds threshold. Can ask.
+    """
+    
+    async def review(
+        self, 
+        decisions: list[Decision], 
+        profile: UserProfile,
+        correlation_id: str,
+    ) -> list[Decision]:
+        """Present decisions needing review to the user.
+        Returns decisions with updated status (approved/modified/declined)."""
+        
+        for decision in decisions:
+            if self._should_auto_approve(decision, profile):
+                decision.status = "auto_approved"
+            elif decision.risk_level in ("high", "critical") or decision.confidence < 0.6:
+                # Present to user via CLI
+                decision = await self._present_decision(decision)
+            else:
+                decision.status = "auto_approved"
+        
+        return decisions
+    
+    def _should_auto_approve(self, decision: Decision, profile: UserProfile) -> bool:
+        """PolicyEngine rules for auto-approval."""
+        hil_level = profile.metadata.get("hil_level", "balanced")
+        
+        if hil_level == "relaxed":
+            return decision.risk_level in ("low", "medium")
+        elif hil_level == "balanced":
+            return (decision.risk_level == "low" and decision.confidence > 0.85)
+        elif hil_level == "strict":
+            return (decision.risk_level == "low" and decision.reversible)
+        return False
+    
+    async def handle_blocked(self, block_reason: str, context: dict) -> dict:
+        """Handle blocked scenario — ask human for help.
+        
+        Examples:
+        - Captcha: open browser for human to solve
+        - Auth required: ask human to log in, then extract data
+        - Ambiguous instruction: ask for clarification
+        """
+        ...
+```
+
+### Checkpoint Manager — Patterns
+
+```python
+class CheckpointManager:
+    """Creates, stores, and restores pipeline state snapshots.
+    
+    Checkpoints are created at:
+    1. After decomposition (plan checkpoint)
+    2. Before each high-risk task execution
+    3. After parallel group completion
+    4. Before final synthesis
+    """
+    
+    def __init__(self):
+        self._checkpoints: dict[str, list[Checkpoint]] = {}  # correlation_id → checkpoints
+    
+    async def create(
+        self,
+        correlation_id: str,
+        dag: TaskDAG,
+        results: dict[str, Any],
+        decisions: list[Decision],
+        checkpoint_type: str = "plan",
+    ) -> Checkpoint:
+        """Create and store a checkpoint."""
+        cp = Checkpoint(
+            correlation_id=correlation_id,
+            checkpoint_type=checkpoint_type,
+            dag=dag,
+            completed_tasks=list(results.keys()),
+            pending_tasks=[n.id for n in dag.nodes if n.id not in results],
+            accumulated_results=results,
+            decisions=decisions,
+        )
+        self._checkpoints.setdefault(correlation_id, []).append(cp)
+        return cp
+    
+    async def revert(self, correlation_id: str, checkpoint_id: str) -> Checkpoint:
+        """Restore pipeline state to a previous checkpoint.
+        All accumulated_results up to this point are PRESERVED."""
+        checkpoints = self._checkpoints.get(correlation_id, [])
+        target = next(cp for cp in checkpoints if cp.id == checkpoint_id)
+        # Discard checkpoints after this one
+        idx = checkpoints.index(target)
+        self._checkpoints[correlation_id] = checkpoints[:idx + 1]
+        return target
+```
+
 ---
 
 ## 📋 AGENT SPECIFICATIONS
@@ -356,8 +549,10 @@ class TaskDAG(BaseModel):
 | Decomposer | LLM-powered | Big (30B/8B) | Query → TaskDAG. Reasons about what agents/data are needed. |
 | Router | Deterministic | None / Small | TaskNode → agent instance mapping. Pattern matching + routing table. |
 | Evaluator | LLM-powered | Big (30B/8B) | Reviews assembled results. Quality gate. Can trigger re-execution. |
-| Policy Engine | Deterministic | None | Rules: max retries, HITL triggers, allowed actions. Pure Python logic. |
+| Policy Engine | Deterministic | None | Rules: max retries, risk levels, HITL triggers, auto-approve thresholds. |
 | Guard | Hybrid | Small + regex | Input/output safety. Regex for injection, small model for semantic checks. |
+| HIL Manager | Deterministic + CLI | None | Renders Decision Ledger to user, collects approve/modify/decline responses. |
+| Checkpoint Manager | Deterministic | None | Creates/stores/restores pipeline state snapshots. Enables revert. |
 
 **OSA.Orchestrator main loop:**
 ```python
@@ -373,17 +568,43 @@ async def run(self, query: str, session_id: str) -> str:
     # 3. Decompose
     dag = await self.decomposer.decompose(query, profile, correlation_id)
     
-    # 4. Check guard result
+    # 4. CHECKPOINT #1 — plan checkpoint
+    cp1 = await self.checkpoint_mgr.create(correlation_id, dag, {}, [])
+    
+    # 5. Check guard result
     if not (await guard_task).is_safe:
         return "Query blocked by safety filter."
     
-    # 5. Route and dispatch
+    # 6. Assess risk and create Decision Ledger
+    decisions = await self.policy_engine.assess(dag)
+    
+    # 7. HIL review for non-auto-approved decisions
+    approved_decisions = await self.hil_manager.review(
+        decisions, profile, correlation_id
+    )
+    
+    # 8. Handle declined decisions — revert and re-plan
+    declined = [d for d in approved_decisions if d.status == "human_declined"]
+    if declined:
+        dag = await self.decomposer.replan(
+            query, cp1, declined, correlation_id
+        )
+        decisions = await self.policy_engine.assess(dag)
+    
+    # 9. Route and dispatch
     results = await self.dispatch(dag, correlation_id)
     
-    # 6. Evaluate
-    output = await self.evaluator.evaluate(query, results, profile, correlation_id)
+    # 10. CHECKPOINT #3 — post-execution
+    cp3 = await self.checkpoint_mgr.create(
+        correlation_id, dag, results, decisions
+    )
     
-    # 7. Record in P&L + Memory
+    # 11. Evaluate
+    output = await self.evaluator.evaluate(
+        query, results, profile, correlation_id
+    )
+    
+    # 12. Record in P&L + Memory
     await self.pnl_agent.record_interaction(query, output, correlation_id)
     await self.memory_agent.maybe_persist(query, output, results, correlation_id)
     
@@ -705,6 +926,8 @@ Tables:
   - user_preferences: (user_id, key, value jsonb, updated_at)
   - feedback_signals: (id, correlation_id, signal_type, value, created_at)
   - synapse_events: (id, correlation_id, event_type, source, target, payload jsonb, created_at)
+  - decisions: (id, correlation_id, action, reasoning, risk_level, confidence, status, human_feedback, task_id, created_at)
+  - checkpoints: (id, correlation_id, checkpoint_type, state jsonb, created_at)
 
 Use asyncpg for ALL database access. Never use synchronous drivers.
 ```
@@ -806,7 +1029,11 @@ async def fetch_finance_data(
 9. **Do NOT catch and silence exceptions** — Log them with structlog, emit Synapse error event, then return AgentResponse with success=False.
 10. **Do NOT import agents from other agents** — Dependency flows DOWN only: CLI → OSA → Agents → Tools → External Services.
 11. **Do NOT bypass Shadows for task dispatch** — In Phase 1, simple `shadows.add()` is fine. But everything goes through Shadows.
-12. **Do NOT put LLM calls in deterministic components** — Router and PolicyEngine are deterministic/small-model only. Save big models for Decomposer and Evaluator.
+12. **Do NOT put LLM calls in deterministic components** — Router, PolicyEngine, HILManager, and CheckpointManager are deterministic/small-model only. Save big models for Decomposer and Evaluator.
+13. **Do NOT execute high-risk tasks without a checkpoint** — Always create a checkpoint before Code Agent execution, Browser Agent scraping, or any destructive action.
+14. **Do NOT auto-approve CRITICAL or HIGH risk decisions** — These always go through HIL Manager for human review, regardless of user's hil_level preference.
+15. **Do NOT discard accumulated results on revert** — When reverting to a checkpoint, preserve all completed task results. Only re-execute tasks that changed in the new DAG.
+16. **Do NOT block the pipeline for LOW risk decisions** — These are auto-approved by PolicyEngine. Only MEDIUM+ with low confidence or HIGH+ trigger HIL.
 
 ---
 
@@ -865,6 +1092,16 @@ SYSSTAT_RAM_THRESHOLD_PERCENT=85
 # === P&L ===
 DEFAULT_EXPERTISE_LEVEL=advanced
 DEFAULT_VERBOSITY=concise
+
+# === HIL (Human-in-the-Loop) ===
+HIL_DEFAULT_LEVEL=balanced           # relaxed | balanced | strict
+HIL_AUTO_APPROVE_CONFIDENCE=0.85     # Auto-approve LOW risk above this confidence
+HIL_ESCALATE_CONFIDENCE=0.60         # Escalate to human below this confidence
+HIL_MAX_MEDIUM_DECISIONS=3           # Escalate after N medium-risk without checkpoint
+
+# === Checkpoints ===
+CHECKPOINT_STORAGE=memory            # memory | redis (Phase 2+: redis)
+CHECKPOINT_MAX_PER_QUERY=10          # Max checkpoints per pipeline execution
 
 # === Logging ===
 LOG_LEVEL=INFO
@@ -1020,12 +1257,17 @@ Endpoints from OCTANE_AI_IDE.md:
 | Agent hierarchy | OSA → Agents → Sub-agents | Biological model. Clear separation. OSA controls all state. |
 | Agent communication | Always through OSA + Synapse | No direct agent-to-agent. Full traceability. |
 | Task dispatch | Shadows (Redis Streams) | At-least-once delivery, retries, scheduling, perpetual tasks. |
-| Deterministic where possible | Router + Policy = no LLM | Avoid OSA bottleneck. Fast, predictable routing. |
+| Deterministic where possible | Router + Policy + HIL + Checkpoint = no LLM | Avoid OSA bottleneck. Fast, predictable routing. |
 | Big model usage | Decomposer + Evaluator only | Expensive reasoning only where it matters. |
 | Web Agent consolidation | Finance/News/Search = sub-types, not separate agents | Cleaner. One agent, multiple data sources. |
 | Guard inside OSA | Sub-agent, not separate top-level | Centralized safety. Runs parallel with main processing. |
 | SysStat owns model management | Only agent calling admin endpoints | Prevents model thrashing from multiple agents. |
 | P&L from Day 1 | Not deferred to Phase 3 | Personalization data accumulates from first interaction. |
+| HIL = 3 trigger categories | Blocked / High-stakes / Confidence | Not everything needs human approval. System knows when to ask. |
+| HIL inside OSA | Sub-agent (HIL Manager), not external | Decisions are OSA's responsibility. HIL is part of the orchestration loop. |
+| Checkpoints preserve results | Revert doesn't re-fetch data | Compute already spent on data gathering is preserved. Only re-plan changes. |
+| Checkpoint storage | In-memory Phase 1, Redis Phase 2+ | Start simple. Persistence comes when pipelines get long-running. |
+| Auto-approval learning | P&L tracks approval patterns | If user approves same decision type 5+ times, auto-approve next time. |
 | CLI-first | No web UI in Week 1 | Agents must be solid before adding React layer. |
 | Python 3.12+ | Required by Shadows | Also gives us better typing and performance. |
 | Horizontal Phase scaling | All layers basic → all layers deeper | Avoids deep agent with no integration. E2E flow matters most. |

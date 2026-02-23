@@ -7,29 +7,27 @@ from pydantic import Field
 class OctaneSettings(BaseSettings):
     """All Octane configuration. Reads from .env file and environment variables."""
 
-    # --- Bodega Inference Engine (local LLM) ---
+    # --- Bodega Inference Engine (local LLM :44468) ---
     bodega_inference_url: str = Field(
         default="http://localhost:44468",
         description="Bodega Inference Engine base URL",
     )
 
-    # --- Bodega Intelligence (external data APIs) ---
-    bodega_search_url: str = Field(
-        default="http://localhost:1111",
-        description="Beru Search API base URL",
+    # --- Bodega Intelligence — consolidated server (:44469) ---
+    bodega_intel_url: str = Field(
+        default="http://localhost:44469",
+        description="Bodega Intelligence consolidated API base URL",
     )
-    bodega_finance_url: str = Field(
-        default="http://localhost:8030",
-        description="Finance API base URL",
+    bodega_intel_api_key: str = Field(
+        default="",
+        description="API key for Bodega Intelligence (Bearer token)",
     )
-    bodega_entertainment_url: str = Field(
-        default="http://localhost:8031",
-        description="Entertainment API base URL",
-    )
-    bodega_news_url: str = Field(
-        default="http://localhost:8032",
-        description="News API base URL",
-    )
+
+    # --- Legacy per-service URLs (kept for fallback reference) ---
+    bodega_search_url: str = Field(default="http://localhost:44469")
+    bodega_finance_url: str = Field(default="http://localhost:44469")
+    bodega_entertainment_url: str = Field(default="http://localhost:44469")
+    bodega_news_url: str = Field(default="http://localhost:44469")
 
     # --- PostgreSQL + pgVector ---
     postgres_url: str = Field(

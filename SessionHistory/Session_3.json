@@ -1,0 +1,77 @@
+{
+  "session": 3,
+  "date": "2026-02-22",
+  "title": "Wire Web Agent to Live Bodega Intelligence APIs",
+  "summary": "All three Web Agent API paths (web search, news, finance) wired to live Bodega Intelligence server at :44469. End-to-end responses confirmed with real data.",
+  "goals": [
+    "Rewrite BodegaIntelClient with correct consolidated server URL and Bearer auth",
+    "Rewrite WebAgent.execute() to route by sub_agent hint",
+    "End-to-end test: octane ask 'ceo of xbox' → real answer",
+    "End-to-end test: octane ask 'NVDA stock price' → real price",
+    "End-to-end test: octane ask 'latest xbox news' → real articles"
+  ],
+  "completed": [
+    "Updated .env: BODEGA_INTEL_URL=http://localhost:44469, BODEGA_INTEL_API_KEY set",
+    "Updated config.py: added bodega_intel_url and bodega_intel_api_key fields",
+    "Rewrote BodegaIntelClient: single httpx client, Bearer auth, correct double-prefix URLs",
+    "Purged old stub methods (market_data, timeseries, etc.) that were overriding new ones",
+    "Rewrote WebAgent.execute(): routes finance/news/search by sub_agent metadata hint",
+    "Updated Router: injects BodegaIntelClient into WebAgent",
+    "Confirmed live: web_search → Phil Spencer/Asha Sharma results",
+    "Confirmed live: market_data → NVDA $189.82 +1.02%",
+    "Confirmed live: news_search → 5 real Xbox articles Feb 20-21 2026"
+  ],
+  "issues_resolved": [
+    {
+      "issue": "Wrong Bodega Intelligence URLs (:1111/:8030/:8032)",
+      "resolution": "Discovered all services on consolidated :44469 server via live curl tests"
+    },
+    {
+      "issue": "Double-prefix URL quirk (/api/v1/news/api/v1/news/search)",
+      "resolution": "FastAPI mount quirk — sub-apps define own prefixes, consolidated server adds outer prefix. Hardcoded confirmed URLs in BodegaIntelClient."
+    },
+    {
+      "issue": "Old stub methods overriding new BodegaIntelClient methods",
+      "resolution": "Python uses last definition — old stubs appended after rewrite were taking precedence. Purged all old methods from the file."
+    },
+    {
+      "issue": "sub_agent values mismatch (web_finance vs finance)",
+      "resolution": "WebAgent.execute() now accepts both short ('finance') and prefixed ('web_finance') forms via tuple match"
+    }
+  ],
+  "api_map": {
+    "server": "http://localhost:44469",
+    "auth": "Bearer token (admin key in .env)",
+    "web_search": "GET /api/v1/beru/search/web?query=...&count=...",
+    "news_search": "GET /api/v1/news/api/v1/news/search?q=...&period=...&max_results=...",
+    "finance_market": "GET /api/v1/finance/api/v1/finance/market/{TICKER}",
+    "finance_timeseries": "GET /api/v1/finance/api/v1/finance/timeseries/{TICKER}?period=...&interval=..."
+  },
+  "live_test_results": [
+    {
+      "query": "ceo of xbox",
+      "template": "web_search",
+      "result": "Phil Spencer / Asha Sharma results from Brave Search"
+    },
+    {
+      "query": "NVDA stock price",
+      "template": "web_finance",
+      "result": "NVDA: $189.82 ▲1.02% today | Volume: 178,422,337 | Market Cap: $4.62T"
+    },
+    {
+      "query": "latest xbox news",
+      "template": "web_news",
+      "result": "5 real articles including IGN, GeekWire, PC Gamer — Feb 20-21 2026"
+    }
+  ],
+  "known_gaps": [
+    "Bodega Inference LLM decomposition returning malformed JSON (LLM outputting prose instead of JSON template name) — keyword fallback working correctly",
+    "Code Agent: stub only (Session 4)"
+  ],
+  "session_4_goals": [
+    "Code Agent: Planner + Writer + Executor + Validator + Debugger (self-healing loop)",
+    "Memory Agent: Redis hot cache with in-process fallback",
+    "Wire memory into Orchestrator: recall before pipeline, remember after",
+    "octane chat end-to-end test with memory continuity across turns"
+  ]
+}

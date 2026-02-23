@@ -3,6 +3,7 @@
 Commands:
     octane health    — System status (SysStat Agent)
     octane ask       — Ask a question (routed through OSA)
+    octane chat      — Interactive multi-turn chat session
     octane trace     — View Synapse trace for a query
     octane agents    — List registered agents
 """
@@ -127,9 +128,25 @@ async def _ask(query: str):
     synapse = _get_synapse()
     osa = Orchestrator(synapse)
 
+    # Pre-flight check — show Bodega status once
+    with console.status("[dim]Checking inference engine...[/]", spinner="dots"):
+        status = await osa.pre_flight()
+
+    if status["bodega_reachable"] and status["model_loaded"]:
+        model_display = status.get("model") or "unknown"
+        # Trim long model paths for display
+        if model_display and "/" in model_display:
+            model_display = model_display.split("/")[-1]
+        console.print(f"[dim]🧠 {model_display} | LLM decomposition + synthesis active[/]")
+    elif status["bodega_reachable"]:
+        console.print(f"[yellow]⚠ Bodega reachable but no model loaded — using keyword fallback[/]")
+    else:
+        console.print(f"[yellow]⚠ Bodega offline — using keyword fallback[/]")
+
     console.print(f"\n[dim]Processing: {query}[/]\n")
 
-    output = await osa.run(query)
+    with console.status("[dim]Thinking...[/]", spinner="dots"):
+        output = await osa.run(query)
 
     console.print(Panel(
         output,
@@ -137,14 +154,18 @@ async def _ask(query: str):
         border_style="green",
     ))
 
-    # Show trace summary
-    trace = synapse.get_recent_traces(limit=1)
-    if trace:
-        t = trace[0]
-        console.print(f"\n[dim]Agents: {', '.join(t.agents_used)} | "
-                      f"Events: {len(t.events)} | "
-                      f"Duration: {t.total_duration_ms}ms | "
-                      f"Trace: {t.correlation_id}[/]")
+    # Show trace summary with the correlation ID for octane trace
+    recent = synapse.get_recent_traces(limit=1)
+    if recent:
+        t = recent[0]
+        # Filter out preflight
+        real_events = [e for e in t.events if e.correlation_id != "preflight"]
+        console.print(
+            f"\n[dim]Agents: {', '.join(t.agents_used)} | "
+            f"Events: {len(real_events)} | "
+            f"Duration: {t.total_duration_ms}ms | "
+            f"Trace ID: [bold]{t.correlation_id}[/][/]"
+        )
 
 
 # ── octane trace ──────────────────────────────────────────────
@@ -154,7 +175,7 @@ async def _ask(query: str):
 def trace(
     correlation_id: str = typer.Argument(
         None,
-        help="Correlation ID to trace. If omitted, shows recent traces.",
+        help="Correlation ID to trace. If omitted, shows recent traces from disk.",
     ),
 ):
     """🔍 View Synapse trace for a query lifecycle."""
@@ -166,58 +187,139 @@ def trace(
             console.print(f"[yellow]No trace found for: {correlation_id}[/]")
             return
 
+        started = t.started_at.strftime("%H:%M:%S") if t.started_at else "?"
         console.print(Panel(
             f"[bold]Correlation ID:[/] {t.correlation_id}\n"
+            f"[bold]Started:[/] {started}\n"
             f"[bold]Duration:[/] {t.total_duration_ms}ms\n"
             f"[bold]Success:[/] {'✅' if t.success else '❌'}\n"
             f"[bold]Agents:[/] {', '.join(t.agents_used)}",
-            title="[bold blue]Synapse Trace[/]",
+            title="[bold blue]🔍 Synapse Trace[/]",
             border_style="blue",
         ))
 
-        # Event table
         table = Table(title="Events", show_lines=True)
         table.add_column("#", style="dim", width=3)
+        table.add_column("Timestamp", style="dim", width=12)
         table.add_column("Type", style="cyan")
         table.add_column("Source", style="green")
         table.add_column("Target", style="magenta")
-        table.add_column("Duration", style="yellow", justify="right")
-        table.add_column("Error", style="red")
+        table.add_column("Info", style="white")
 
+        t0 = t.started_at
         for i, event in enumerate(t.events, 1):
+            if t0:
+                offset_ms = (event.timestamp - t0).total_seconds() * 1000
+                ts_display = f"+{offset_ms:.0f}ms"
+            else:
+                ts_display = "—"
+
+            # Summarise the payload into one short line
+            info = ""
+            if event.error:
+                info = f"[red]ERR: {event.error[:60]}[/]"
+            elif event.payload:
+                # Pick the most meaningful payload field
+                for key in ("reasoning", "template", "output_preview", "query", "error"):
+                    if key in event.payload:
+                        val = str(event.payload[key])[:80]
+                        info = f"[dim]{key}:[/] {val}"
+                        break
+
             table.add_row(
                 str(i),
+                ts_display,
                 event.event_type,
                 event.source,
                 event.target or "—",
-                f"{event.duration_ms}ms" if event.duration_ms else "—",
-                event.error[:50] if event.error else "—",
+                info,
             )
 
         console.print(table)
     else:
-        traces = synapse.get_recent_traces()
-        if not traces:
-            console.print("[yellow]No traces recorded yet. Try running 'octane ask' first.[/]")
+        # Show recent traces from disk (cross-process)
+        trace_ids = synapse.list_traces(limit=15)
+        if not trace_ids:
+            console.print("[yellow]No traces found. Run 'octane ask' first.[/]")
             return
 
-        table = Table(title="Recent Traces")
+        table = Table(title="Recent Traces  (from ~/.octane/traces/)")
         table.add_column("Correlation ID", style="cyan")
         table.add_column("Events", justify="right")
-        table.add_column("Agents", style="green")
         table.add_column("Duration", style="yellow", justify="right")
         table.add_column("Status", justify="center")
 
-        for t in traces:
+        for cid in trace_ids:
+            if cid == "preflight":
+                continue
+            t = synapse.get_trace(cid)
             table.add_row(
-                t.correlation_id[:12] + "...",
+                t.correlation_id,
                 str(len(t.events)),
-                ", ".join(t.agents_used),
-                f"{t.total_duration_ms}ms",
+                f"{t.total_duration_ms:.0f}ms",
                 "✅" if t.success else "❌",
             )
 
         console.print(table)
+        console.print("[dim]Run: octane trace <correlation_id>  for full event log[/]")
+
+
+# ── octane chat ───────────────────────────────────────────────
+
+
+@app.command()
+def chat():
+    """💬 Interactive multi-turn chat session with Octane."""
+    asyncio.run(_chat())
+
+
+async def _chat():
+    from octane.osa.orchestrator import Orchestrator
+
+    synapse = _get_synapse()
+    osa = Orchestrator(synapse)
+    session_id = f"chat_{int(__import__('time').time())}"
+
+    console.print(Panel(
+        "[bold green]Octane Chat[/]\n"
+        "[dim]Type your message and press Enter. "
+        "Type [bold]exit[/bold] or [bold]quit[/bold] to end the session.[/]",
+        border_style="green",
+    ))
+
+    # Pre-flight once at session start
+    with console.status("[dim]Starting up...[/]", spinner="dots"):
+        status = await osa.pre_flight()
+
+    if status["bodega_reachable"] and status["model_loaded"]:
+        model_display = (status.get("model") or "").split("/")[-1] or "model loaded"
+        console.print(f"[dim]🧠 {model_display} ready[/]\n")
+    else:
+        note = status.get("note", "Bodega offline")
+        console.print(f"[yellow]⚠ {note}[/]\n")
+
+    turn = 0
+    while True:
+        try:
+            query = console.input("[bold cyan]You:[/] ").strip()
+        except (EOFError, KeyboardInterrupt):
+            console.print("\n[dim]Session ended.[/]")
+            break
+
+        if not query:
+            continue
+
+        if query.lower() in ("exit", "quit", "bye", "q"):
+            console.print("[dim]Goodbye.[/]")
+            break
+
+        turn += 1
+        with console.status("[dim]Thinking...[/]", spinner="dots"):
+            output = await osa.run(query, session_id=session_id)
+
+        console.print(f"\n[bold green]Octane:[/] {output}\n")
+
+    console.print(f"[dim]Session {session_id} — {turn} turn(s)[/]")
 
 
 # ── octane agents ─────────────────────────────────────────────

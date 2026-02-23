@@ -1,18 +1,18 @@
 """OSA Orchestrator — the main loop.
 
 Every user query flows through here. The Orchestrator:
-1. Receives the query
-2. Runs Guard (safety check)
-3. Runs Decomposer (query → TaskDAG)
-4. Runs Router (TaskNode → agent mapping)
-5. Dispatches tasks to agents
-6. Collects results
-7. Runs Evaluator (quality gate)
-8. Returns final output
+1. pre_flight  — checks Bodega is reachable, loads grunt model if needed
+2. Guard       — safety check on input
+3. Decompose   — query → TaskDAG (LLM-powered, keyword fallback)
+4. Route       — TaskNode → agent instance
+5. Dispatch    — execute tasks (parallel within wave, sequential across waves)
+6. Evaluate    — LLM synthesis of all agent results
+7. Egress      — Synapse event + return output
 """
 
 from __future__ import annotations
 
+import asyncio
 import uuid
 
 import structlog
@@ -24,38 +24,77 @@ from octane.osa.router import Router
 from octane.osa.evaluator import Evaluator
 from octane.osa.policy import PolicyEngine
 from octane.osa.guard import Guard
+from octane.tools.bodega_inference import BodegaInferenceClient
 
 logger = structlog.get_logger().bind(component="osa")
 
 
 class Orchestrator:
-    """The brain of Octane. Every query flows through here.
-
-    Coordinates decomposition, routing, dispatch, evaluation,
-    and emits Synapse events at every state transition.
-    """
+    """The brain of Octane. Every query flows through here."""
 
     def __init__(self, synapse: SynapseEventBus) -> None:
         self.synapse = synapse
-        self.decomposer = Decomposer()
-        self.router = Router(synapse)
-        self.evaluator = Evaluator()
+        self.bodega = BodegaInferenceClient()
+        self.decomposer = Decomposer(bodega=self.bodega)
+        self.router = Router(synapse, bodega=self.bodega)
+        self.evaluator = Evaluator(bodega=self.bodega)
         self.policy = PolicyEngine()
         self.guard = Guard()
+        self._preflight_done = False
+        # Memory agent reference (resolved lazily from router to avoid circular import)
+        self._memory_agent = None
+
+    async def pre_flight(self) -> dict:
+        """Check Bodega is reachable and a model is loaded.
+
+        Called once before the first query. If Bodega is down, the
+        Decomposer and Evaluator will gracefully fall back to
+        keyword heuristics and string concatenation respectively.
+
+        Returns a status dict for display in the CLI.
+        """
+        status = {"bodega_reachable": False, "model_loaded": False, "model": None, "note": ""}
+
+        try:
+            health = await self.bodega.health()
+            if health.get("status") == "ok":
+                status["bodega_reachable"] = True
+
+                model_info = await self.bodega.current_model()
+                if "error" not in model_info and model_info:
+                    status["model_loaded"] = True
+                    status["model"] = model_info.get("model_path") or model_info.get("model")
+                else:
+                    status["note"] = "Bodega reachable but no model loaded — LLM features disabled"
+                    logger.warning("bodega_no_model_loaded")
+            else:
+                status["note"] = "Bodega server not reachable — using keyword fallback"
+                logger.warning("bodega_unreachable")
+
+        except Exception as exc:
+            status["note"] = f"Bodega check failed: {exc} — using keyword fallback"
+            logger.warning("bodega_preflight_error", error=str(exc))
+
+        self._preflight_done = True
+
+        self.synapse.emit(SynapseEvent(
+            correlation_id="preflight",
+            event_type="preflight",
+            source="osa",
+            payload=status,
+        ))
+
+        return status
 
     async def run(self, query: str, session_id: str = "cli") -> str:
-        """Main orchestration loop.
+        """Main orchestration loop."""
+        # Run pre_flight lazily on first query if not already done
+        if not self._preflight_done:
+            await self.pre_flight()
 
-        Args:
-            query: The user's query
-            session_id: Session identifier for multi-turn context
-
-        Returns:
-            Final output string for the user
-        """
         correlation_id = str(uuid.uuid4())
 
-        # STEP 1: INGRESS — log the incoming query
+        # STEP 1: INGRESS
         self.synapse.emit(SynapseEvent(
             correlation_id=correlation_id,
             event_type="ingress",
@@ -64,7 +103,7 @@ class Orchestrator:
             payload={"query": query, "session_id": session_id},
         ))
 
-        # STEP 2: GUARD — safety check on input
+        # STEP 2: GUARD — safety check (fast, parallel with decompose in Phase 3+)
         guard_result = await self.guard.check_input(query)
         if not guard_result["safe"]:
             self.synapse.emit(SynapseEvent(
@@ -75,7 +114,7 @@ class Orchestrator:
             ))
             return f"⚠ Query blocked: {guard_result.get('reason', 'Safety check failed')}"
 
-        # STEP 3: DECOMPOSE — query → TaskDAG
+        # STEP 3: DECOMPOSE
         self.synapse.emit(SynapseEvent(
             correlation_id=correlation_id,
             event_type="decomposition_start",
@@ -92,21 +131,36 @@ class Orchestrator:
             payload={
                 "nodes": len(dag.nodes),
                 "reasoning": dag.reasoning,
+                "source": dag.nodes[0].metadata.get("source", "unknown") if dag.nodes else "unknown",
+                "template": dag.nodes[0].metadata.get("template", "") if dag.nodes else "",
             },
         ))
 
-        # STEP 4: ROUTE & DISPATCH — execute each task via agents
-        request = AgentRequest(
-            query=query,
-            correlation_id=correlation_id,
-            session_id=session_id,
-            source="osa",
-        )
+        # STEP 3.5: MEMORY RECALL — inject prior context for chat continuity
+        memory_agent = self._get_memory_agent()
+        prior_context: str | None = None
+        if memory_agent and session_id != "cli":
+            prior_context = await memory_agent.recall(session_id, query)
+            if prior_context:
+                logger.info("memory_recalled", session_id=session_id, preview=prior_context[:60])
 
+        # STEP 3.6: USER PROFILE — fetch preferences to shape Evaluator tone
+        user_profile: dict = {}
+        pnl_agent = self.router.get_agent("pnl")
+        if pnl_agent:
+            try:
+                user_id = session_id.split("_")[0] if "_" in session_id else "default"
+                user_profile = await pnl_agent.get_profile(user_id)
+            except Exception:
+                pass
+
+        # STEP 4: ROUTE & DISPATCH — parallel within each wave
         results: list[AgentResponse] = []
+        accumulated: dict[str, AgentResponse] = {}
+
         for wave in dag.execution_order():
-            # In Phase 1: sequential execution
-            # Phase 2+: asyncio.gather for parallel waves
+            # Build requests for this wave
+            wave_requests = []
             for node in wave:
                 self.synapse.emit(SynapseEvent(
                     correlation_id=correlation_id,
@@ -125,31 +179,55 @@ class Orchestrator:
                         source="osa",
                         metadata=node.metadata,
                     )
-                    response = await agent.run(task_request)
-                    results.append(response)
+                    wave_requests.append((node, agent, task_request))
                 else:
                     logger.warning("no_agent_found", agent=node.agent)
-                    results.append(AgentResponse(
+                    accumulated[node.task_id] = AgentResponse(
                         agent=node.agent,
                         success=False,
-                        error=f"No agent found for: {node.agent}",
+                        error=f"No agent registered for: {node.agent}",
                         correlation_id=correlation_id,
-                    ))
+                    )
 
-        # STEP 5: EVALUATE — assemble and quality-gate the output
-        output = await self.evaluator.evaluate(query, results)
+            # Execute wave in parallel
+            if wave_requests:
+                wave_responses = await asyncio.gather(
+                    *[agent.run(req) for _, agent, req in wave_requests],
+                    return_exceptions=False,
+                )
+                for (node, _, _), response in zip(wave_requests, wave_responses):
+                    accumulated[node.task_id] = response
+                    results.append(response)
 
-        # STEP 6: EGRESS — log final output
+        # STEP 5: EVALUATE — synthesize all results (inject prior memory context + user profile)
+        output = await self.evaluator.evaluate(
+            query, results,
+            prior_context=prior_context,
+            user_profile=user_profile,
+        )
+
+        # STEP 5.5: MEMORY WRITE — persist the answer for future recall
+        if memory_agent and session_id != "cli":
+            await memory_agent.remember(session_id, query, output)
+
+        # STEP 6: EGRESS
         self.synapse.emit(SynapseEvent(
             correlation_id=correlation_id,
             event_type="egress",
             source="osa",
             target="user",
             payload={
-                "output_preview": output[:500],
+                "output_preview": output[:200],
                 "agents_used": [r.agent for r in results],
-                "all_succeeded": all(r.success for r in results),
+                "tasks_total": len(results),
+                "tasks_succeeded": sum(1 for r in results if r.success),
             },
         ))
 
         return output
+
+    def _get_memory_agent(self):
+        """Lazily resolve MemoryAgent from the router (avoids circular import)."""
+        if self._memory_agent is None:
+            self._memory_agent = self.router.get_agent("memory")
+        return self._memory_agent

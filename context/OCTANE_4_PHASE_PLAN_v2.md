@@ -499,6 +499,194 @@ Make the system genuinely intelligent. OSA reasons about routing. Memory provide
 - [ ] `octane plugin install <name>` — installs community agents
 - [ ] `octane workflow publish <template>` — exports shareable workflow
 
+
+---
+
+## ADDENDUM: HIL (Human-in-the-Loop) & Checkpointing System
+
+*Added 2026-02-16. Paste this after the Phase 4 section in OCTANE_4_PHASE_PLAN_v2.md*
+
+---
+
+### New OSA Sub-components
+
+Two new sub-components are added to OSA:
+
+```
+OSA Sub-agents (updated):
+  ┌────────────┐ ┌──────────┐ ┌───────────┐ ┌─────────────┐ ┌──────────┐
+  │ Decomposer │ │  Router  │ │ Evaluator │ │   Guard     │ │   HIL    │
+  │(big model) │ │(determin)│ │(big model)│ │  (hybrid)   │ │ Manager  │
+  └────────────┘ └──────────┘ └───────────┘ └─────────────┘ └──────────┘
+  ┌──────────────┐ ┌────────────────────┐
+  │Policy Engine │ │Checkpoint Manager  │
+  │(deterministic│ │(snapshots + revert)│
+  └──────────────┘ └────────────────────┘
+```
+
+**HIL Manager** — Renders decision reviews, collects user responses (approve/modify/decline), feeds results back to OSA loop.
+
+**Checkpoint Manager** — Creates, stores, and restores pipeline state snapshots. Enables revert-to-checkpoint when user declines a decision.
+
+---
+
+### Three HIL Trigger Categories
+
+| Category | When | Example | User Action Required |
+|----------|------|---------|---------------------|
+| **Blocked** | System literally cannot proceed | Captcha, login wall, missing credentials, ambiguous instruction | Must resolve to continue |
+| **High-stakes** | Action is irreversible or consequential | Code execution, file deletion, external API writes, financial actions | Should review before proceeding |
+| **Confidence checkpoint** | Accumulated uncertainty exceeds threshold | Multiple medium-confidence routing decisions, unfamiliar query pattern | Can review or skip |
+
+---
+
+### Decision Ledger
+
+Every non-trivial OSA decision is logged as a `Decision`:
+
+```python
+class Decision(BaseModel):
+    id: str
+    correlation_id: str
+    timestamp: datetime
+    
+    # What
+    action: str                          # "Route to Web Agent for AMD comparison"
+    reasoning: str                       # Why the agent made this choice
+    
+    # Risk assessment
+    risk_level: str                      # "low" | "medium" | "high" | "critical"
+    confidence: float                    # 0.0 to 1.0
+    uncertainty_reason: str              # Why confidence < 1.0
+    
+    # Evidence
+    sources: list[str] = []             # URLs, memory IDs, data references
+    code_preview: str | None = None     # If Code Agent, show the code
+    
+    # Status
+    status: str = "pending"             # pending | auto_approved | human_approved |
+                                        # human_modified | human_declined
+    human_feedback: str = ""            # Modification or decline reason
+    
+    # Linkage
+    task_id: str                        # Which TaskNode in the DAG
+    reversible: bool = True
+```
+
+---
+
+### Auto-Approval Rules (Policy Engine)
+
+**Auto-approve when:**
+- Risk is LOW + confidence > 0.85
+- Action is read-only (search, memory read, data retrieval)
+- Same action type approved by user 5+ times previously (P&L learning)
+- User preference: `octane pref set auto_approve_level medium`
+
+**Escalate to HIL when:**
+- Risk is HIGH or CRITICAL (regardless of confidence)
+- Confidence < 0.60 (regardless of risk)
+- 3+ accumulated MEDIUM-risk decisions without checkpoint
+- Destructive action (delete, send, execute on external systems)
+- Literally blocked (auth, captcha, missing data)
+- First encounter with this decision type (no prior pattern)
+
+**User controls:**
+```bash
+octane pref set hil_level relaxed     # Only HIGH+ interrupts
+octane pref set hil_level balanced    # MEDIUM+ when confidence < 0.75 (default)
+octane pref set hil_level strict      # Everything except LOW read-only
+
+# Per-action overrides
+octane pref set auto_approve web.search true
+octane pref set auto_approve code.execute false
+```
+
+---
+
+### Checkpoint System
+
+**What a checkpoint captures:**
+```python
+class Checkpoint(BaseModel):
+    id: str
+    correlation_id: str
+    timestamp: datetime
+    
+    # Pipeline state
+    dag: TaskDAG
+    completed_tasks: list[str]
+    pending_tasks: list[str]
+    
+    # Results so far
+    accumulated_results: dict[str, Any]    # task_id → AgentResponse
+    
+    # Decision state
+    decisions: list[Decision]
+    approved_decisions: list[str]
+    
+    # Context
+    memory_context: dict[str, Any]
+    pnl_profile: UserProfile
+    synapse_events: list[SynapseEvent]
+```
+
+**When checkpoints are created:**
+1. After decomposition (the "plan" checkpoint)
+2. Before each high-risk task execution
+3. After parallel group completion (data gathered, before synthesis)
+4. Before final synthesis
+
+**Revert flow:**
+```
+User declines Decision #4 at Checkpoint #2
+    ↓
+User provides reason: "qualitative only, skip quantitative"
+    ↓
+Checkpoint Manager restores state to Checkpoint #2
+    ↓
+OSA.Decomposer re-plans with:
+  - Original query
+  - All data from completed tasks (preserved, not re-fetched)
+  - Declined decision + user's reason as new context
+    ↓
+Modified DAG executes only the changed steps
+```
+
+**Checkpoint-enabled features (Phase 3+):**
+```bash
+octane replay <correlation_id>                    # Re-run from first checkpoint
+octane branch <correlation_id> --from-checkpoint 2  # Fork with new instructions
+octane audit <correlation_id>                     # Full decision + checkpoint trail
+```
+
+---
+
+### Phase Integration
+
+| Phase | HIL Scope | Checkpoint Scope |
+|-------|-----------|------------------|
+| Phase 1 | BLOCKED only (captcha, auth, missing info). Simple `input()` prompts. | In-memory dict snapshots. Basic save/restore. |
+| Phase 2 | Add risk/confidence HIL. Decision Ledger. Rich CLI panels. | Checkpoints persisted to Redis. Revert flow working. |
+| Phase 3 | Auto-approval learning via P&L. User preference controls. | Replay + branch from checkpoints. |
+| Phase 4 | Full audit trail in Postgres. VW bandits learn from approval patterns. | Checkpoint diff visualization. Workflow learning. |
+
+---
+
+### Updated File Structure (new files only)
+
+```
+octane/osa/
+├── hil_manager.py           # HIL rendering, user input collection, response routing
+├── checkpoint_manager.py    # Checkpoint creation, storage, restoration, revert
+└── (existing: orchestrator.py, decomposer.py, router.py, evaluator.py, policy.py, guard.py, synapse.py)
+
+octane/models/
+├── decisions.py             # Decision, DecisionLedger models
+├── checkpoints.py           # Checkpoint model
+└── (existing: schemas.py, synapse.py, dag.py)
+```
+
 ---
 
 ## Timeline Summary

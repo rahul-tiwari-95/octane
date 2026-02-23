@@ -15,28 +15,27 @@ from octane.agents.sysstat.agent import SysStatAgent
 from octane.agents.pnl.agent import PnLAgent
 from octane.models.synapse import SynapseEventBus
 from octane.tools.bodega_inference import BodegaInferenceClient
+from octane.tools.bodega_intel import BodegaIntelClient
+from octane.tools.redis_client import RedisClient
 
 logger = structlog.get_logger().bind(component="osa.router")
 
 
 class Router:
-    """Maps agent names to agent instances.
-
-    Deterministic routing — no LLM needed. The Decomposer decides
-    WHICH agent; the Router resolves the name to an instance.
-    """
+    """Maps agent names to agent instances."""
 
     def __init__(self, synapse: SynapseEventBus, bodega: BodegaInferenceClient | None = None) -> None:
         self.synapse = synapse
         self.bodega = bodega or BodegaInferenceClient()
+        self.intel = BodegaIntelClient()
+        self.redis = RedisClient()
 
-        # Agent registry — instantiate all agents
         self._agents: dict[str, BaseAgent] = {
-            "web": WebAgent(synapse),
-            "code": CodeAgent(synapse),
-            "memory": MemoryAgent(synapse),
+            "web": WebAgent(synapse, intel=self.intel),
+            "code": CodeAgent(synapse, bodega=self.bodega),
+            "memory": MemoryAgent(synapse, redis=self.redis),
             "sysstat": SysStatAgent(synapse, self.bodega),
-            "pnl": PnLAgent(synapse),
+            "pnl": PnLAgent(synapse, redis=self.redis),
         }
 
     def get_agent(self, name: str) -> BaseAgent | None:
