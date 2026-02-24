@@ -198,13 +198,23 @@ async def _ask(query: str, verbose: bool = False):
     else:
         console.print(f"[yellow]⚠ Bodega offline — using keyword fallback[/]")
 
-    console.print(f"\n[dim]Processing: {query}[/]\n")
+    console.print(f"\n[dim]Query: {query}[/]\n")
 
-    console.print("[bold green]🔥 Octane:[/] ", end="")
+    # Spinner runs while guard → decompose → dispatch → first Evaluator token
+    # Stops automatically the moment the first streamed chunk arrives.
+    status = console.status("[dim]⚙  Routing and dispatching...[/]", spinner="dots")
+    status.start()
     full_output_parts = []
+    first_token = True
     async for chunk in osa.run_stream(query):
+        if first_token:
+            status.stop()
+            console.print("[bold green]🔥 Octane:[/] ", end="")
+            first_token = False
         console.print(chunk, end="")
         full_output_parts.append(chunk)
+    if first_token:
+        status.stop()  # pipeline ran but no tokens yielded (guard block, etc.)
     console.print("\n")
 
     # Show trace summary with the correlation ID for octane trace
@@ -381,15 +391,24 @@ async def _chat():
         # Add user turn to history before processing
         conversation_history.append({"role": "user", "content": query})
 
-        console.print(f"\n[bold green]Octane:[/] ", end="")
+        # Spinner covers guard → decompose → dispatch → first Evaluator token
+        _status = console.status("[dim]⚙  Working...[/]", spinner="dots")
+        _status.start()
         response_parts: list[str] = []
+        _first = True
         async for chunk in osa.run_stream(
             query,
             session_id=session_id,
             conversation_history=conversation_history,
         ):
+            if _first:
+                _status.stop()
+                console.print(f"\n[bold green]Octane:[/] ", end="")
+                _first = False
             console.print(chunk, end="")
             response_parts.append(chunk)
+        if _first:
+            _status.stop()  # no tokens (guard blocked, etc.)
         console.print()  # newline after stream ends
         console.print()
 
@@ -641,6 +660,247 @@ async def _session():
     console.print(f"\n[dim]Session {session_id} complete.[/]")
 
 
+# ── octane watch ─────────────────────────────────────────────
+
+watch_app = typer.Typer(
+    name="watch",
+    help="📡 Background stock / asset monitors (powered by Shadows).",
+    no_args_is_help=True,
+)
+app.add_typer(watch_app, name="watch")
+
+
+def _get_watch_shadow():
+    """Return (shadow_name, redis_url) from settings."""
+    from octane.config import settings
+    return "octane", settings.redis_url
+
+
+@watch_app.command("start")
+def watch_start(
+    ticker: str = typer.Argument(..., help="Ticker symbol, e.g. AAPL or BTC"),
+    interval_hours: float = typer.Option(1.0, "--every", "-e", help="Poll interval in hours"),
+):
+    """📈 Start a perpetual background monitor for a ticker.
+
+    Schedules ``monitor_ticker`` as a Shadows perpetual task, then
+    launches the Octane background worker subprocess if it is not
+    already running.
+
+    Examples::
+
+        octane watch start AAPL
+        octane watch start BTC --every 0.5
+    """
+    asyncio.run(_watch_start(ticker.upper(), interval_hours))
+
+
+async def _watch_start(ticker: str, interval_hours: float):
+    import subprocess
+    from datetime import timedelta
+    from shadows import Shadow
+    from octane.tasks.monitor import monitor_ticker, POLL_INTERVAL
+    from octane.tasks.worker_process import read_pid, PID_FILE
+    from octane.config import settings
+
+    shadow_name, redis_url = _get_watch_shadow()
+
+    # ── 1. Schedule the perpetual task via Shadow ──────────────
+    console.print(f"[dim]Connecting to Redis at {redis_url}...[/]")
+    try:
+        every = timedelta(hours=interval_hours)
+        async with Shadow(name=shadow_name, url=redis_url) as shadow:
+            shadow.register(monitor_ticker)
+            # Use ticker symbol as the stable task key — guarantees exactly one
+            # perpetual loop per symbol regardless of how many times the user
+            # runs this command.
+            await shadow.add(monitor_ticker, key=ticker)(ticker=ticker)
+        console.print(
+            f"[green]✅ Scheduled monitor for [bold]{ticker}[/bold] "
+            f"(every {every}, key={ticker})[/]"
+        )
+    except Exception as exc:
+        console.print(f"[red]Failed to schedule task: {exc}[/]")
+        raise typer.Exit(1)
+
+    # ── 2. Ensure the worker subprocess is running ─────────────
+    existing_pid = read_pid()
+    if existing_pid:
+        console.print(f"[dim]Worker already running (PID {existing_pid}) — task picked up automatically.[/]")
+        return
+
+    console.print("[dim]Starting Octane background worker...[/]")
+    import sys
+    proc = subprocess.Popen(
+        [
+            sys.executable,
+            "-m", "octane.tasks.worker_process",
+            "--shadows-name", shadow_name,
+            "--redis-url", redis_url,
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,   # detach from terminal
+    )
+    # Give it a moment to write the PID file
+    import time
+    time.sleep(0.8)
+    pid = read_pid()
+    if pid:
+        console.print(f"[green]🚀 Worker started (PID {pid})[/]")
+    else:
+        # Process launched but PID file not yet visible — report the Popen PID
+        console.print(f"[green]🚀 Worker launched (PID ~{proc.pid})[/]")
+
+    console.print(
+        f"\n[dim]Run [bold]octane watch status[/bold] to see running monitors.\n"
+        f"Run [bold]octane watch latest {ticker}[/bold] to see the latest quote.[/]"
+    )
+
+
+@watch_app.command("stop")
+def watch_stop():
+    """🛑 Stop the Octane background worker."""
+    from octane.tasks.worker_process import read_pid, _remove_pid
+    import os
+    import signal as _signal
+
+    pid = read_pid()
+    if pid is None:
+        console.print("[yellow]No worker is running.[/]")
+        return
+
+    try:
+        os.kill(pid, _signal.SIGTERM)
+        _remove_pid()
+        console.print(f"[green]✅ Worker (PID {pid}) stopped.[/]")
+    except ProcessLookupError:
+        _remove_pid()
+        console.print(f"[yellow]Worker PID {pid} was already gone — cleaned up.[/]")
+    except PermissionError:
+        console.print(f"[red]Permission denied stopping PID {pid}.[/]")
+
+
+@watch_app.command("status")
+def watch_status():
+    """📊 Show running monitors and worker status."""
+    asyncio.run(_watch_status())
+
+
+async def _watch_status():
+    from shadows import Shadow
+    from octane.tasks.worker_process import read_pid
+    from octane.config import settings
+
+    shadow_name, redis_url = _get_watch_shadow()
+
+    # Worker process status
+    pid = read_pid()
+    worker_line = (
+        f"[green]🟢 Running (PID {pid})[/]" if pid else "[red]🔴 Not running[/]"
+    )
+    console.print(Panel(worker_line, title="[bold]Octane Worker[/]", border_style="cyan"))
+
+    # Scheduled tasks snapshot
+    try:
+        async with Shadow(name=shadow_name, url=redis_url) as shadow:
+            from octane.tasks.monitor import monitor_ticker
+            shadow.register(monitor_ticker)
+            snapshot = await shadow.snapshot()
+
+        table = Table(title="Scheduled / Running Tasks", show_lines=False)
+        table.add_column("Key", style="cyan")
+        table.add_column("Function", style="green")
+        table.add_column("When (UTC)", style="yellow")
+        table.add_column("State", style="white")
+
+        for exe in snapshot.future:
+            table.add_row(
+                exe.key,
+                exe.function.__name__,
+                exe.when.strftime("%Y-%m-%d %H:%M:%S"),
+                "[dim]scheduled[/]",
+            )
+        for exe in snapshot.running:
+            table.add_row(
+                exe.key,
+                exe.function.__name__,
+                exe.when.strftime("%Y-%m-%d %H:%M:%S"),
+                f"[bold green]running[/] on {exe.worker}",
+            )
+
+        total = snapshot.total_tasks
+        if total == 0:
+            console.print("[dim]No tasks scheduled. Run: octane watch start <ticker>[/]")
+        else:
+            console.print(table)
+            console.print(f"[dim]Total: {total} task(s)  ·  Workers active: {len(snapshot.workers)}[/]")
+
+    except Exception as exc:
+        console.print(f"[yellow]Could not reach Redis: {exc}[/]")
+        console.print("[dim]Is Redis running? Check: redis-cli ping[/]")
+
+
+@watch_app.command("latest")
+def watch_latest(
+    ticker: str = typer.Argument(..., help="Ticker symbol"),
+):
+    """💹 Show the latest stored quote for a ticker."""
+    asyncio.run(_watch_latest(ticker.upper()))
+
+
+async def _watch_latest(ticker: str):
+    from octane.tools.redis_client import RedisClient
+    import json
+
+    redis = RedisClient()
+    key = f"watch:{ticker}:latest"
+    raw = await redis.get(key)
+    await redis.close()
+
+    if not raw:
+        console.print(
+            f"[yellow]No data yet for [bold]{ticker}[/bold]. "
+            f"Run: octane watch start {ticker}[/]"
+        )
+        return
+
+    try:
+        data = json.loads(raw)
+    except Exception:
+        data = {"raw": raw}
+
+    table = Table(show_header=False, box=None, padding=(0, 2))
+    table.add_column("Field", style="cyan")
+    table.add_column("Value", style="white")
+    for k, v in data.items():
+        table.add_row(str(k), str(v))
+    console.print(Panel(table, title=f"[bold green]📈 {ticker} — Latest Quote[/]", border_style="green"))
+
+
+@watch_app.command("cancel")
+def watch_cancel(
+    ticker: str = typer.Argument(..., help="Ticker symbol to stop monitoring"),
+):
+    """❌ Cancel the perpetual monitor for a ticker."""
+    asyncio.run(_watch_cancel(ticker.upper()))
+
+
+async def _watch_cancel(ticker: str):
+    from shadows import Shadow
+    from octane.config import settings
+
+    shadow_name, redis_url = _get_watch_shadow()
+
+    try:
+        async with Shadow(name=shadow_name, url=redis_url) as shadow:
+            await shadow.cancel(ticker)
+        console.print(f"[green]✅ Monitor for [bold]{ticker}[/bold] cancelled.[/]")
+    except Exception as exc:
+        console.print(f"[red]Failed to cancel: {exc}[/]")
+        raise typer.Exit(1)
+
+
 # ── octane agents ─────────────────────────────────────────────
 
 
@@ -670,6 +930,202 @@ def version():
     """📦 Show Octane version."""
     from octane import __version__
     console.print(f"[bold cyan]🔥 Octane[/] v{__version__}")
+
+
+# ── octane workflow ───────────────────────────────────────────
+
+workflow_app = typer.Typer(
+    name="workflow",
+    help="🗂  Save, list, and replay Octane pipeline templates.",
+    no_args_is_help=True,
+)
+app.add_typer(workflow_app, name="workflow")
+
+
+@workflow_app.command("export")
+def workflow_export(
+    correlation_id: str = typer.Argument(..., help="Trace ID to export (from octane ask footer)"),
+    name: str = typer.Option(None, "--name", "-n", help="Template name (default: first 8 chars of trace ID)"),
+    description: str = typer.Option("", "--desc", "-d", help="Human-readable description"),
+    out: str = typer.Option(None, "--out", "-o", help="Output file path (default: ~/.octane/workflows/<name>.workflow.json)"),
+):
+    """📤 Export a previous query as a reusable workflow template.
+
+    Reads the Synapse trace for CORRELATION_ID and saves the DAG structure
+    as a parameterised ``.workflow.json`` file.
+
+    Example::
+
+        octane workflow export abc12345 --name stock-check
+    """
+    from octane.workflow import export_from_trace
+    from pathlib import Path
+
+    try:
+        template = export_from_trace(correlation_id, name=name, description=description)
+    except FileNotFoundError as e:
+        console.print(f"[red]{e}[/]")
+        raise typer.Exit(1)
+    except ValueError as e:
+        console.print(f"[yellow]{e}[/]")
+        raise typer.Exit(1)
+
+    save_path = Path(out) if out else None
+    saved_to = template.save(save_path)
+
+    placeholders = template.list_placeholders()
+    console.print(Panel(
+        f"[bold]Name:[/]        {template.name}\n"
+        f"[bold]Nodes:[/]       {len(template.nodes)}\n"
+        f"[bold]Reasoning:[/]   {template.reasoning[:80] or '—'}\n"
+        f"[bold]Placeholders:[/] {', '.join(placeholders) or 'none'}\n"
+        f"[bold]Saved to:[/]    [cyan]{saved_to}[/]",
+        title="[bold green]✅ Workflow Exported[/]",
+        border_style="green",
+    ))
+
+
+@workflow_app.command("list")
+def workflow_list():
+    """📋 List saved workflow templates."""
+    from octane.workflow import list_workflows, WorkflowTemplate
+
+    files = list_workflows()
+    if not files:
+        console.print("[yellow]No workflows saved yet. Run: octane workflow export <trace_id>[/]")
+        return
+
+    table = Table(title="Saved Workflows  (~/.octane/workflows/)")
+    table.add_column("Name", style="cyan")
+    table.add_column("Nodes", justify="right", style="yellow")
+    table.add_column("Variables", style="green")
+    table.add_column("Description", style="white")
+
+    for f in files:
+        try:
+            t = WorkflowTemplate.load(f)
+            table.add_row(
+                t.name,
+                str(len(t.nodes)),
+                ", ".join(f"[dim]{k}[/]=[bold]{v}[/]" for k, v in t.variables.items()) or "—",
+                t.description[:60] or "—",
+            )
+        except Exception:
+            table.add_row(f.stem, "?", "?", "[red]parse error[/]")
+
+    console.print(table)
+    console.print(f"[dim]{len(files)} template(s) · Run: octane workflow run <name>.workflow.json[/]")
+
+
+@workflow_app.command("run")
+def workflow_run(
+    file: str = typer.Argument(..., help="Path to .workflow.json file"),
+    var: list[str] = typer.Option([], "--var", "-v", help="Variable override: key=value (repeatable)"),
+    query: str = typer.Option("", "--query", "-q", help="Override the {{query}} variable"),
+    verbose: bool = typer.Option(False, "--verbose", help="Show DAG trace after response"),
+):
+    """▶  Run a saved workflow template.
+
+    Fills ``{{variables}}``, builds the TaskDAG, and streams the result —
+    bypassing the Decomposer (the pipeline shape is fixed by the template).
+
+    Examples::
+
+        octane workflow run ~/.octane/workflows/stock-check.workflow.json --var ticker=MSFT
+        octane workflow run stock-check.workflow.json --query "Compare NVDA and AMD"
+    """
+    asyncio.run(_workflow_run(file, var, query, verbose))
+
+
+async def _workflow_run(file_str: str, var_list: list[str], query_override: str, verbose: bool):
+    from pathlib import Path
+    from octane.workflow.runner import load_workflow
+    from octane.osa.orchestrator import Orchestrator
+
+    path = Path(file_str)
+    # Try ~/.octane/workflows/ as fallback if not an absolute/relative path
+    if not path.exists():
+        from octane.workflow import WORKFLOW_DIR
+        fallback = WORKFLOW_DIR / file_str
+        if fallback.exists():
+            path = fallback
+        else:
+            # Also try adding .workflow.json suffix
+            fallback2 = WORKFLOW_DIR / f"{file_str}.workflow.json"
+            if fallback2.exists():
+                path = fallback2
+
+    try:
+        template = load_workflow(path)
+    except FileNotFoundError:
+        console.print(f"[red]Workflow file not found: {file_str}[/]")
+        console.print("[dim]Run 'octane workflow list' to see available templates.[/]")
+        raise typer.Exit(1)
+
+    # Parse --var key=value overrides
+    overrides: dict[str, str] = {}
+    for item in var_list:
+        if "=" in item:
+            k, _, v = item.partition("=")
+            overrides[k.strip()] = v.strip()
+        else:
+            console.print(f"[yellow]Ignoring malformed --var '{item}' (expected key=value)[/]")
+
+    if query_override:
+        overrides["query"] = query_override
+
+    # Build the DAG
+    try:
+        dag = template.to_dag(overrides)
+    except Exception as exc:
+        console.print(f"[red]Failed to build DAG from template: {exc}[/]")
+        raise typer.Exit(1)
+
+    # Run
+    synapse = _get_synapse()
+    osa = Orchestrator(synapse)
+
+    effective_query = overrides.get("query") or template.variables.get("query") or template.description
+    console.print(Panel(
+        f"[bold]Template:[/] {template.name}  ·  [bold]Nodes:[/] {len(dag.nodes)}  ·  "
+        f"[bold]Query:[/] {effective_query[:80]}",
+        title="[bold cyan]▶ Running Workflow[/]",
+        border_style="cyan",
+    ))
+
+    status = console.status("[dim]⚙  Running pipeline...[/]", spinner="dots")
+    status.start()
+    first_token = True
+    full_parts: list[str] = []
+
+    async for chunk in osa.run_from_dag(dag, query=effective_query):
+        if first_token:
+            status.stop()
+            console.print("[bold green]🔥 Octane:[/] ", end="")
+            first_token = False
+        console.print(chunk, end="")
+        full_parts.append(chunk)
+
+    if first_token:
+        status.stop()  # pipeline ran but produced no output
+
+    console.print("\n")
+
+    recent = synapse.get_recent_traces(limit=1)
+    if recent:
+        t = recent[0]
+        real_events = [e for e in t.events if e.correlation_id != "preflight"]
+        egress = next((e for e in real_events if e.event_type == "egress"), None)
+        dag_nodes = egress.payload.get("dag_nodes", "?") if egress and egress.payload else "?"
+        console.print(
+            f"[dim]Agents: {', '.join(t.agents_used)} | "
+            f"DAG nodes: {dag_nodes} | "
+            f"Duration: {t.total_duration_ms}ms | "
+            f"Trace: [bold]{t.correlation_id}[/][/]"
+        )
+        if verbose:
+            dag_reason = egress.payload.get("dag_reasoning", "") if egress and egress.payload else ""
+            _print_dag_trace(t, real_events, dag_nodes, dag_reason)
 
 
 # ── Entry point ───────────────────────────────────────────────

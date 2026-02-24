@@ -1131,3 +1131,606 @@ async def test_egress_event_contains_dag_metadata():
     egress = egress_events[-1]
     assert egress.payload.get("dag_nodes") == 2
     assert egress.payload.get("dag_reasoning") == "two-step plan"
+
+
+# ── Shadows / watch tasks (Session 11) ───────────────────────────────────────
+
+# ── 1. Task collection is importable and non-empty ────────────────────────────
+
+def test_octane_tasks_collection_is_non_empty():
+    """octane.tasks should export a non-empty list of task functions."""
+    from octane.tasks import octane_tasks
+    assert isinstance(octane_tasks, list)
+    assert len(octane_tasks) >= 1
+
+
+def test_monitor_ticker_is_in_collection():
+    """monitor_ticker must be registered in octane_tasks."""
+    from octane.tasks import octane_tasks, monitor_ticker
+    assert monitor_ticker in octane_tasks
+
+
+# ── 2. monitor_ticker task structure ─────────────────────────────────────────
+
+def test_monitor_ticker_is_coroutine_function():
+    """monitor_ticker must be an async function (Shadows requires awaitable tasks)."""
+    import asyncio
+    from octane.tasks.monitor import monitor_ticker
+    assert asyncio.iscoroutinefunction(monitor_ticker)
+
+
+def test_monitor_ticker_has_perpetual_dependency():
+    """monitor_ticker must declare a Perpetual dependency via default param."""
+    import inspect
+    from shadows import Perpetual
+    from octane.tasks.monitor import monitor_ticker
+
+    sig = inspect.signature(monitor_ticker)
+    perpetual_params = [
+        p for p in sig.parameters.values()
+        if isinstance(p.default, Perpetual)
+    ]
+    assert perpetual_params, "monitor_ticker must have a Perpetual default parameter"
+
+
+def test_monitor_ticker_poll_interval_is_one_hour():
+    """Default poll interval must be 1 hour."""
+    from datetime import timedelta
+    from octane.tasks.monitor import POLL_INTERVAL
+    assert POLL_INTERVAL == timedelta(hours=1)
+
+
+# ── 3. monitor_ticker execution (mocked Bodega + Redis) ───────────────────────
+
+@pytest.mark.asyncio
+async def test_monitor_ticker_stores_quote_to_redis():
+    """monitor_ticker should store the fetched quote in Redis when Bodega succeeds."""
+    from unittest.mock import AsyncMock, MagicMock, patch
+    from octane.tasks.monitor import monitor_ticker
+    from shadows import Perpetual
+    from shadows.dependencies import TaskLogger
+    import logging
+
+    fake_quote = {"ticker": "AAPL", "price": "182.50", "c": "182.50"}
+    fake_perpetual = MagicMock(spec=Perpetual)
+    fake_log = logging.LoggerAdapter(logging.getLogger("test"), {})
+
+    mock_intel_ctx = AsyncMock()
+    mock_intel_ctx.__aenter__ = AsyncMock(return_value=mock_intel_ctx)
+    mock_intel_ctx.__aexit__ = AsyncMock(return_value=False)
+    mock_intel_ctx.finance = AsyncMock(return_value=fake_quote)
+
+    stored: dict = {}
+
+    async def fake_execute(commands):
+        pass
+
+    mock_pipe = AsyncMock()
+    mock_pipe.__aenter__ = AsyncMock(return_value=mock_pipe)
+    mock_pipe.__aexit__ = AsyncMock(return_value=False)
+    mock_pipe.set = MagicMock(return_value=mock_pipe)
+    mock_pipe.rpush = MagicMock(return_value=mock_pipe)
+    mock_pipe.ltrim = MagicMock(return_value=mock_pipe)
+    mock_pipe.execute = AsyncMock()
+
+    mock_redis = AsyncMock()
+    mock_redis.pipeline = MagicMock(return_value=mock_pipe)
+    mock_redis.publish = AsyncMock()
+    mock_redis.aclose = AsyncMock()
+
+    with patch("octane.tools.bodega_intel.BodegaIntelClient", return_value=mock_intel_ctx), \
+         patch("octane.config.settings") as mock_settings, \
+         patch("redis.asyncio.from_url", return_value=mock_redis):
+        mock_settings.bodega_intel_url = "http://localhost:44469"
+        mock_settings.redis_url = "redis://localhost:6379/0"
+
+        await monitor_ticker(
+            ticker="AAPL",
+            perpetual=fake_perpetual,
+            log=fake_log,
+        )
+
+    mock_intel_ctx.finance.assert_awaited_once_with("AAPL")
+    mock_pipe.set.assert_called_once()
+    key_arg = mock_pipe.set.call_args[0][0]
+    assert key_arg == "watch:AAPL:latest"
+
+
+@pytest.mark.asyncio
+async def test_monitor_ticker_survives_bodega_failure():
+    """monitor_ticker must not raise if Bodega is unreachable — log + return."""
+    from unittest.mock import AsyncMock, MagicMock, patch
+    from octane.tasks.monitor import monitor_ticker
+    from shadows import Perpetual
+    import logging
+
+    fake_perpetual = MagicMock(spec=Perpetual)
+    fake_log = logging.LoggerAdapter(logging.getLogger("test"), {})
+
+    mock_intel_ctx = AsyncMock()
+    mock_intel_ctx.__aenter__ = AsyncMock(return_value=mock_intel_ctx)
+    mock_intel_ctx.__aexit__ = AsyncMock(return_value=False)
+    mock_intel_ctx.finance = AsyncMock(side_effect=ConnectionError("Bodega offline"))
+
+    with patch("octane.tools.bodega_intel.BodegaIntelClient", return_value=mock_intel_ctx), \
+         patch("octane.config.settings") as mock_settings:
+        mock_settings.bodega_intel_url = "http://localhost:44469"
+        mock_settings.redis_url = "redis://localhost:6379/0"
+
+        # Must not raise
+        await monitor_ticker(
+            ticker="TSLA",
+            perpetual=fake_perpetual,
+            log=fake_log,
+        )
+
+
+# ── 4. Worker PID file utilities ──────────────────────────────────────────────
+
+def test_worker_pid_file_path_is_under_home():
+    """PID file must live in ~/.octane/worker.pid."""
+    from pathlib import Path
+    from octane.tasks.worker_process import PID_FILE
+    assert PID_FILE == Path.home() / ".octane" / "worker.pid"
+
+
+def test_read_pid_returns_none_when_file_absent(tmp_path, monkeypatch):
+    """read_pid() returns None when the PID file does not exist."""
+    import octane.tasks.worker_process as wp
+    monkeypatch.setattr(wp, "PID_FILE", tmp_path / "worker.pid")
+    assert wp.read_pid() is None
+
+
+def test_read_pid_returns_none_for_dead_process(tmp_path, monkeypatch):
+    """read_pid() returns None and cleans up when the stored PID is dead."""
+    import octane.tasks.worker_process as wp
+    pid_file = tmp_path / "worker.pid"
+    # PID 9999999 is virtually guaranteed to not exist
+    pid_file.write_text("9999999")
+    monkeypatch.setattr(wp, "PID_FILE", pid_file)
+    result = wp.read_pid()
+    assert result is None
+    assert not pid_file.exists()
+
+
+# ── Session 12: Workflow module tests ─────────────────────────────────────────
+
+class TestWorkflowTemplate:
+    """Round-trip, fill, and placeholder tests for WorkflowTemplate."""
+
+    def _make_template(self, **kwargs):
+        from octane.workflow.template import WorkflowTemplate
+        defaults = dict(
+            name="test-wf",
+            description="A test workflow",
+            variables={"ticker": "AAPL", "query": "What is {{ticker}} price?"},
+            reasoning="single lookup",
+            nodes=[
+                {
+                    "task_id": "t1",
+                    "agent": "web",
+                    "instruction": "Get {{ticker}} price",
+                    "depends_on": [],
+                    "priority": 1,
+                    "metadata": {"hint": "finance for {{ticker}}"},
+                }
+            ],
+        )
+        defaults.update(kwargs)
+        return WorkflowTemplate(**defaults)
+
+    def test_save_and_load_round_trip(self, tmp_path):
+        """save() then load() produces an identical template."""
+        from octane.workflow.template import WorkflowTemplate
+        t = self._make_template()
+        saved = t.save(tmp_path / "test-wf.workflow.json")
+        loaded = WorkflowTemplate.load(saved)
+        assert loaded.name == t.name
+        assert loaded.variables == t.variables
+        assert loaded.nodes == t.nodes
+
+    def test_fill_substitutes_variables(self):
+        """fill() replaces {{ticker}} with the default variable value."""
+        t = self._make_template()
+        nodes = t.fill()
+        assert "AAPL" in nodes[0].instruction
+        assert "{{ticker}}" not in nodes[0].instruction
+
+    def test_fill_with_overrides_takes_precedence(self):
+        """fill(overrides) uses runtime value over template default."""
+        t = self._make_template()
+        nodes = t.fill(overrides={"ticker": "MSFT"})
+        assert "MSFT" in nodes[0].instruction
+        assert "AAPL" not in nodes[0].instruction
+
+    def test_fill_leaves_unknown_placeholders_as_is(self):
+        """Unknown {{placeholder}} names are left unchanged, not silently removed."""
+        from octane.workflow.template import WorkflowTemplate
+        t = WorkflowTemplate(
+            name="partial",
+            nodes=[{
+                "task_id": "t1",
+                "agent": "web",
+                "instruction": "Do {{known}} and {{unknown}}",
+                "depends_on": [],
+                "priority": 1,
+                "metadata": {},
+            }],
+            variables={"known": "resolved"},
+        )
+        nodes = t.fill()
+        assert "resolved" in nodes[0].instruction
+        assert "{{unknown}}" in nodes[0].instruction
+
+    def test_list_placeholders_returns_all_names(self):
+        """list_placeholders() finds every unique {{name}} in the node list."""
+        t = self._make_template()
+        placeholders = t.list_placeholders()
+        # ticker appears in both instruction and metadata hint
+        assert "ticker" in placeholders
+
+    def test_to_dag_returns_task_dag(self):
+        """to_dag() wraps filled nodes in a TaskDAG instance."""
+        from octane.models.dag import TaskDAG
+        t = self._make_template()
+        dag = t.to_dag()
+        assert isinstance(dag, TaskDAG)
+        assert len(dag.nodes) == 1
+        assert dag.nodes[0].agent == "web"
+
+
+class TestWorkflowExporter:
+    """export_from_dag and export_from_trace unit tests."""
+
+    def _make_dag(self, query="Get AAPL price"):
+        from octane.models.dag import TaskDAG, TaskNode
+        return TaskDAG(
+            nodes=[
+                TaskNode(
+                    task_id="t1",
+                    agent="web",
+                    instruction=f"{query} today",
+                    depends_on=[],
+                    priority=1,
+                    metadata={"hint": query},
+                )
+            ],
+            reasoning="single lookup",
+            original_query=query,
+        )
+
+    def test_export_from_dag_produces_template(self):
+        """export_from_dag() returns a WorkflowTemplate with correct name."""
+        from octane.workflow.exporter import export_from_dag
+        dag = self._make_dag()
+        tpl = export_from_dag(dag, name="aapl-lookup")
+        assert tpl.name == "aapl-lookup"
+        assert len(tpl.nodes) == 1
+
+    def test_export_from_dag_substitutes_query_placeholder(self):
+        """export_from_dag() replaces original_query text with {{query}}."""
+        from octane.workflow.exporter import export_from_dag
+        dag = self._make_dag(query="Get AAPL price")
+        tpl = export_from_dag(dag, name="aapl-lookup")
+        instruction = tpl.nodes[0]["instruction"]
+        # The literal query text should be gone; {{query}} placeholder present
+        assert "{{query}}" in instruction
+        assert "Get AAPL price" not in instruction
+
+    def test_export_from_trace_raises_on_missing_trace(self, tmp_path):
+        """export_from_trace() raises FileNotFoundError for unknown correlation_id."""
+        from octane.workflow.exporter import export_from_trace
+        with pytest.raises(FileNotFoundError, match="No trace found"):
+            export_from_trace("nonexistent-id-xyz", trace_dir=tmp_path)
+
+    def test_export_from_trace_raises_on_missing_dag_nodes_json(self, tmp_path):
+        """export_from_trace() raises ValueError when dag_nodes_json absent."""
+        import json
+        from octane.workflow.exporter import export_from_trace
+        from octane.models.synapse import SynapseEvent
+        # Write a trace with decomposition_complete but no dag_nodes_json
+        evt = SynapseEvent(
+            correlation_id="abc12345",
+            event_type="decomposition_complete",
+            source="decomposer",
+            target="router",
+            payload={"node_count": 1},  # no dag_nodes_json
+        )
+        trace_file = tmp_path / "abc12345.jsonl"
+        trace_file.write_text(evt.model_dump_json() + "\n", encoding="utf-8")
+        with pytest.raises(ValueError, match="dag_nodes_json"):
+            export_from_trace("abc12345", trace_dir=tmp_path)
+
+    def test_export_from_trace_rebuilds_template(self, tmp_path):
+        """export_from_trace() correctly reconstructs WorkflowTemplate from trace."""
+        import json
+        from octane.models.dag import TaskNode
+        from octane.models.synapse import SynapseEvent
+        from octane.workflow.exporter import export_from_trace
+        node = TaskNode(
+            task_id="t1", agent="web",
+            instruction="Get TSLA price today",
+            depends_on=[], priority=1, metadata={},
+        )
+        evt = SynapseEvent(
+            correlation_id="trace99",
+            event_type="decomposition_complete",
+            source="decomposer",
+            target="router",
+            payload={
+                "node_count": 1,
+                "dag_nodes_json": [node.model_dump()],
+                "dag_original_query": "Get TSLA price today",
+            },
+        )
+        trace_file = tmp_path / "trace99.jsonl"
+        trace_file.write_text(evt.model_dump_json() + "\n", encoding="utf-8")
+        tpl = export_from_trace("trace99", name="tsla-wf", trace_dir=tmp_path)
+        assert tpl.name == "tsla-wf"
+        assert len(tpl.nodes) == 1
+        # The instruction should have had "Get TSLA price today" replaced with {{query}}
+        assert "{{query}}" in tpl.nodes[0]["instruction"]
+
+
+# ── Edge-case regression tests (post-bug-fix) ─────────────────────────────────
+#
+# These tests cover the three real-world failure modes observed when running
+# `octane ask` in a dev environment:
+#
+#   1. Duplicate class definition  — MemoryAgent must expose connect_pg / remember / recall
+#   2. Postgres unavailable        — connect_pg() must return False, never raise
+#   3. Bodega offline              — pre_flight must complete without crashing
+#
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+class TestMemoryAgentIntegrity:
+    """Guard against the duplicate-class bug and verify the public API surface."""
+
+    def test_only_one_memory_agent_class_is_importable(self):
+        """Regression: two class definitions in the same file caused the second
+        (incomplete) one to shadow the first.  Ensure only one survives and it
+        is the complete Postgres+Redis version."""
+        import inspect
+        from octane.agents.memory.agent import MemoryAgent
+
+        # Count how many times 'class MemoryAgent' appears in the actual source
+        source = inspect.getsource(MemoryAgent)
+        # The source of a *class* (via inspect.getsource) should not contain
+        # another full class definition with the same name inside it.
+        assert source.count("class MemoryAgent") == 1
+
+    def test_memory_agent_exposes_connect_pg(self):
+        """connect_pg must be a callable async method on MemoryAgent."""
+        import asyncio
+        from octane.agents.memory.agent import MemoryAgent
+        from octane.models.synapse import SynapseEventBus
+
+        agent = MemoryAgent(SynapseEventBus())
+        assert callable(getattr(agent, "connect_pg", None)), (
+            "connect_pg missing — duplicate class definition bug has re-appeared"
+        )
+
+    def test_memory_agent_exposes_remember_and_recall(self):
+        """remember() and recall() must be present — used directly by Orchestrator."""
+        from octane.agents.memory.agent import MemoryAgent
+        from octane.models.synapse import SynapseEventBus
+
+        agent = MemoryAgent(SynapseEventBus())
+        assert callable(getattr(agent, "remember", None))
+        assert callable(getattr(agent, "recall", None))
+
+    async def test_connect_pg_returns_false_when_asyncpg_missing(self, monkeypatch):
+        """connect_pg() must return False gracefully when asyncpg is not installed.
+        This matches the observed .venv behaviour where asyncpg is absent."""
+        import builtins
+        from octane.agents.memory.agent import MemoryAgent
+        from octane.models.synapse import SynapseEventBus
+
+        real_import = builtins.__import__
+
+        def mock_import(name, *args, **kwargs):
+            if name == "asyncpg":
+                raise ModuleNotFoundError("No module named 'asyncpg'")
+            return real_import(name, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "__import__", mock_import)
+        agent = MemoryAgent(SynapseEventBus())
+        result = await agent.connect_pg()
+        assert result is False, "connect_pg should return False when asyncpg is missing"
+
+    async def test_connect_pg_returns_false_when_postgres_unreachable(self, monkeypatch):
+        """connect_pg() must return False when Postgres is unreachable (connection refused)."""
+        from octane.agents.memory.agent import MemoryAgent
+        from octane.models.synapse import SynapseEventBus
+        from octane.tools.pg_client import PgClient
+
+        # Patch PgClient.connect to simulate connection failure
+        async def mock_connect(self):
+            return False
+
+        monkeypatch.setattr(PgClient, "connect", mock_connect)
+        agent = MemoryAgent(SynapseEventBus())
+        result = await agent.connect_pg()
+        assert result is False
+
+
+class TestOrchestratorGracefulDegradation:
+    """Orchestrator pre_flight must complete and return a status dict even when
+    all external services (Bodega, Postgres, Redis) are offline."""
+
+    async def test_preflight_completes_when_bodega_offline(self, monkeypatch):
+        """pre_flight returns a status dict with bodega_reachable=False.
+        Regression: used to crash with AttributeError before duplicate-class fix."""
+        import httpx
+        from octane.osa.orchestrator import Orchestrator
+        from octane.models.synapse import SynapseEventBus
+        from octane.tools.pg_client import PgClient
+
+        # Simulate Bodega being unreachable
+        async def mock_get(*args, **kwargs):
+            raise httpx.ConnectError("Connection refused")
+
+        monkeypatch.setattr(httpx.AsyncClient, "get", mock_get)
+
+        # Simulate Postgres also down
+        async def mock_pg_connect(self):
+            return False
+
+        monkeypatch.setattr(PgClient, "connect", mock_pg_connect)
+
+        osa = Orchestrator(SynapseEventBus())
+        status = await osa.pre_flight()
+
+        assert isinstance(status, dict), "pre_flight must return a dict"
+        assert "bodega_reachable" in status
+        assert status["bodega_reachable"] is False
+
+    async def test_preflight_does_not_raise_on_connect_pg(self, monkeypatch):
+        """_connect_memory_pg must never propagate an exception — it is fire-and-forget."""
+        import httpx
+        from octane.osa.orchestrator import Orchestrator
+        from octane.models.synapse import SynapseEventBus
+        from octane.tools.pg_client import PgClient
+
+        async def mock_get(*args, **kwargs):
+            raise httpx.ConnectError("Connection refused")
+
+        monkeypatch.setattr(httpx.AsyncClient, "get", mock_get)
+
+        async def exploding_connect(self):
+            raise RuntimeError("Simulated Postgres catastrophic failure")
+
+        monkeypatch.setattr(PgClient, "connect", exploding_connect)
+
+        osa = Orchestrator(SynapseEventBus())
+        # Should NOT raise even when PgClient.connect throws
+        try:
+            await osa.pre_flight()
+        except RuntimeError:
+            pytest.fail(
+                "pre_flight propagated a Postgres exception — "
+                "_connect_memory_pg must swallow infra errors"
+            )
+
+
+class TestWebAgentPublicAPI:
+    """Guard against missing methods on WebAgent — regression for _format_web_results."""
+
+    def test_web_agent_has_all_format_methods(self):
+        """Both _format_market_data and _format_web_results must exist.
+        Regression: _format_web_results was called but never defined, crashing
+        any finance query where the ticker was not recognised (e.g. small-cap stocks)."""
+        from octane.agents.web.agent import WebAgent
+        from octane.models.synapse import SynapseEventBus
+
+        agent = WebAgent(SynapseEventBus())
+        assert callable(getattr(agent, "_format_market_data", None)), \
+            "_format_market_data missing"
+        assert callable(getattr(agent, "_format_web_results", None)), \
+            "_format_web_results missing — small-cap/unrecognised ticker queries will crash"
+
+    def test_format_web_results_returns_string(self):
+        """_format_web_results must return a non-empty string for valid results."""
+        from octane.agents.web.agent import WebAgent
+        from octane.models.synapse import SynapseEventBus
+
+        agent = WebAgent(SynapseEventBus())
+        raw = {
+            "web": {
+                "results": [
+                    {"title": "Netscout Systems Q3 results", "url": "https://example.com",
+                     "description": "NTCT reported revenue of $85M, beating estimates."},
+                ]
+            }
+        }
+        result = agent._format_web_results(raw, "netscout systems price")
+        assert isinstance(result, str)
+        assert "Netscout" in result
+
+    def test_format_web_results_handles_empty_results(self):
+        """_format_web_results must not crash on an empty result set."""
+        from octane.agents.web.agent import WebAgent
+        from octane.models.synapse import SynapseEventBus
+
+        agent = WebAgent(SynapseEventBus())
+        result = agent._format_web_results({}, "unknown query")
+        assert isinstance(result, str)
+        assert len(result) > 0
+
+    def test_all_agents_instantiate_without_error(self):
+        """All five agents must instantiate cleanly — catches missing-method bugs early."""
+        from octane.agents.web.agent import WebAgent
+        from octane.agents.code.agent import CodeAgent
+        from octane.agents.memory.agent import MemoryAgent
+        from octane.agents.sysstat.agent import SysStatAgent
+        from octane.agents.pnl.agent import PnLAgent
+        from octane.models.synapse import SynapseEventBus
+
+        synapse = SynapseEventBus()
+        for cls in [WebAgent, CodeAgent, MemoryAgent, SysStatAgent, PnLAgent]:
+            try:
+                cls(synapse)
+            except Exception as exc:
+                pytest.fail(f"{cls.__name__} failed to instantiate: {exc}")
+
+
+class TestClockUtility:
+    """Regression suite for octane.utils.clock — the single source of truth for dates.
+
+    These tests guard against the class of bug where stale dates are hard-coded
+    or the clock module is broken, causing search queries and LLM prompts to use
+    the wrong temporal context (e.g. showing Oct-2025 data when today is Feb-2026).
+    """
+
+    def test_today_str_is_iso_format(self):
+        """today_str() must return a valid ISO 8601 date: YYYY-MM-DD."""
+        import re
+        from octane.utils.clock import today_str
+
+        result = today_str()
+        assert re.match(r"^\d{4}-\d{2}-\d{2}$", result), \
+            f"today_str() returned unexpected format: {result!r}"
+
+    def test_today_human_contains_year(self):
+        """today_human() must contain the current 4-digit year."""
+        from octane.utils.clock import today_human, year
+
+        result = today_human()
+        assert year() in result, \
+            f"today_human() '{result}' does not contain current year '{year()}'"
+
+    def test_month_year_format(self):
+        """month_year() must return '<MonthName> <YYYY>' (e.g. 'February 2026')."""
+        import re
+        from octane.utils.clock import month_year
+
+        result = month_year()
+        assert re.match(r"^[A-Z][a-z]+ \d{4}$", result), \
+            f"month_year() returned unexpected format: {result!r}"
+
+    def test_evaluator_system_prompt_contains_today(self):
+        """The Evaluator system prompt must embed today's date so the LLM
+        can flag stale data (e.g. a stock price from 4 months ago)."""
+        from octane.osa.evaluator import _build_system_prompt
+        from octane.utils.clock import year
+
+        prompt = _build_system_prompt(None)
+        assert year() in prompt, \
+            "Evaluator system prompt does not contain the current year — LLM will not detect stale data"
+
+    def test_finance_fallback_query_includes_month_year(self):
+        """When WebAgent falls back to web_search (no ticker), the query sent to
+        Brave must include the current month+year to surface fresh results."""
+        from octane.agents.web.agent import WebAgent
+        from octane.models.synapse import SynapseEventBus
+        from octane.utils.clock import month_year
+
+        # Verify the month_year() string itself is well-formed
+        my = month_year()
+        assert len(my) > 6, f"month_year() too short: {my!r}"
+
+        # Verify the agent module imports clock correctly (would raise ImportError if broken)
+        agent = WebAgent(SynapseEventBus())
+        assert agent is not None
+

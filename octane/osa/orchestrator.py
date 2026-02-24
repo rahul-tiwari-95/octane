@@ -25,7 +25,7 @@ import structlog
 
 from octane.models.schemas import AgentRequest, AgentResponse
 from octane.models.synapse import SynapseEvent, SynapseEventBus
-from octane.models.dag import TaskNode
+from octane.models.dag import TaskNode, TaskDAG
 from octane.osa.decomposer import Decomposer
 from octane.osa.router import Router
 from octane.osa.evaluator import Evaluator
@@ -102,7 +102,12 @@ class Orchestrator:
         """Connect MemoryAgent to Postgres warm tier. Safe to call even if Postgres is down."""
         memory_agent = self._get_memory_agent()
         if memory_agent is not None:
-            await memory_agent.connect_pg()
+            try:
+                await memory_agent.connect_pg()
+            except Exception as exc:
+                # Never crash the pipeline over an infra connection failure.
+                # MemoryAgent will operate in Redis-only fallback mode.
+                logger.warning("memory_pg_connect_error", error=str(exc))
         self._pg_connected = True
 
     async def run(
@@ -166,6 +171,9 @@ class Orchestrator:
                 "reasoning": dag.reasoning,
                 "source": dag.nodes[0].metadata.get("source", "unknown") if dag.nodes else "unknown",
                 "template": dag.nodes[0].metadata.get("template", "") if dag.nodes else "",
+                # Full DAG serialisation — consumed by `octane workflow export`
+                "dag_nodes_json": [n.model_dump() for n in dag.nodes],
+                "dag_original_query": dag.original_query,
             },
         ))
 
@@ -324,6 +332,20 @@ class Orchestrator:
         # Decompose
         dag = await self.decomposer.decompose(query)
 
+        self.synapse.emit(SynapseEvent(
+            correlation_id=correlation_id,
+            event_type="decomposition_complete",
+            source="osa.decomposer",
+            payload={
+                "nodes": len(dag.nodes),
+                "reasoning": dag.reasoning,
+                "source": dag.nodes[0].metadata.get("source", "unknown") if dag.nodes else "unknown",
+                "template": dag.nodes[0].metadata.get("template", "") if dag.nodes else "",
+                "dag_nodes_json": [n.model_dump() for n in dag.nodes],
+                "dag_original_query": dag.original_query,
+            },
+        ))
+
         # Guard rail: unknown agent
         for node in dag.nodes:
             if not self.router.get_agent(node.agent):
@@ -413,6 +435,136 @@ class Orchestrator:
                 "output_preview": full_output[:200],
                 "agents_used": [r.agent for r in results],
                 "mode": "stream",
+                "dag_nodes": len(dag.nodes),
+                "dag_reasoning": dag.reasoning,
+            },
+        ))
+
+    async def run_from_dag(
+        self,
+        dag: TaskDAG,
+        query: str,
+        session_id: str = "cli",
+        conversation_history: list[dict[str, str]] | None = None,
+    ) -> AsyncIterator[str]:
+        """Execute a pre-built TaskDAG, bypassing Guard and Decomposer.
+
+        Used by ``octane workflow run`` to replay a saved workflow template.
+        The DAG's nodes are dispatched directly through the Router → Evaluator
+        pipeline.  Guard is skipped because the template was already vetted
+        when it was first exported.
+
+        Args:
+            dag: Pre-built TaskDAG (from WorkflowTemplate.to_dag()).
+            query: The user-facing query string (shown in egress event).
+            session_id: Session ID for memory read/write.
+            conversation_history: Optional multi-turn context buffer.
+
+        Yields:
+            Text fragments from the Evaluator, same as run_stream().
+        """
+        if not self._preflight_done:
+            await self.pre_flight()
+
+        correlation_id = str(uuid.uuid4())
+
+        self.synapse.emit(SynapseEvent(
+            correlation_id=correlation_id,
+            event_type="ingress",
+            source="user",
+            target="osa",
+            payload={"query": query, "session_id": session_id, "mode": "workflow"},
+        ))
+
+        # Validate agents exist
+        for node in dag.nodes:
+            if not self.router.get_agent(node.agent):
+                yield (
+                    f"⚠ Workflow references unknown agent '{node.agent}'. "
+                    "Check the template and re-export."
+                )
+                return
+
+        # Memory + profile (same as run_stream)
+        memory_agent = self._get_memory_agent()
+        prior_context: str | None = None
+        if memory_agent and session_id != "cli":
+            prior_context = await memory_agent.recall(session_id, query)
+
+        user_profile: dict = {}
+        pnl_agent = self.router.get_agent("pnl")
+        if pnl_agent:
+            try:
+                user_id = session_id.split("_")[0] if "_" in session_id else "default"
+                user_profile = await pnl_agent.get_profile(user_id)
+            except Exception:
+                pass
+
+        # Dispatch — parallel within each wave
+        results: list[AgentResponse] = []
+        accumulated: dict[str, AgentResponse] = {}
+
+        for wave in dag.execution_order():
+            wave_requests = []
+            for node in wave:
+                agent = self.router.get_agent(node.agent)
+                if agent:
+                    instruction = _inject_upstream_data(node, accumulated, query)
+                    self.synapse.emit(SynapseEvent(
+                        correlation_id=correlation_id,
+                        event_type="dispatch",
+                        source="osa.router",
+                        target=node.agent,
+                        payload={"task_id": node.task_id, "instruction": node.instruction},
+                    ))
+                    task_request = AgentRequest(
+                        query=instruction,
+                        correlation_id=correlation_id,
+                        session_id=session_id,
+                        source="osa",
+                        metadata=node.metadata,
+                    )
+                    wave_requests.append((node, agent, task_request))
+                else:
+                    accumulated[node.task_id] = AgentResponse(
+                        agent=node.agent, success=False,
+                        error=f"No agent: {node.agent}",
+                        correlation_id=correlation_id,
+                    )
+
+            if wave_requests:
+                wave_responses = await asyncio.gather(
+                    *[agent.run(req) for _, agent, req in wave_requests],
+                )
+                for (node, _, _), response in zip(wave_requests, wave_responses):
+                    accumulated[node.task_id] = response
+                    results.append(response)
+
+        # Evaluate → stream
+        full_output_parts: list[str] = []
+        async for chunk in self.evaluator.evaluate_stream(
+            query, results,
+            prior_context=prior_context,
+            user_profile=user_profile,
+            conversation_history=conversation_history,
+        ):
+            full_output_parts.append(chunk)
+            yield chunk
+
+        full_output = "".join(full_output_parts).strip()
+
+        if memory_agent and session_id != "cli":
+            await memory_agent.remember(session_id, query, full_output)
+
+        self.synapse.emit(SynapseEvent(
+            correlation_id=correlation_id,
+            event_type="egress",
+            source="osa",
+            target="user",
+            payload={
+                "output_preview": full_output[:200],
+                "agents_used": [r.agent for r in results],
+                "mode": "workflow",
                 "dag_nodes": len(dag.nodes),
                 "dag_reasoning": dag.reasoning,
             },

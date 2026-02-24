@@ -10,9 +10,11 @@ import re
 
 import structlog
 
+from octane.utils.clock import today_human
+
 logger = structlog.get_logger().bind(component="web.synthesizer")
 
-_NEWS_SYSTEM = """\
+_NEWS_SYSTEM_BASE = """\
 You are a news analyst. Given a list of raw news articles, produce a brief \
 structured summary with exactly this format:
 
@@ -26,9 +28,10 @@ Rules:
 - Each insight must be one sentence of factual analysis, not just a restatement.
 - Do not invent facts. Use only what is in the provided articles.
 - Do not mention "agent", "tool", or "API".
+- If an article date is more than 30 days before today, note it as potentially outdated.
 - End with: Sources: <comma-separated publisher names>"""
 
-_SEARCH_SYSTEM = """\
+_SEARCH_SYSTEM_BASE = """\
 You are a research assistant. Given raw web search results, synthesize the \
 key information relevant to the user's query into 2-4 concise bullet points.
 
@@ -36,7 +39,18 @@ Rules:
 - Ground every point in the provided results. Do not invent facts.
 - Be direct. Skip filler phrases like "According to the results..."
 - Do not mention "agent", "tool", or "API".
+- If a result contains a date that is not recent (relative to today), flag it as stale.
 - If the results don't answer the query, say so briefly."""
+
+
+def _news_system() -> str:
+    """Return the news system prompt with today's date injected."""
+    return f"Today's date: {today_human()}.\n\n{_NEWS_SYSTEM_BASE}"
+
+
+def _search_system() -> str:
+    """Return the search system prompt with today's date injected."""
+    return f"Today's date: {today_human()}.\n\n{_SEARCH_SYSTEM_BASE}"
 
 
 class Synthesizer:
@@ -76,7 +90,7 @@ class Synthesizer:
             try:
                 result = await self._bodega.chat_simple(
                     prompt=prompt,
-                    system=_NEWS_SYSTEM,
+                    system=_news_system(),
                     temperature=0.2,
                     max_tokens=512,
                 )
@@ -118,7 +132,7 @@ class Synthesizer:
             try:
                 result = await self._bodega.chat_simple(
                     prompt=prompt,
-                    system=_SEARCH_SYSTEM,
+                    system=_search_system(),
                     temperature=0.2,
                     max_tokens=512,
                 )

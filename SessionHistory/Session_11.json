@@ -1,0 +1,98 @@
+{
+  "session": 11,
+  "phase": 3,
+  "date": "2026-02-23",
+  "title": "Shadows Integration — Background Perpetual Task Monitor",
+  "status": "complete",
+
+  "deliverables": [
+    {
+      "id": "S11-1",
+      "name": "shadow-task installed",
+      "detail": "shadow-task v0.1.3 installed into sandbox/oct_env via python -m pip install shadow-task. Verified: python -c 'import shadows; print(shadows.__version__)' => 0.1.3"
+    },
+    {
+      "id": "S11-2",
+      "name": "octane/tasks/__init__.py",
+      "detail": "New module. Exports octane_tasks = [monitor_ticker] — the TaskCollection consumed by Worker.run(tasks=['octane.tasks:octane_tasks'])."
+    },
+    {
+      "id": "S11-3",
+      "name": "octane/tasks/monitor.py",
+      "detail": "monitor_ticker perpetual task. Polls Bodega Intelligence finance endpoint for a ticker every POLL_INTERVAL (1h). Stores latest quote at watch:<TICKER>:latest, appends to watch:<TICKER>:history (capped at 48 entries), publishes to watch:<TICKER>:events pub/sub channel. All imports inside function body (cloudpickle-safe). Gracefully handles Bodega offline (log.warning + return). Uses redis.asyncio pipeline directly for list ops (rpush/ltrim) not covered by RedisClient."
+    },
+    {
+      "id": "S11-4",
+      "name": "octane/tasks/worker_process.py",
+      "detail": "Subprocess entrypoint for 'python -m octane.tasks.worker_process'. Accepts --shadows-name, --redis-url, --log-level args. Writes PID to ~/.octane/worker.pid on start, removes it on stop. Registers octane.tasks:octane_tasks collection, runs Worker.run_forever(). Exports read_pid() and PID_FILE for CLI use. Handles SIGTERM/SIGINT with graceful asyncio.CancelledError."
+    },
+    {
+      "id": "S11-5",
+      "name": "octane/main.py — watch command group",
+      "detail": "Added watch_app = typer.Typer() sub-app mounted at 'watch'. Five sub-commands: start <ticker> [--every HOURS] — schedules monitor_ticker via Shadow then launches worker subprocess if not running; stop — sends SIGTERM to worker PID; status — shows worker PID + Shadow snapshot table; latest <ticker> — reads watch:<TICKER>:latest from Redis; cancel <ticker> — calls shadow.cancel(ticker). Worker subprocess launched with subprocess.Popen(start_new_session=True) so it survives terminal close."
+    }
+  ],
+
+  "constraints_honoured": [
+    "Foreground OSA pipeline (octane ask / octane chat) NOT replaced by Shadows — synchronous path unchanged",
+    "Shadows only used for perpetual background tasks",
+    "All Shadows imports inside function bodies or worker subprocess only — no top-level import in Octane modules",
+    "monitor_ticker uses ticker symbol as stable task key — Shadow deduplication ensures exactly one loop per symbol"
+  ],
+
+  "tests_added": [
+    "test_octane_tasks_collection_is_non_empty",
+    "test_monitor_ticker_is_in_collection",
+    "test_monitor_ticker_is_coroutine_function",
+    "test_monitor_ticker_has_perpetual_dependency",
+    "test_monitor_ticker_poll_interval_is_one_hour",
+    "test_monitor_ticker_stores_quote_to_redis",
+    "test_monitor_ticker_survives_bodega_failure",
+    "test_worker_pid_file_path_is_under_home",
+    "test_read_pid_returns_none_when_file_absent",
+    "test_read_pid_returns_none_for_dead_process"
+  ],
+
+  "test_counts": {
+    "before": 52,
+    "added": 10,
+    "total": 62,
+    "pass_rate": "62/62",
+    "duration_s": 0.49
+  },
+
+  "files_modified": [
+    "octane/tasks/__init__.py (new)",
+    "octane/tasks/monitor.py (new)",
+    "octane/tasks/worker_process.py (new)",
+    "octane/main.py (watch command group added)",
+    "tests/test_agents.py (10 tests appended)",
+    "SessionHistory/Session_11.json (this file)"
+  ],
+
+  "key_design_decisions": {
+    "no_at_task_decorator": "Shadows has no @task decorator — plain async functions with dependency-injected default parameters. monitor_ticker follows self_perpetuating.py example exactly.",
+    "cloudpickle_safe_imports": "All Octane imports (BodegaIntelClient, settings, redis) are inside the task body. cloudpickle serialises the function closure; top-level module imports in the task file could break deserialization in the worker subprocess.",
+    "ticker_as_task_key": "shadow.add(monitor_ticker, key=ticker) uses the symbol (e.g. AAPL) as the stable Shadows key. Shadow.add() with an existing key is a no-op (returns EXISTS from Lua), so running 'octane watch start AAPL' twice is idempotent.",
+    "perpetual_not_automatic": "automatic=False (default) because the task requires a 'ticker' argument. automatic=True is only for zero-arg tasks. Schedule is triggered explicitly by 'octane watch start <ticker>'.",
+    "subprocess_not_thread": "Worker runs in a separate OS process (subprocess.Popen + start_new_session=True) so it survives after the CLI process exits. PID file at ~/.octane/worker.pid enables status/stop commands.",
+    "redis_pipeline_for_list_ops": "RedisClient only wraps get/set/delete. rpush/ltrim/publish require the raw redis.asyncio client, used directly inside the task body."
+  },
+
+  "redis_key_schema": {
+    "watch:<TICKER>:latest": "JSON string — most recent quote snapshot",
+    "watch:<TICKER>:history": "Redis list — up to 48 hourly snapshots (FIFO, ltrim)",
+    "watch:<TICKER>:events": "Pub/sub channel — publish on each new quote",
+    "octane:queue": "Shadows sorted set — scheduled (future) tasks",
+    "octane:stream": "Shadows Redis stream — immediate/ready tasks",
+    "octane:known:<key>": "Shadows known-task marker",
+    "~/.octane/worker.pid": "Worker OS process PID (file)"
+  },
+
+  "session_12_targets": [
+    "octane workflow export <trace_id> — write DAG + events as JSON template",
+    "octane workflow run <file.json> — replay a saved workflow",
+    "Shareable pipeline format (agent sequence + instructions)",
+    "Polish: octane ask streaming UX improvements, rich error messages"
+  ]
+}

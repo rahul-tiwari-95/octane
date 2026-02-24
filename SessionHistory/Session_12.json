@@ -1,0 +1,88 @@
+{
+  "session": 12,
+  "title": "Workflow Templates + Streaming UX Polish",
+  "date": "2025-01-31",
+  "objectives": [
+    "Export reusable pipeline templates from live DAGs or persisted Synapse traces",
+    "octane workflow export / list / run CLI commands",
+    "Spinner UX for _ask() and _chat() — hides 2-5s pipeline phase before first LLM token",
+    "Enrich decomposition_complete Synapse event with full DAG (dag_nodes_json + dag_original_query)",
+    "Orchestrator.run_from_dag() — bypass Guard+Decomposer for pre-built DAGs",
+    "10 new tests; cumulative suite at 73/73"
+  ],
+  "completed": [
+    {
+      "task": "Enrich decomposition_complete event (run + run_stream)",
+      "detail": "Added dag_nodes_json and dag_original_query fields to payload in both Orchestrator.run() and run_stream(). run_stream() previously emitted no decomposition_complete at all — added it."
+    },
+    {
+      "task": "TaskDAG import fix in orchestrator",
+      "detail": "Added TaskDAG to 'from octane.models.dag import TaskNode, TaskDAG'"
+    },
+    {
+      "task": "Orchestrator.run_from_dag() method (~110 lines)",
+      "detail": "New async generator method. Signature: run_from_dag(dag, query, session_id, conversation_history). Skips Guard+Decomposer. Runs memory recall + user profile fetch identically to run_stream(). Dispatches waves via dag.execution_order() + asyncio.gather. Emits dispatch + egress Synapse events. Streams via evaluator.evaluate_stream(). Writes memory when session_id != 'cli'."
+    },
+    {
+      "task": "octane/workflow/ package (4 files)",
+      "files": [
+        "octane/workflow/__init__.py",
+        "octane/workflow/template.py",
+        "octane/workflow/exporter.py",
+        "octane/workflow/runner.py"
+      ],
+      "detail": "WorkflowTemplate Pydantic model with save/load/fill/to_dag/list_placeholders. {{variable}} substitution via _VAR_RE = re.compile(r'\\{\\{(\\w+)\\}\\}'). Resolution order: overrides > template.variables; unknowns left as-is. export_from_dag() and export_from_trace() build templates from live DAG or .jsonl trace. list_workflows() and load_workflow() for discovery."
+    },
+    {
+      "task": "octane workflow CLI commands in main.py",
+      "commands": [
+        "octane workflow export <trace_id> [--name] [--desc] [--out]",
+        "octane workflow list",
+        "octane workflow run <file> [--var key=value ...] [--query] [--verbose]"
+      ],
+      "detail": "workflow_app = typer.Typer() mounted via app.add_typer(workflow_app, name='workflow'). _workflow_run() uses spinner UX: status.start() before run_from_dag(), status.stop() on first token."
+    },
+    {
+      "task": "Streaming UX polish — _ask()",
+      "detail": "Replaced static 'Processing: {query}' + immediate stream loop with spinner (console.status dots) that starts before osa.run_stream() and stops the moment the first token arrives. Fallback: spinner.stop() if no tokens (guard block)."
+    },
+    {
+      "task": "Streaming UX polish — _chat()",
+      "detail": "Same spinner pattern applied to the per-turn stream loop. Spinner starts before osa.run_stream(), stops on first token, label: '⚙  Working...'. First-token guard prints newline + 'Octane: ' prefix inline."
+    },
+    {
+      "task": "10 new tests (73/73 total)",
+      "classes": [
+        "TestWorkflowTemplate (6 tests): save_and_load_round_trip, fill_substitutes_variables, fill_with_overrides_takes_precedence, fill_leaves_unknown_placeholders_as_is, list_placeholders_returns_all_names, to_dag_returns_task_dag",
+        "TestWorkflowExporter (4 tests): export_from_dag_produces_template, export_from_dag_substitutes_query_placeholder, export_from_trace_raises_on_missing_trace, export_from_trace_raises_on_missing_dag_nodes_json, export_from_trace_rebuilds_template"
+      ],
+      "note": "SynapseEvent requires correlation_id — added to all test constructors. 73 passed in 0.54s."
+    }
+  ],
+  "files_modified": [
+    "octane/osa/orchestrator.py",
+    "octane/main.py",
+    "tests/test_agents.py"
+  ],
+  "files_created": [
+    "octane/workflow/__init__.py",
+    "octane/workflow/template.py",
+    "octane/workflow/exporter.py",
+    "octane/workflow/runner.py"
+  ],
+  "test_results": {
+    "total": 73,
+    "passed": 73,
+    "failed": 0,
+    "duration_seconds": 0.54
+  },
+  "key_design_decisions": [
+    "{{variable}} placeholders in workflow JSON — regex _VAR_RE = r'\\{\\{(\\w+)\\}\\}'. Unknown vars left as-is (not silently dropped).",
+    "export_from_dag auto-substitutes original_query → {{query}} so every exported template is immediately parameterisable.",
+    "export_from_trace requires dag_nodes_json in the decomposition_complete payload (Octane ≥ Session 12). Raises ValueError with clear message for older traces.",
+    "run_from_dag() skips Guard+Decomposer entirely — this is by design. Templates are pre-validated at export time.",
+    "Spinner pattern: status.start() → first-token check → status.stop() + print prefix inline. Covers guard-blocked case (no tokens) with a separate if first_token: status.stop() after loop."
+  ],
+  "cumulative_session_count": 12,
+  "cumulative_test_count": 73
+}

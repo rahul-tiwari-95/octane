@@ -20,6 +20,7 @@ from octane.models.schemas import AgentRequest, AgentResponse
 from octane.tools.bodega_intel import BodegaIntelClient
 from octane.agents.web.synthesizer import Synthesizer
 from octane.agents.web.query_strategist import QueryStrategist
+from octane.utils.clock import month_year, today_str
 
 logger = structlog.get_logger().bind(component="web_agent")
 
@@ -65,8 +66,10 @@ class WebAgent(BaseAgent):
                 )
             summary = self._format_market_data(raw, ticker)
         else:
-            # No ticker found — fall back to web search for financial query
-            raw = await self._intel.web_search(query, count=3)
+            # No ticker found — fall back to a date-enriched web search so
+            # Brave returns current results, not cached pages from months ago.
+            dated_query = f"{query} {month_year()}"
+            raw = await self._intel.web_search(dated_query, count=3)
             if "error" in raw:
                 return AgentResponse(
                     agent=self.name, success=False,
@@ -114,6 +117,34 @@ class WebAgent(BaseAgent):
             f"{ticker}: ${price:.2f} {direction}{abs(change_pct):.2f}% today | "
             f"Volume: {volume:,} | Market Cap: {cap_str}"
         )
+
+    def _format_web_results(self, raw: dict, query: str) -> str:
+        """Turn a generic web_search response into a readable summary string.
+
+        Called when a finance query has no recognised ticker symbol and falls
+        back to a broad web search (e.g. 'netscout systems price').
+        """
+        web = raw.get("web", {})
+        results = web.get("results", [])
+        if not results:
+            # Some APIs return top-level 'results' or 'discussions'
+            results = raw.get("results", []) or raw.get("discussions", {}).get("results", [])
+
+        if not results:
+            return f"No web results found for '{query}'."
+
+        lines = [f"Web results for '{query}' (as of {today_str()}):"]
+        for i, r in enumerate(results[:5], 1):
+            title = r.get("title", "").strip()
+            url = r.get("url", r.get("link", ""))
+            snippet = r.get("description", r.get("snippet", "")).strip()
+            if title:
+                lines.append(f"{i}. {title}")
+            if snippet:
+                lines.append(f"   {snippet[:120]}")
+            if url:
+                lines.append(f"   {url}")
+        return "\n".join(lines)
 
     # ── News ──────────────────────────────────────────────────────────────
 

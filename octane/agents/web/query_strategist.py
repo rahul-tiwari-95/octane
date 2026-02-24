@@ -13,9 +13,11 @@ import re
 
 import structlog
 
+from octane.utils.clock import month_year, today_str
+
 logger = structlog.get_logger().bind(component="web.query_strategist")
 
-_STRATEGIST_SYSTEM = """\
+_STRATEGIST_SYSTEM_BASE = """\
 You are a search query optimizer. Given a user query, return a JSON array of \
 2-3 search variations that maximise coverage of the topic.
 
@@ -29,6 +31,8 @@ Rules:
 - Use "news" for recent events, announcements, headlines.
 - Use "search" for factual/technical/general queries.
 - Variations should be meaningfully different, not just synonyms.
+- For time-sensitive queries (prices, news, current events), include the \
+  current month and year in at least one search variation to ensure fresh results.
 - Return ONLY valid JSON. No prose, no markdown fences."""
 
 _FALLBACK_APIS = {
@@ -80,11 +84,11 @@ class QueryStrategist:
             elif sub_agent in ("news", "web_news"):
                 context_hint = " [Context: this is a news query]"
 
-        prompt = f'Query: "{query}"{context_hint}\n\nGenerate 2-3 search variations.'
+        prompt = f'Today is {today_str()} ({month_year()}).\nQuery: "{query}"{context_hint}\n\nGenerate 2-3 search variations.'
 
         raw = await self._bodega.chat_simple(
             prompt=prompt,
-            system=_STRATEGIST_SYSTEM,
+            system=_STRATEGIST_SYSTEM_BASE,
             temperature=0.3,
             max_tokens=256,
         )

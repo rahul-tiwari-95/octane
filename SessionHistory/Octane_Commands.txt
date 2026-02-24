@@ -1,0 +1,296 @@
+╔══════════════════════════════════════════════════════════════════════════════╗
+║              🔥 OCTANE — Command Reference & Experimentation Guide           ║
+║                          Post-Session 13 Edition                             ║
+╚══════════════════════════════════════════════════════════════════════════════╝
+
+All commands assume the virtualenv is activated:
+    source /Users/rahul/octane/sandbox/oct_env/bin/activate
+    # OR prefix every command with:
+    /Users/rahul/octane/sandbox/oct_env/bin/octane <command>
+
+Abbreviated below as just: octane <command>
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  BASICS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+# Show the full CLI surface
+octane --help
+
+# Version splash screen (shows version, agents, build info)
+octane version
+
+# System health — RAM, CPU, loaded model, Bodega status
+octane health
+
+# List all registered agents and their capabilities
+octane agents
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  octane ask  — Single-shot queries through the full OSA pipeline
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+# Basic ask — watch the spinner, then streaming answer + trace footer
+octane ask "What is the current price of AAPL?"
+
+# Finance + analysis (multi-agent: web.finance + memory + synthesis)
+octane ask "How is NVIDIA performing and should I be paying attention to it?"
+
+# Code agent — generates and explains code
+octane ask "Write a Python function that calculates compound interest"
+
+# News + sentiment
+octane ask "What's the latest news about Apple today?"
+
+# Cross-domain (OSA decomposes into parallel web + code tasks)
+octane ask "Explain what a transformer neural network is and show me a minimal Python example"
+
+# --verbose: shows the full DAG dispatch trace after the answer
+octane ask "What's happening with the S&P 500 today?" --verbose
+
+# --verbose with a code question to see Code Agent steps
+octane ask "Write a script to fetch bitcoin price and plot it" --verbose
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  octane dag  — Preview the decomposition plan WITHOUT running agents (new S13)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# This is pure dry-run — no agents execute, no LLM synthesis happens.
+# Perfect for understanding how Octane thinks about your query.
+
+# See how a finance query gets decomposed
+octane dag "What is Tesla stock doing and what's driving the movement?"
+
+# See how a multi-part research query gets broken into parallel tasks
+octane dag "Compare AMD and Intel's current market position and recent news"
+
+# See how a code query gets planned
+octane dag "Write a web scraper for Hacker News headlines"
+
+# Decompose a complex cross-domain question
+octane dag "What's the latest AI news and write me a Python script to track it automatically"
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  octane trace  — Inspect the Synapse event lifecycle of any query
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+# List recent traces (newest first)
+octane trace
+
+# Full event timeline for a specific query (copy ID from ask footer)
+octane trace <correlation_id>
+
+# Tip: the trace ID appears in the footer after every `octane ask` run.
+# It looks like: 🔗 abc12345   → octane trace abc12345
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  octane chat  — Multi-turn conversation with persistent context
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+# Start a chat session (context flows between turns)
+octane chat
+
+# Inside chat:
+#   You: What is AAPL trading at?
+#   You: What about MSFT?          ← Octane remembers the finance context
+#   You: How do they compare?      ← Multi-hop follow-up
+#   You: exit  (or quit / bye / q)
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  octane session  — Annotated session with full replay
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+# Like chat but shows full Synapse event trace + Redis memory writes when done
+octane session
+
+# Inside session:
+#   Ask 2-3 questions, then type: END
+#   You'll see the full event timeline for every turn + what was written to Redis
+# 
+# Great for understanding: what did Octane remember? what agents ran?
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  octane feedback  — Teach Octane what you liked/didn't like
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+# After a good answer: thumbs up (last trace auto-detected)
+octane feedback thumbs_up
+
+# After a bad answer: thumbs down with specific trace
+octane feedback thumbs_down <trace_id>
+
+# As a different user (user profiles are isolated)
+octane feedback thumbs_up --user rahul
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  octane pref  — Manage your user profile & preferences (new S13)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+# Show current profile (verbosity, expertise, domains, response style)
+octane pref show
+
+# Set verbosity: concise | balanced | detailed
+octane pref set verbosity concise
+octane pref set verbosity detailed
+
+# Set expertise level: beginner | intermediate | advanced
+octane pref set expertise advanced
+octane pref set expertise beginner
+# ↑ Try setting beginner, then ask a hard question — notice simpler explanations
+
+# Set domain interests (comma-separated)
+octane pref set domains finance,technology,ai
+
+# Set response style: prose | bullets | code-first
+octane pref set response_style bullets
+octane pref set response_style code-first
+# ↑ With code-first, Octane leads with a code example before prose explanation
+
+# Reset ALL preferences back to defaults
+octane pref reset
+
+# Fun experiment: set expertise=beginner + verbosity=detailed, ask a hard question,
+# then set expertise=advanced + verbosity=concise, ask the same question.
+# Compare the outputs.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  octane watch  — Background asset monitors (powered by Shadows)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# NOTE: Requires Redis running: redis-server
+# NOTE: Requires Bodega Intel on :8030
+
+# Start a background monitor for AAPL (polls every 1 hour by default)
+octane watch start AAPL
+
+# Start with custom interval (every 2 hours)
+octane watch start TSLA --every 2
+
+# Check worker + task status
+octane watch status
+
+# See the latest stored quote for a ticker
+octane watch latest AAPL
+
+# Cancel a specific ticker monitor (but keep worker running)
+octane watch cancel AAPL
+
+# Stop the worker entirely
+octane watch stop
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  octane workflow  — Reusable pipeline templates
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+# List saved templates
+octane workflow list
+
+# Export a past query as a reusable template
+# (get trace_id from `octane trace` or from ask footer)
+octane workflow export <trace_id> --name "aapl-analysis" --desc "Finance + news for any ticker"
+
+# Run a saved template with variable substitution
+octane workflow run ~/.octane/workflows/aapl-analysis.workflow.json
+
+# Run with variable override (change the ticker without editing the file)
+octane workflow run ~/.octane/workflows/aapl-analysis.workflow.json --var query="What is TSLA doing today?"
+
+# Full pipeline: ask → export → run with new vars
+#   1. octane ask "What is AAPL trading at today?" --verbose
+#   2. octane trace                           ← get the trace_id
+#   3. octane workflow export <id> --name stock-price
+#   4. octane workflow run ~/.octane/workflows/stock-price.workflow.json --var query="TSLA price today"
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  EXPERIMENT SEQUENCES (fun things to try)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+─── Experiment 1: Watch the Pipeline Think ───────────────────────────────────
+# Ask the same query in dry-run mode first, then actually run it.
+# See how the DAG plan maps to the real execution trace.
+
+octane dag "What's the latest news on Tesla and what does it mean for investors?"
+octane ask "What's the latest news on Tesla and what does it mean for investors?" --verbose
+octane trace    ← compare the dag preview to the real events
+
+
+─── Experiment 2: Personalization ────────────────────────────────────────────
+# See how preferences shape the output.
+
+octane pref set verbosity detailed
+octane pref set expertise beginner
+octane pref set response_style bullets
+octane ask "How does a transformer model work?"
+# Now flip it:
+octane pref set verbosity concise
+octane pref set expertise advanced
+octane pref set response_style prose
+octane ask "How does a transformer model work?"
+# Compare the two answers.
+
+
+─── Experiment 3: Session Memory ─────────────────────────────────────────────
+# See Octane build context across turns.
+
+octane session
+# Turn 1: "What is AAPL trading at today?"
+# Turn 2: "What about MSFT?"
+# Turn 3: "Which one would you recommend watching this week?"
+# Turn 4: "Summarise what we discussed"
+# Type: END
+# Watch the Synapse events — notice memory writes increasing each turn.
+
+
+─── Experiment 4: Workflow Factory ───────────────────────────────────────────
+# Build a reusable template from a live query.
+
+octane ask "What is AAPL stock performance this week and any major news?"
+octane trace                              ← grab the first ID
+octane workflow export <id> --name weekly-stock-brief --desc "Weekly brief for any ticker"
+octane workflow list                      ← see it appear
+cat ~/.octane/workflows/weekly-stock-brief.workflow.json   ← inspect the template
+octane workflow run ~/.octane/workflows/weekly-stock-brief.workflow.json --var query="TSLA weekly brief"
+
+
+─── Experiment 5: Health + System State ──────────────────────────────────────
+octane health           ← what model is loaded, RAM usage
+octane agents           ← what agents are registered
+octane version          ← full build info
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  FILE LOCATIONS (things Octane creates on disk)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+~/.octane/traces/         ← Synapse event logs (.jsonl per query)
+~/.octane/workflows/      ← Saved workflow templates (.workflow.json)
+~/.octane/worker.pid      ← Background worker PID file
+~/.octane/outputs/        ← Code agent execution artifacts
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  TROUBLESHOOTING
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+# Check if Bodega inference engine is running
+curl http://localhost:44468/v1/models
+
+# Check if Redis is running
+redis-cli ping    ← should return PONG
+
+# Check if Bodega Intel is running
+curl http://localhost:1111/health
+
+# Run the test suite
+cd /Users/rahul/octane && sandbox/oct_env/bin/python -m pytest tests/test_agents.py -v
+
+# Full rebuild test
+sandbox/oct_env/bin/python -m pytest tests/test_agents.py -v --tb=short 2>&1 | tail -10

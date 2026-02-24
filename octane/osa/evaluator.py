@@ -14,6 +14,7 @@ from collections.abc import AsyncIterator
 import structlog
 
 from octane.models.schemas import AgentResponse
+from octane.utils.clock import today_human
 
 logger = structlog.get_logger().bind(component="osa.evaluator")
 
@@ -26,12 +27,15 @@ Rules:
 - If an agent failed or returned no useful data, acknowledge it briefly \
   and answer with what you have.
 - Do not mention "agents", "tools", or internal system names in your response.
-- Respond directly to the user as if you are one coherent assistant."""
+- Respond directly to the user as if you are one coherent assistant.
+- If the data contains a date that is not today, note that it may be outdated."""
 
 
 def _build_system_prompt(user_profile: dict | None) -> str:
     """Build a personalized system prompt from the user's preference profile."""
-    lines = [_EVALUATOR_SYSTEM_BASE]
+    # Always ground the LLM in the current wall-clock date so it can flag
+    # stale data (e.g. a stock price from 4 months ago) accurately.
+    lines = [_EVALUATOR_SYSTEM_BASE, f"\nToday's date: {today_human()}."]
 
     if user_profile:
         verbosity = user_profile.get("verbosity", "concise")
