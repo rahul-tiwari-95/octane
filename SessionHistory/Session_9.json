@@ -1,0 +1,173 @@
+{
+  "session": 9,
+  "date": "2026-02-23",
+  "title": "Phase 2 Closeout — Memory Depth + Code Self-Healing Events + Model Topology",
+  "status": "complete",
+  "started_at": "2026-02-23T00:00:00Z",
+  "completed_at": "2026-02-23T01:30:00Z",
+
+  "theme": "Close out Phase 2. Three remaining gaps: Postgres warm tier for Memory, Code Agent Synapse observability, and Scaler topology recommendations.",
+
+  "phase_status": {
+    "phase_1": "COMPLETE (Sessions 1-3)",
+    "phase_2": "COMPLETE (Sessions 4-9)",
+    "phase_3": "NEXT (Sessions 10+) — smart routing, context-aware memory, workflow templates"
+  },
+
+  "postgres_setup": {
+    "database": "octane",
+    "host": "localhost",
+    "port": 5432,
+    "user": "postgres",
+    "connection_string": "postgresql://postgres@localhost:5432/octane",
+    "env_var": "POSTGRES_URL in .env",
+    "pgadmin_steps": [
+      "Install pgAdmin 4 for macOS from pgadmin.org",
+      "Add server: localhost:5432, user=postgres",
+      "Create database 'octane' (or let Octane auto-create schema on first connect)",
+      "On first 'octane ask' or 'octane chat': PgClient.connect() runs DDL automatically",
+      "Refresh pgAdmin — memory_chunks table will appear under octane > Tables"
+    ],
+    "table_normalization": {
+      "memory_chunks": {
+        "purpose": "Warm tier — persistent structured memory per session",
+        "normalization": "1NF/2NF — no repeating groups, slot+session_id is the natural key (not enforced as unique to allow history). JSONB metadata avoids over-normalization of sparse fields.",
+        "columns": {
+          "id": "SERIAL PRIMARY KEY — surrogate key for foreign references",
+          "session_id": "TEXT — maps to Octane session (not a FK to a users table yet)",
+          "slot": "TEXT — short label derived from query stopword stripping (e.g. 'nvda_price')",
+          "content": "TEXT — the full agent answer, not normalized further (atomic fact)",
+          "query": "TEXT — original user query that produced this content",
+          "agent_used": "TEXT — which agent produced the content (web, code, etc.)",
+          "metadata": "JSONB — sparse fields: correlation_id, promoted_by, etc.",
+          "access_count": "INTEGER — for Janitor tier promotion decisions",
+          "created_at": "TIMESTAMPTZ — immutable write timestamp",
+          "accessed_at": "TIMESTAMPTZ — updated on every read (for LRU promotion)"
+        },
+        "indexes": [
+          "idx_memory_slot — fast lookup by slot label",
+          "idx_memory_session — fast scan of all session keys",
+          "idx_memory_session_slot — composite for waterfall recall query"
+        ],
+        "design_notes": "Deliberately denormalized on agent_used/query to avoid JOIN cost on hot reads. Phase 4: extract sessions table, FK session_id."
+      },
+      "memory_embeddings": {
+        "purpose": "Cold tier — pgVector semantic similarity search",
+        "normalization": "Extension of memory_chunks via chunk_id FK. Separation keeps plain Postgres warm tier working without pgVector extension.",
+        "columns": {
+          "id": "SERIAL PRIMARY KEY",
+          "chunk_id": "INTEGER FK → memory_chunks.id ON DELETE CASCADE",
+          "embedding": "vector(384) — sentence-transformers all-MiniLM-L6-v2 output",
+          "created_at": "TIMESTAMPTZ"
+        },
+        "indexes": ["idx_embedding_vec — IVFFlat cosine, lists=100 for ANN search"],
+        "status": "Table created if pgVector extension is installed. Embedding generation is Phase 3."
+      }
+    }
+  },
+
+  "goals": [
+    "PgClient — real asyncpg connection pool with schema auto-creation",
+    "memory_chunks table auto-created on first connect (DDL idempotent)",
+    "memory_embeddings table created if pgVector extension available (graceful skip if not)",
+    "MemoryWriter dual-writes to Redis AND Postgres",
+    "MemoryAgent.recall() waterfall: Redis → Postgres → None",
+    "Postgres recall promotes result back to Redis hot cache",
+    "Janitor gains clean() (delete stale rows) and promote_hot() (Redis promotion)",
+    "Scaler recommends model topology from 4 tiers based on available RAM",
+    "SysStatAgent wires Scaler into execute() + format_output()",
+    "octane health shows Recommended Topology panel",
+    "CodeAgent self-healing loop emits structured Synapse events at every state transition",
+    "Orchestrator connects MemoryAgent to Postgres during pre_flight()",
+    "35/35 tests passing"
+  ],
+
+  "deliverables": {
+    "modified_files": [
+      "octane/tools/pg_client.py — full asyncpg implementation (was stub)",
+      "octane/agents/memory/writer.py — dual-write Redis + Postgres",
+      "octane/agents/memory/agent.py — waterfall recall + connect_pg()",
+      "octane/agents/memory/janitor.py — clean() + promote_hot() methods",
+      "octane/agents/sysstat/scaler.py — 4-tier topology from stub",
+      "octane/agents/sysstat/agent.py — wires Scaler into execute()",
+      "octane/agents/code/agent.py — Synapse events for all retry states",
+      "octane/osa/orchestrator.py — _connect_memory_pg() in pre_flight()",
+      "octane/main.py — Topology panel in octane health",
+      "tests/test_agents.py — 14 new Session 9 tests"
+    ]
+  },
+
+  "code_agent_synapse_events": {
+    "code_success": "First-attempt success — no debugger needed",
+    "code_attempt_failed": "An attempt failed — includes error_summary, exit_code, should_retry",
+    "code_debug_invoked": "Debugger called — includes attempt number, error_len",
+    "code_healed": "Subsequent attempt succeeded after debugger fix — healed=true",
+    "code_exhausted": "All retries exhausted with no success — includes last_error, task",
+    "design_note": "These events form the training data signal for Phase 4 VW bandit / LoRA alignment. code_healed after N failures = negative Writer signal. code_success on first try = positive Writer signal."
+  },
+
+  "memory_architecture": {
+    "hot_tier": {
+      "storage": "Redis",
+      "ttl": "24 hours",
+      "key": "memory:{session_id}:{slot}",
+      "use_case": "Within-session recall, sub-millisecond reads"
+    },
+    "warm_tier": {
+      "storage": "Postgres memory_chunks table",
+      "ttl": "Permanent (Janitor cleans after 30 days if never accessed)",
+      "key": "session_id + slot",
+      "use_case": "Cross-session recall, structured data, survives Redis restarts"
+    },
+    "cold_tier": {
+      "storage": "pgVector memory_embeddings table",
+      "ttl": "Permanent",
+      "use_case": "Semantic similarity search (Phase 3 — embedding generation not yet wired)"
+    },
+    "waterfall": "Redis → Postgres → None. First hit wins. Postgres hit promotes to Redis."
+  },
+
+  "scaler_tiers": {
+    "tier_64gb": {"min_ram_gb": 40, "models": ["31B brain", "8B worker", "0.9B grunt"]},
+    "tier_32gb": {"min_ram_gb": 20, "models": ["8B brain", "4B worker", "0.9B grunt"]},
+    "tier_16gb": {"min_ram_gb": 8,  "models": ["8B brain", "0.9B grunt"]},
+    "tier_8gb":  {"min_ram_gb": 0,  "models": ["0.9B brain"]}
+  },
+
+  "graceful_degradation": [
+    "Postgres unavailable → MemoryAgent runs Redis-only, no crash",
+    "pgVector extension absent → memory_embeddings table skipped, warm tier unaffected",
+    "Redis unavailable → in-process dict fallback (existing behavior)",
+    "Bodega offline → keyword fallback (existing behavior)"
+  ],
+
+  "tests": {
+    "total": 35,
+    "passing": 35,
+    "duration_seconds": 0.45,
+    "new_in_session_9": [
+      "test_scaler_recommends_tier_64gb",
+      "test_scaler_recommends_tier_32gb",
+      "test_scaler_recommends_tier_16gb",
+      "test_scaler_recommends_tier_8gb",
+      "test_scaler_exact_boundary_40gb",
+      "test_scaler_just_below_boundary",
+      "test_memory_recall_waterfall_redis_hit",
+      "test_memory_recall_waterfall_all_miss",
+      "test_memory_writer_skips_short_answer",
+      "test_memory_writer_stores_substantive_answer",
+      "test_code_agent_emits_synapse_on_success",
+      "test_code_agent_emits_synapse_on_debug_and_heal",
+      "test_code_agent_emits_code_exhausted_after_max_retries",
+      "test_janitor_sweep_returns_session_keys"
+    ]
+  },
+
+  "phase_3_preview": {
+    "session_10": "Smart routing — OSA.Decomposer uses Synapse history, Router learns from past successes",
+    "session_11": "Context-aware memory augmentation — every synthesis step checks Memory for prior context",
+    "session_12": "Workflow templates — export/import/run JSON workflow definitions",
+    "session_13": "VW Bandit foundation — log routing decisions + outcomes, offline training script",
+    "session_14": "GitHub-ready demo — clean README, asciinema recording, tagged release"
+  }
+}

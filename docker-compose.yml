@@ -1,0 +1,48 @@
+# Octane data layer — Postgres + Redis
+#
+# Usage:
+#   docker compose up -d       # start both
+#   docker compose down        # stop both (data persists in volumes)
+#   docker compose down -v     # stop + wipe all data
+#
+# Postgres connects at: postgresql://postgres:postgres@localhost:5432/octane
+# Redis connects at:    redis://localhost:6379/0
+
+services:
+
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: octane-postgres
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: octane
+    ports:
+      - "5432:5432"
+    volumes:
+      - octane_pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    container_name: redis-docker
+    ports:
+      - "6379:6379"
+    volumes:
+      - octane_redis_data:/data
+    command: redis-server --appendonly yes
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+volumes:
+  octane_pg_data:
+  octane_redis_data:

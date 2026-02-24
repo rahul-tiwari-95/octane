@@ -6,6 +6,8 @@ Model loading/unloading is done ONLY by SysStat.ModelManager.
 
 from __future__ import annotations
 
+import json
+from collections.abc import AsyncIterator
 from typing import Any
 
 import httpx
@@ -90,17 +92,7 @@ class BodegaInferenceClient:
         temperature: float = 0.7,
         max_tokens: int = 2048,
     ) -> str:
-        """Convenience: send a simple prompt, get back just the text.
-
-        Args:
-            prompt: User message
-            system: Optional system message
-            temperature: Sampling temperature
-            max_tokens: Max tokens
-
-        Returns:
-            The assistant's response text
-        """
+        """Convenience: send a simple prompt, get back just the text."""
         messages: list[dict[str, str]] = []
         if system:
             messages.append({"role": "system", "content": system})
@@ -113,6 +105,54 @@ class BodegaInferenceClient:
         )
 
         return result["choices"][0]["message"]["content"]
+
+    async def chat_stream(
+        self,
+        prompt: str,
+        system: str = "",
+        temperature: float = 0.7,
+        max_tokens: int = 2048,
+    ) -> AsyncIterator[str]:
+        """Streaming chat: yields text chunks as they arrive from Bodega.
+
+        Uses the OpenAI-compatible SSE format (data: {...} lines).
+        Each yielded value is a raw text fragment — callers print them
+        immediately to give the user a real-time typing effect.
+
+        Usage:
+            async for chunk in bodega.chat_stream(prompt, system=sys):
+                print(chunk, end="", flush=True)
+        """
+        messages: list[dict[str, str]] = []
+        if system:
+            messages.append({"role": "system", "content": system})
+        messages.append({"role": "user", "content": prompt})
+
+        payload = {
+            "model": "current",
+            "messages": messages,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+            "stream": True,
+        }
+
+        client = await self._get_client()
+        async with client.stream("POST", "/v1/chat/completions", json=payload) as response:
+            response.raise_for_status()
+            async for line in response.aiter_lines():
+                if not line.startswith("data:"):
+                    continue
+                data = line[5:].strip()
+                if data == "[DONE]":
+                    break
+                try:
+                    chunk = json.loads(data)
+                    delta = chunk["choices"][0].get("delta", {})
+                    text = delta.get("content", "")
+                    if text:
+                        yield text
+                except (json.JSONDecodeError, KeyError, IndexError):
+                    continue
 
     # ---- Health & Info ----
 

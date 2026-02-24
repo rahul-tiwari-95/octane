@@ -43,8 +43,10 @@ class MemoryRouter:
     def _extract_slot(self, query: str) -> str:
         """Generate a short, stable slot label from the query text."""
         # Strip common stop words, take first 3 meaningful words
-        stopwords = {"what", "is", "the", "a", "an", "of", "for", "in", "on",
-                     "at", "to", "and", "or", "do", "you", "me", "my", "i"}
+        stopwords = {"what", "was", "were", "is", "are", "the", "a", "an",
+                     "of", "for", "in", "on", "at", "to", "and", "or",
+                     "do", "did", "you", "me", "my", "i", "tell", "show",
+                     "give", "get", "has", "had", "have", "been", "be"}
         words = re.findall(r"[a-z0-9]+", query.lower())
         meaningful = [w for w in words if w not in stopwords][:3]
         return "_".join(meaningful) if meaningful else "general"

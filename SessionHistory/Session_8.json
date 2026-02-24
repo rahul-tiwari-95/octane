@@ -1,0 +1,106 @@
+{
+  "session": 8,
+  "date": "2026-02-22",
+  "title": "Multi-Step DAG Execution — Real Data for Code Agent",
+  "status": "complete",
+  "started_at": "2026-02-22T18:00:00Z",
+  "completed_at": "2026-02-22T21:50:00Z",
+
+  "motivation": "User asked for a comparative capex chart (MSFT, AMZN, META, GOOGL, last 5 years with AI-buildout data points). The system routed the entire query to code_generation as a single node — CodeAgent had no real financial data, produced a chart with hardcoded LLM-hallucinated numbers, and the chart was deleted when the temp dir was cleaned up. Both problems needed fixing properly, for scalability.",
+
+  "goals": [
+    "Build DAGPlanner to decompose compound queries into multi-node execution plans",
+    "Wire DAGPlanner into Decomposer as the primary path for compound queries",
+    "Inject upstream agent outputs into dependent nodes (data propagation across waves)",
+    "Persist chart/CSV artifacts permanently in ~/octane_output/<correlation_id>/",
+    "Inject OUTPUT_DIR variable into every executed script so code can save files",
+    "Surface saved file paths in CodeAgent response so user knows where to find charts",
+    "Fix _collect_artifacts to scan both tmpdir (cwd) and output_dir (OUTPUT_DIR)",
+    "Write 8 new tests covering DAGPlanner, data injection, and artifact saving",
+    "All 21 tests green"
+  ],
+
+  "deliverables": {
+    "new_files": [
+      "octane/osa/dag_planner.py — DAGPlanner class (266 lines)"
+    ],
+    "modified_files": [
+      "octane/osa/decomposer.py — tries DAGPlanner first for compound queries",
+      "octane/osa/orchestrator.py — _inject_upstream_data in both run() + run_stream() dispatch loops",
+      "octane/agents/code/executor.py — permanent output dir, OUTPUT_DIR preamble, _collect_artifacts (both dirs), TIMEOUT 30→60s",
+      "octane/agents/code/agent.py — passes correlation_id to executor; _format_success shows saved files",
+      "tests/test_agents.py — 8 new Session 8 tests"
+    ]
+  },
+
+  "architecture": {
+    "dag_planner": {
+      "location": "octane/osa/dag_planner.py",
+      "description": "Plans multi-step DAGs for compound queries. Sits between Decomposer and single-node fallback.",
+      "compound_signal_examples": ["chart", "graph", "compare", "analyze", "then", "based on", "with the data", "visualize"],
+      "llm_output_format": "N. agent/template | instruction\\ndepends_on: N needs M, K",
+      "valid_templates": ["web_finance", "web_news", "web_search", "code_generation", "memory_recall", "sysstat_health"],
+      "fallback": "Returns None if LLM fails or produces ≤1 node — Decomposer falls back to single-node classifier"
+    },
+    "data_injection": {
+      "location": "octane/osa/orchestrator.py — _inject_upstream_data()",
+      "description": "Prepends upstream agent outputs (real data) to dependent node's instruction. Applied in both run() and run_stream() dispatch loops.",
+      "truncation": "800 chars per upstream output, then '... [truncated]'",
+      "effect": "CodeAgent receives real fetched financial data instead of having to hallucinate numbers"
+    },
+    "artifact_persistence": {
+      "location": "octane/agents/code/executor.py",
+      "output_root": "~/octane_output/<correlation_id>/",
+      "preamble": "OUTPUT_DIR variable injected at top of every executed script",
+      "scan_locations": ["output_dir (files written directly via OUTPUT_DIR)", "tmpdir (cwd files copied over)"],
+      "extensions": [".png", ".jpg", ".jpeg", ".svg", ".pdf", ".csv", ".json", ".txt", ".html"]
+    }
+  },
+
+  "example_query_flow": {
+    "query": "chart capex for MSFT, GOOGL, META, AMZN last 5 years",
+    "step_1_is_compound": true,
+    "step_2_dag_planned": [
+      "1. web/web_finance | MSFT total capex last 5 years",
+      "2. web/web_finance | GOOGL total capex last 5 years",
+      "3. web/web_finance | META total capex last 5 years",
+      "4. web/web_finance | AMZN total capex last 5 years",
+      "5. code/code_generation | Create comparative capex bar chart",
+      "depends_on: 5 needs 1, 2, 3, 4"
+    ],
+    "step_3_wave_1": "nodes 1-4 execute in parallel (web_finance)",
+    "step_4_wave_2": "node 5 receives all 4 real datasets via _inject_upstream_data",
+    "step_5_output": "Chart saved to ~/octane_output/<correlation_id>/capex_chart.png",
+    "step_6_user_told": "_format_success lists saved files with full path"
+  },
+
+  "bugs_fixed": [
+    "Charts deleted on exec completion — temp dir cleaned up. Fix: permanent ~/octane_output/<correlation_id>/ dir.",
+    "_collect_artifacts only scanned tmpdir, missed files written to OUTPUT_DIR directly. Fix: scan both dirs.",
+    "CodeAgent had no real data for compound queries — produced hallucinated numbers. Fix: DAGPlanner + _inject_upstream_data.",
+    "_format_success didn't tell user where charts were saved. Fix: added '── Saved files ──' section."
+  ],
+
+  "tests": {
+    "total": 21,
+    "passing": 21,
+    "duration_seconds": 0.42,
+    "new_in_session_8": [
+      "test_dag_planner_detects_compound_query — 6 compound queries all True",
+      "test_dag_planner_simple_query_not_compound — 5 simple queries all False",
+      "test_dag_planner_parse_plan_builds_dag — 3-node plan with correct dependencies",
+      "test_dag_planner_trivial_plan_returns_none — 1-node parse (plan() filters it)",
+      "test_inject_upstream_data_root_node_unchanged — no depends_on → passthrough",
+      "test_inject_upstream_data_enriches_dependent_node — upstream output prepended",
+      "test_inject_upstream_data_truncates_long_output — 2000-char output truncated at 800",
+      "test_executor_creates_output_dir_and_saves_artifacts — CSV written to OUTPUT_DIR persists"
+    ]
+  },
+
+  "notes": [
+    "DAGPlanner requires Bodega to be online — returns None (graceful fallback) if bodega=None or LLM call fails",
+    "Compound detection is heuristic (regex). Will occasionally mis-classify; fallback to single-node is always safe.",
+    "OUTPUT_DIR injection means all scripts can use it without importing anything — it's a plain string variable",
+    "correlation_id flows from CLI → Orchestrator → AgentRequest → CodeAgent → Executor → output dir name, making traces and output dirs co-located by the same ID"
+  ]
+}

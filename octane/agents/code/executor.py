@@ -5,28 +5,43 @@ Isolation model:
   - pip installs go into that tempdir only (--target)
   - Hard timeout: 30 seconds max
   - stdout + stderr captured separately
-  - Returns dict with stdout, stderr, exit_code, duration_ms
+  - Output files (charts, CSVs) are copied to ~/octane_output/<correlation_id>/
+  - Returns dict with stdout, stderr, exit_code, duration_ms, output_files
 """
 
 from __future__ import annotations
 
 import asyncio
 import os
+import shutil
 import sys
 import tempfile
 import time
+from pathlib import Path
+
 import structlog
 
 logger = structlog.get_logger().bind(component="code.executor")
 
-TIMEOUT_SECONDS = 30
-MAX_OUTPUT_CHARS = 4000  # Truncate runaway output
+TIMEOUT_SECONDS = 60
+MAX_OUTPUT_CHARS = 4000
+
+# Where output files (charts, CSVs) are saved permanently
+OUTPUT_ROOT = Path.home() / "octane_output"
+
+# File extensions considered "output artifacts" worth saving
+_ARTIFACT_EXTENSIONS = {".png", ".jpg", ".jpeg", ".svg", ".pdf", ".csv", ".json", ".txt", ".html"}
 
 
 class Executor:
     """Runs Python code in an isolated subprocess with optional pip deps."""
 
-    async def run(self, code: str, requirements: list[str] | None = None) -> dict:
+    async def run(
+        self,
+        code: str,
+        requirements: list[str] | None = None,
+        correlation_id: str | None = None,
+    ) -> dict:
         """
         Execute code string. Returns:
             {
@@ -35,16 +50,30 @@ class Executor:
                 "exit_code": int,
                 "duration_ms": float,
                 "truncated": bool,
+                "output_dir": str | None,   # path where artifacts were saved
+                "output_files": list[str],  # filenames of saved artifacts
             }
         """
         start = time.monotonic()
+
+        # Prepare permanent output dir for this execution
+        run_id = correlation_id or f"run_{int(time.time() * 1000)}"
+        output_dir = OUTPUT_ROOT / run_id
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        # Inject OUTPUT_DIR into the code so scripts can use it
+        preamble = (
+            f"import os as _os\n"
+            f"OUTPUT_DIR = r'{output_dir}'\n"
+            f"_os.makedirs(OUTPUT_DIR, exist_ok=True)\n\n"
+        )
+        code_with_preamble = preamble + code
+
         with tempfile.TemporaryDirectory(prefix="octane_exec_") as tmpdir:
-            # Write code to file
             code_path = os.path.join(tmpdir, "solution.py")
             with open(code_path, "w", encoding="utf-8") as f:
-                f.write(code)
+                f.write(code_with_preamble)
 
-            # Install requirements if any
             if requirements:
                 install_result = await self._install_deps(requirements, tmpdir)
                 if install_result["exit_code"] != 0:
@@ -54,12 +83,12 @@ class Executor:
                         "exit_code": 1,
                         "duration_ms": (time.monotonic() - start) * 1000,
                         "truncated": False,
+                        "output_dir": str(output_dir),
+                        "output_files": [],
                     }
 
-            # Run the code
             env = os.environ.copy()
             if requirements:
-                # Add our tmp site-packages to PYTHONPATH
                 env["PYTHONPATH"] = tmpdir + os.pathsep + env.get("PYTHONPATH", "")
 
             result = await self._run_subprocess(
@@ -68,13 +97,21 @@ class Executor:
                 env=env,
             )
 
+            # Collect any artifact files written to tmpdir or output_dir
+            artifacts = self._collect_artifacts(tmpdir, output_dir)
+
         duration_ms = (time.monotonic() - start) * 1000
         result["duration_ms"] = duration_ms
+        result["output_dir"] = str(output_dir) if artifacts else None
+        result["output_files"] = artifacts
+
         logger.info(
             "execution_complete",
             exit_code=result["exit_code"],
             duration_ms=f"{duration_ms:.0f}",
             stdout_len=len(result["stdout"]),
+            artifacts=len(artifacts),
+            output_dir=str(output_dir) if artifacts else None,
         )
         return result
 
@@ -85,6 +122,37 @@ class Executor:
             [sys.executable, "-m", "pip", "install", "--quiet",
              "--target", target_dir, *requirements],
         )
+
+    def _collect_artifacts(self, tmpdir: str, output_dir: Path) -> list[str]:
+        """Collect artifact files from both tmpdir and output_dir.
+
+        Scripts may write to OUTPUT_DIR directly (already in output_dir) or
+        to their cwd (tmpdir). Both locations are scanned; tmpdir files are
+        copied, output_dir files are already in place.
+        Returns list of filenames found.
+        """
+        saved: list[str] = []
+
+        # Files the script wrote directly to OUTPUT_DIR (already in place)
+        for item in output_dir.iterdir():
+            if item.is_file() and item.suffix.lower() in _ARTIFACT_EXTENSIONS:
+                saved.append(item.name)
+                logger.info("artifact_found", file=item.name, path=str(item))
+
+        # Files the script wrote to cwd (tmpdir) — copy them over
+        for root, _, files in os.walk(tmpdir):
+            for fname in files:
+                if Path(fname).suffix.lower() in _ARTIFACT_EXTENSIONS:
+                    src = Path(root) / fname
+                    dst = output_dir / fname
+                    if fname not in saved:  # avoid double-counting
+                        try:
+                            shutil.copy2(src, dst)
+                            saved.append(fname)
+                            logger.info("artifact_saved", file=fname, path=str(dst))
+                        except Exception as e:
+                            logger.warning("artifact_copy_failed", file=fname, error=str(e))
+        return saved
 
     async def _run_subprocess(
         self,

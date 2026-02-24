@@ -22,6 +22,7 @@ from octane.agents.code.planner import Planner
 from octane.agents.code.validator import Validator
 from octane.agents.code.writer import Writer
 from octane.models.schemas import AgentRequest, AgentResponse
+from octane.models.synapse import SynapseEvent
 from octane.tools.bodega_inference import BodegaInferenceClient
 
 logger = structlog.get_logger().bind(component="code.agent")
@@ -63,24 +64,63 @@ class CodeAgent(BaseAgent):
             logger.info("executing_attempt", attempt=attempt)
 
             # ── EXECUTE ───────────────────────────────────────────────────
-            exec_result = await self.executor.run(code, requirements=requirements)
+            exec_result = await self.executor.run(
+                code,
+                requirements=requirements,
+                correlation_id=request.correlation_id,
+            )
 
             # ── VALIDATE ──────────────────────────────────────────────────
             validation = self.validator.validate(exec_result)
 
             if validation["passed"]:
                 logger.info("code_success", attempt=attempt)
+                self.synapse.emit(SynapseEvent(
+                    correlation_id=request.correlation_id or "unknown",
+                    event_type="code_healed" if attempt > 1 else "code_success",
+                    source="code.agent",
+                    payload={
+                        "attempt": attempt,
+                        "duration_ms": exec_result.get("duration_ms", 0),
+                        "output_files": exec_result.get("output_files", []),
+                        "healed": attempt > 1,
+                    },
+                ))
                 break
 
             last_error = validation["error_summary"]
             logger.warning("code_failed", attempt=attempt, error=last_error[:120])
+
+            self.synapse.emit(SynapseEvent(
+                correlation_id=request.correlation_id or "unknown",
+                event_type="code_attempt_failed",
+                source="code.agent",
+                payload={
+                    "attempt": attempt,
+                    "error_summary": last_error[:200],
+                    "should_retry": validation["should_retry"],
+                    "exit_code": exec_result.get("exit_code"),
+                },
+            ))
 
             if not validation["should_retry"] or attempt == MAX_RETRIES:
                 break
 
             # ── DEBUG → REWRITE ───────────────────────────────────────────
             logger.info("invoking_debugger", attempt=attempt)
-            code = await self.debugger.debug(code, last_error)
+            self.synapse.emit(SynapseEvent(
+                correlation_id=request.correlation_id or "unknown",
+                event_type="code_debug_invoked",
+                source="code.agent",
+                payload={"attempt": attempt, "error_len": len(last_error)},
+            ))
+            fixed_code = await self.debugger.debug(code, last_error)
+            if fixed_code and fixed_code != code:
+                code = fixed_code
+                logger.info("code_rewritten_by_debugger", attempt=attempt)
+            else:
+                logger.warning("debugger_no_change_stopping", attempt=attempt)
+                break
 
         # ── FORMAT RESPONSE ───────────────────────────────────────────────
         if validation.get("passed"):
@@ -97,6 +137,16 @@ class CodeAgent(BaseAgent):
                 correlation_id=request.correlation_id,
             )
         else:
+            self.synapse.emit(SynapseEvent(
+                correlation_id=request.correlation_id or "unknown",
+                event_type="code_exhausted",
+                source="code.agent",
+                payload={
+                    "attempts": MAX_RETRIES,
+                    "last_error": (last_error or "")[:200],
+                    "task": task[:120],
+                },
+            ))
             output_text = self._format_failure(task, last_error, code)
             return AgentResponse(
                 agent=self.name,
@@ -116,9 +166,21 @@ class CodeAgent(BaseAgent):
     ) -> str:
         output = validation.get("output", "").strip()
         duration = exec_result.get("duration_ms", 0)
+        artifacts = exec_result.get("output_files", [])
+        output_dir = exec_result.get("output_dir")
+
         lines = [
             f"✅ Code executed successfully ({duration:.0f}ms)",
             f"Task: {task}",
+        ]
+
+        if artifacts and output_dir:
+            lines.append("")
+            lines.append("── Saved files ──")
+            for f in artifacts:
+                lines.append(f"  📄 {output_dir}/{f}")
+
+        lines += [
             "",
             "── Output ──",
             output or "(no stdout)",

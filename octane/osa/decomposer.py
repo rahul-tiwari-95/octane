@@ -11,6 +11,7 @@ from __future__ import annotations
 import structlog
 
 from octane.models.dag import TaskDAG, TaskNode
+from octane.osa.dag_planner import DAGPlanner
 
 logger = structlog.get_logger().bind(component="osa.decomposer")
 
@@ -88,14 +89,29 @@ class Decomposer:
     def __init__(self, bodega=None) -> None:
         # Bodega client injected by Orchestrator (avoids circular imports)
         self._bodega = bodega
+        self._dag_planner = DAGPlanner(bodega=bodega)
 
     async def decompose(self, query: str) -> TaskDAG:
         """Analyze the query and produce a TaskDAG.
 
-        Tries LLM classification first, falls back to keywords.
+        For compound queries (fetch + code, multi-company, etc.) the DAGPlanner
+        is tried first. Falls back to single-node classification if planning
+        produces a trivial or invalid result.
         """
-        template_name, reasoning, source = await self._classify(query)
+        # Attempt multi-node planning for compound queries
+        if self._dag_planner.is_compound(query):
+            dag = await self._dag_planner.plan(query)
+            if dag is not None:
+                logger.info(
+                    "decomposed_multi",
+                    query=query[:80],
+                    nodes=len(dag.nodes),
+                    waves=len(dag.execution_order()),
+                )
+                return dag
 
+        # Single-node fallback
+        template_name, reasoning, source = await self._classify(query)
         template = PIPELINE_TEMPLATES[template_name]
 
         dag = TaskDAG(

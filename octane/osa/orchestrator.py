@@ -8,17 +8,24 @@ Every user query flows through here. The Orchestrator:
 5. Dispatch    — execute tasks (parallel within wave, sequential across waves)
 6. Evaluate    — LLM synthesis of all agent results
 7. Egress      — Synapse event + return output
+
+Session 10:
+- conversation_history buffer for multi-turn chat continuity
+- run_stream() accepts optional conversation_history
+- DAG execution metadata surfaced in egress event for --verbose flag
 """
 
 from __future__ import annotations
 
 import asyncio
 import uuid
+from collections.abc import AsyncIterator
 
 import structlog
 
 from octane.models.schemas import AgentRequest, AgentResponse
 from octane.models.synapse import SynapseEvent, SynapseEventBus
+from octane.models.dag import TaskNode
 from octane.osa.decomposer import Decomposer
 from octane.osa.router import Router
 from octane.osa.evaluator import Evaluator
@@ -43,6 +50,7 @@ class Orchestrator:
         self._preflight_done = False
         # Memory agent reference (resolved lazily from router to avoid circular import)
         self._memory_agent = None
+        self._pg_connected = False
 
     async def pre_flight(self) -> dict:
         """Check Bodega is reachable and a model is loaded.
@@ -75,6 +83,10 @@ class Orchestrator:
             status["note"] = f"Bodega check failed: {exc} — using keyword fallback"
             logger.warning("bodega_preflight_error", error=str(exc))
 
+        # Connect Postgres warm tier on first startup (non-blocking, graceful fallback)
+        if not self._pg_connected:
+            await self._connect_memory_pg()
+
         self._preflight_done = True
 
         self.synapse.emit(SynapseEvent(
@@ -86,8 +98,29 @@ class Orchestrator:
 
         return status
 
-    async def run(self, query: str, session_id: str = "cli") -> str:
-        """Main orchestration loop."""
+    async def _connect_memory_pg(self) -> None:
+        """Connect MemoryAgent to Postgres warm tier. Safe to call even if Postgres is down."""
+        memory_agent = self._get_memory_agent()
+        if memory_agent is not None:
+            await memory_agent.connect_pg()
+        self._pg_connected = True
+
+    async def run(
+        self,
+        query: str,
+        session_id: str = "cli",
+        conversation_history: list[dict[str, str]] | None = None,
+    ) -> str:
+        """Main orchestration loop.
+
+        Args:
+            query: The user's query.
+            session_id: Session identifier for memory recall/write.
+            conversation_history: Optional rolling buffer of prior turns
+                [{"role": "user"|"assistant", "content": "..."}].
+                When provided, injected into the Evaluator prompt so the
+                LLM has direct multi-turn context (supplements memory recall).
+        """
         # Run pre_flight lazily on first query if not already done
         if not self._preflight_done:
             await self.pre_flight()
@@ -136,6 +169,15 @@ class Orchestrator:
             },
         ))
 
+        # GUARD RAIL: reject if the decomposer mapped to an agent we don't have
+        for node in dag.nodes:
+            if not self.router.get_agent(node.agent):
+                logger.warning("unknown_agent_rejected", agent=node.agent, query=query[:80])
+                return (
+                    "I'm not sure how to help with that. "
+                    "Try rephrasing, or ask about web search, code, news, finance, or system status."
+                )
+
         # STEP 3.5: MEMORY RECALL — inject prior context for chat continuity
         memory_agent = self._get_memory_agent()
         prior_context: str | None = None
@@ -172,8 +214,12 @@ class Orchestrator:
 
                 agent = self.router.get_agent(node.agent)
                 if agent:
+                    # DATA INJECTION: enrich instruction with upstream results
+                    instruction = _inject_upstream_data(
+                        node, accumulated, dag.original_query
+                    )
                     task_request = AgentRequest(
-                        query=node.instruction,
+                        query=instruction,
                         correlation_id=correlation_id,
                         session_id=session_id,
                         source="osa",
@@ -204,6 +250,7 @@ class Orchestrator:
             query, results,
             prior_context=prior_context,
             user_profile=user_profile,
+            conversation_history=conversation_history,
         )
 
         # STEP 5.5: MEMORY WRITE — persist the answer for future recall
@@ -221,6 +268,8 @@ class Orchestrator:
                 "agents_used": [r.agent for r in results],
                 "tasks_total": len(results),
                 "tasks_succeeded": sum(1 for r in results if r.success),
+                "dag_nodes": len(dag.nodes),
+                "dag_reasoning": dag.reasoning,
             },
         ))
 
@@ -231,3 +280,176 @@ class Orchestrator:
         if self._memory_agent is None:
             self._memory_agent = self.router.get_agent("memory")
         return self._memory_agent
+
+    async def run_stream(
+        self,
+        query: str,
+        session_id: str = "cli",
+        conversation_history: list[dict[str, str]] | None = None,
+    ) -> AsyncIterator[str]:
+        """Like run(), but streams Evaluator tokens as they arrive.
+
+        Runs the full pipeline (guard → decompose → dispatch) synchronously,
+        then streams the Evaluator output chunk-by-chunk.
+
+        Args:
+            query: The user's query.
+            session_id: Session identifier for memory recall/write.
+            conversation_history: Optional rolling buffer of prior turns for
+                direct multi-turn context injection into the Evaluator.
+
+        Yields:
+            Text fragments from the LLM as they are generated.
+            The final complete string is also written to memory.
+        """
+        if not self._preflight_done:
+            await self.pre_flight()
+
+        correlation_id = str(uuid.uuid4())
+
+        self.synapse.emit(SynapseEvent(
+            correlation_id=correlation_id,
+            event_type="ingress",
+            source="user",
+            target="osa",
+            payload={"query": query, "session_id": session_id, "mode": "stream"},
+        ))
+
+        # Guard
+        guard_result = await self.guard.check_input(query)
+        if not guard_result["safe"]:
+            yield f"⚠ Query blocked: {guard_result.get('reason', 'Safety check failed')}"
+            return
+
+        # Decompose
+        dag = await self.decomposer.decompose(query)
+
+        # Guard rail: unknown agent
+        for node in dag.nodes:
+            if not self.router.get_agent(node.agent):
+                logger.warning("unknown_agent_rejected", agent=node.agent, query=query[:80])
+                yield (
+                    "I'm not sure how to help with that. "
+                    "Try rephrasing, or ask about web search, code, news, finance, or system status."
+                )
+                return
+
+        # Memory recall
+        memory_agent = self._get_memory_agent()
+        prior_context: str | None = None
+        if memory_agent and session_id != "cli":
+            prior_context = await memory_agent.recall(session_id, query)
+            if prior_context:
+                logger.info("memory_recalled", session_id=session_id, preview=prior_context[:60])
+
+        # User profile
+        user_profile: dict = {}
+        pnl_agent = self.router.get_agent("pnl")
+        if pnl_agent:
+            try:
+                user_id = session_id.split("_")[0] if "_" in session_id else "default"
+                user_profile = await pnl_agent.get_profile(user_id)
+            except Exception:
+                pass
+
+        # Dispatch
+        results: list[AgentResponse] = []
+        accumulated: dict[str, AgentResponse] = {}
+
+        for wave in dag.execution_order():
+            wave_requests = []
+            for node in wave:
+                agent = self.router.get_agent(node.agent)
+                if agent:
+                    instruction = _inject_upstream_data(
+                        node, accumulated, dag.original_query
+                    )
+                    task_request = AgentRequest(
+                        query=instruction,
+                        correlation_id=correlation_id,
+                        session_id=session_id,
+                        source="osa",
+                        metadata=node.metadata,
+                    )
+                    wave_requests.append((node, agent, task_request))
+                else:
+                    accumulated[node.task_id] = AgentResponse(
+                        agent=node.agent, success=False,
+                        error=f"No agent registered for: {node.agent}",
+                        correlation_id=correlation_id,
+                    )
+
+            if wave_requests:
+                wave_responses = await asyncio.gather(
+                    *[agent.run(req) for _, agent, req in wave_requests],
+                )
+                for (node, _, _), response in zip(wave_requests, wave_responses):
+                    accumulated[node.task_id] = response
+                    results.append(response)
+
+        # Stream evaluate — collect full output for memory write
+        full_output_parts: list[str] = []
+        async for chunk in self.evaluator.evaluate_stream(
+            query, results,
+            prior_context=prior_context,
+            user_profile=user_profile,
+            conversation_history=conversation_history,
+        ):
+            full_output_parts.append(chunk)
+            yield chunk
+
+        full_output = "".join(full_output_parts).strip()
+
+        # Memory write
+        if memory_agent and session_id != "cli":
+            await memory_agent.remember(session_id, query, full_output)
+
+        self.synapse.emit(SynapseEvent(
+            correlation_id=correlation_id,
+            event_type="egress",
+            source="osa",
+            target="user",
+            payload={
+                "output_preview": full_output[:200],
+                "agents_used": [r.agent for r in results],
+                "mode": "stream",
+                "dag_nodes": len(dag.nodes),
+                "dag_reasoning": dag.reasoning,
+            },
+        ))
+
+
+# ── Module-level helpers ──────────────────────────────────────────────────────
+
+def _inject_upstream_data(
+    node: TaskNode,
+    accumulated: dict[str, AgentResponse],
+    original_query: str,
+) -> str:
+    """Build the instruction for a node, injecting results from its dependencies.
+
+    For root nodes (no depends_on): instruction is unchanged.
+    For dependent nodes: upstream outputs are prepended as DATA CONTEXT so the
+    agent (especially CodeAgent) has real data to work with instead of guessing.
+    """
+    if not node.depends_on:
+        return node.instruction
+
+    upstream_parts: list[str] = []
+    for dep_id in node.depends_on:
+        dep_response = accumulated.get(dep_id)
+        if dep_response and dep_response.success and dep_response.output:
+            output = dep_response.output.strip()
+            if len(output) > 800:
+                output = output[:800] + "\n... [truncated]"
+            upstream_parts.append(f"[Data from {dep_response.agent} agent]\n{output}")
+
+    if not upstream_parts:
+        return node.instruction
+
+    context_block = "\n\n".join(upstream_parts)
+    return (
+        f"{node.instruction}\n\n"
+        f"Use the following real data retrieved from upstream agents:\n\n"
+        f"{context_block}"
+    )

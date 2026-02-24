@@ -1,0 +1,144 @@
+{
+  "session": 6,
+  "date": "2026-02-23",
+  "started_at": "2026-02-23T00:00:00Z",
+  "completed_at": "2026-02-23T01:46:30Z",
+  "theme": "Personalization Layer + Test Suite",
+  "status": "complete",
+
+  "objectives": [
+    "Inject user_profile into Evaluator system prompt",
+    "Write regression test suite (happy path, all agents)",
+    "Build PnL FeedbackLearner (thumbs up/down → preference nudges)",
+    "octane chat end-to-end 3-turn demo"
+  ],
+
+  "completed": [
+    {
+      "task": "Evaluator profile injection",
+      "file": "octane/osa/evaluator.py",
+      "description": "Renamed _EVALUATOR_SYSTEM to _EVALUATOR_SYSTEM_BASE. Added _build_system_prompt(user_profile) that maps verbosity/expertise/response_style preferences to concrete LLM instructions. _synthesize_with_llm now builds a personalized system prompt per user.",
+      "key_function": "_build_system_prompt(user_profile: dict | None) -> str"
+    },
+    {
+      "task": "MemoryRouter stopword expansion",
+      "file": "octane/agents/memory/router.py",
+      "description": "Added was/were/did/do/have/had/be/been/tell/show/give/get/are to stopwords in _extract_slot(). This prevents query-phrasing differences (e.g. 'NVDA stock price' vs 'what was NVDA stock price?') from producing different Redis slot keys.",
+      "impact": "Memory recall now correctly matches stored slots regardless of question phrasing"
+    },
+    {
+      "task": "Regression test suite",
+      "file": "tests/test_agents.py",
+      "description": "13 tests across all agents. No network/LLM required — all in-process. Run time: 0.42s.",
+      "tests": [
+        "test_web_agent_routes_finance",
+        "test_web_agent_routes_news",
+        "test_web_agent_routes_search_by_default",
+        "test_memory_agent_write_and_read",
+        "test_code_agent_executes_clean_python",
+        "test_code_agent_captures_stderr_on_failure",
+        "test_sysstat_monitor_returns_ram",
+        "test_sysstat_agent_execute_succeeds",
+        "test_evaluator_profile_shapes_system_prompt",
+        "test_evaluator_fallback_concatenation",
+        "test_feedback_thumbs_up_increments_score",
+        "test_feedback_thumbs_down_decrements_score",
+        "test_feedback_nudges_verbosity_after_threshold"
+      ],
+      "result": "13/13 passed in 0.42s"
+    },
+    {
+      "task": "PnL FeedbackLearner",
+      "file": "octane/agents/pnl/feedback_learner.py",
+      "description": "Full implementation replacing the stub. Records thumbs_up (+1), thumbs_down (-1), time_spent (scored by breakpoints: <5s=-1, 5-20s=0, >20s=+1). After NUDGE_THRESHOLD (3) accumulated signals, nudges verbosity one step on the ladder: concise ↔ balanced ↔ detailed. Score resets to 0 after each nudge. Signals persisted at pnl:{user_id}:fb:{cid} with 30-day TTL.",
+      "key_classes": ["FeedbackLearner"],
+      "key_methods": ["record(user_id, signal_type, value, correlation_id)", "get_score(user_id)", "_nudge(user_id, score)"],
+      "verbosity_ladder": ["concise", "balanced", "detailed"],
+      "nudge_threshold": 3
+    },
+    {
+      "task": "PnLAgent feedback command",
+      "file": "octane/agents/pnl/agent.py",
+      "description": "Wired FeedbackLearner into PnLAgent.__init__. Added feedback command handling in execute(): 'feedback thumbs_up', 'feedback thumbs_down', 'feedback time_spent 42.5' — dispatches to FeedbackLearner.record() and returns running score."
+    },
+    {
+      "task": "octane chat end-to-end demo",
+      "description": "3-turn CLI session confirmed working end-to-end",
+      "turns": [
+        {
+          "turn": 1,
+          "input": "what is NVDA stock price today?",
+          "route": "web_finance (source=llm)",
+          "output": "NVDA stock price today is $189.82, up 1.02%.",
+          "memory_stored": "memory:chat_1771811061:nvda_stock_price"
+        },
+        {
+          "turn": 2,
+          "input": "write a python script to print the number 189.82",
+          "route": "code_generation (source=llm)",
+          "memory_recalled": "NVDA stock price today is $189.82, up 1.02%.",
+          "output": "print(189.82)",
+          "duration_ms": 32672
+        },
+        {
+          "turn": 3,
+          "input": "what did I research earlier in this session?",
+          "route": "memory_recall (source=llm)",
+          "output": "You researched the NVDA stock price today, which is $189.82, up 1.02%.",
+          "duration_ms": 1.81
+        }
+      ],
+      "session_id": "chat_1771811061",
+      "total_turns": 3
+    }
+  ],
+
+  "bugs_fixed": [
+    {
+      "bug": "test_memory_agent_write_and_read failing",
+      "root_cause": "Two issues: (1) test answer 'NVDA is $189.82 today.' was 22 chars, below the 30-char quality filter minimum. (2) 'was' was not in _extract_slot stopwords, so recall query generated a different Redis key than the write query.",
+      "fix": "Lengthened test answer to 43 chars. Expanded stopwords in MemoryRouter to include was/were/did/are/be/been/etc."
+    },
+    {
+      "bug": "test_evaluator_profile_shapes_system_prompt failing",
+      "root_cause": "Base system prompt contained 'acknowledge it briefly' — assert 'brief' not in default was a false positive.",
+      "fix": "Changed assertion to assert 'Be brief and direct' not in default — that exact phrase is only injected when verbosity=concise is explicitly passed."
+    }
+  ],
+
+  "architecture_state": {
+    "pipeline": "query → Decomposer (LLM/keyword) → Router → Agent(s) → MemoryRecall → Evaluator(profile-shaped) → MemoryWrite → output",
+    "personalization_flow": "PnLAgent.get_profile() → Orchestrator step 3.6 → Evaluator._build_system_prompt(profile) → LLM system= param",
+    "feedback_flow": "PnLAgent.execute('feedback thumbs_up') → FeedbackLearner.record() → _update_score() → [if ±3] _nudge() → PreferenceManager.set(verbosity, new_value)",
+    "memory_flow": "MemoryAgent.remember(session, query, answer) → MemoryWriter._worth_storing() [>30 chars + digit] → Redis set. recall() → scan keys → term match",
+    "test_suite": "13 tests, 0.42s, no network required"
+  },
+
+  "metrics": {
+    "tests_passing": "13/13",
+    "test_runtime_seconds": 0.42,
+    "live_demo_turns": 3,
+    "files_modified": [
+      "octane/osa/evaluator.py",
+      "octane/agents/memory/router.py",
+      "octane/agents/pnl/feedback_learner.py",
+      "octane/agents/pnl/agent.py",
+      "tests/test_agents.py"
+    ],
+    "files_created": [
+      "SessionHistory/Session_6.json"
+    ]
+  },
+
+  "next_session_7_plan": {
+    "theme": "Observability + CLI Polish",
+    "items": [
+      "octane trace — live rich tree view of a running pipeline (streaming Synapse events)",
+      "octane feedback thumbs_up <trace_id> — CLI shortcut to record feedback against a trace",
+      "Decomposer confidence scoring — return P(template) alongside the chosen template",
+      "Evaluator streaming output — stream tokens to console as they arrive from Bodega",
+      "Guard rail in OSA — reject/reroute queries that decompose to unknown templates",
+      "Session 7 JSON history"
+    ]
+  }
+}

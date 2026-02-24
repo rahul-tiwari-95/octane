@@ -31,7 +31,7 @@ class Router:
         self.redis = RedisClient()
 
         self._agents: dict[str, BaseAgent] = {
-            "web": WebAgent(synapse, intel=self.intel),
+            "web": WebAgent(synapse, intel=self.intel, bodega=self.bodega),
             "code": CodeAgent(synapse, bodega=self.bodega),
             "memory": MemoryAgent(synapse, redis=self.redis),
             "sysstat": SysStatAgent(synapse, self.bodega),

@@ -13,6 +13,7 @@ from __future__ import annotations
 import structlog
 
 from octane.agents.base import BaseAgent
+from octane.agents.pnl.feedback_learner import FeedbackLearner
 from octane.agents.pnl.preference_manager import PreferenceManager
 from octane.models.schemas import AgentRequest, AgentResponse
 from octane.tools.redis_client import RedisClient
@@ -29,6 +30,7 @@ class PnLAgent(BaseAgent):
         super().__init__(synapse)
         redis = redis or RedisClient()
         self.prefs = PreferenceManager(redis=redis)
+        self.feedback = FeedbackLearner(redis=redis, prefs=self.prefs)
 
     async def get_profile(self, user_id: str = "default") -> dict[str, str]:
         """Return the full preference profile for a user."""
@@ -60,6 +62,22 @@ class PnLAgent(BaseAgent):
                     output=f"Preference updated: {key} = {value}",
                     correlation_id=request.correlation_id,
                 )
+
+        # Handle feedback signals: "feedback thumbs_up", "feedback thumbs_down",
+        #                          "feedback time_spent 42.5"
+        if query.startswith("feedback "):
+            parts = query.split(None, 2)
+            signal = parts[1] if len(parts) >= 2 else ""
+            value = float(parts[2]) if len(parts) == 3 else 1.0
+            cid = request.metadata.get("correlation_id") or request.correlation_id
+            await self.feedback.record(user_id, signal, value, correlation_id=cid)
+            score = await self.feedback.get_score(user_id)
+            return AgentResponse(
+                agent=self.name, success=True,
+                output=f"Feedback recorded: {signal} (running score: {score})",
+                data={"signal": signal, "score": score},
+                correlation_id=request.correlation_id,
+            )
 
         # Default: return current profile
         profile = await self.prefs.get_all(user_id)

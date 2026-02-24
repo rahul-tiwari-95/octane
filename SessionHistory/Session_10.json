@@ -1,0 +1,85 @@
+{
+  "session": 10,
+  "phase": 3,
+  "date": "2026-02-23",
+  "theme": "Web Intelligence + Multi-Turn Chat + DAG Visibility",
+  "tests": { "before": 35, "after": 52, "added": 17 },
+  "deliverables": [
+    {
+      "component": "Synthesizer (web/synthesizer.py)",
+      "status": "complete",
+      "description": "Full LLM synthesis pass for news and web search. News → 'Key stories: 1. ...' format. Search → bullet points. Finance passes through unchanged. <think> block stripping. Graceful fallback to plain list if LLM unavailable."
+    },
+    {
+      "component": "QueryStrategist (web/query_strategist.py)",
+      "status": "complete",
+      "description": "LLM-powered multi-variation query generation (2-3 per query). Returns JSON array with query, api, rationale. Validates and normalises API values (unknown → 'search'). Keyword fallback: finance/news/search by keyword matching. Falls back gracefully on LLM failure."
+    },
+    {
+      "component": "WebAgent (web/agent.py)",
+      "status": "complete",
+      "description": "Wired Synthesizer and QueryStrategist into _fetch_news and _fetch_search. Both components receive bodega from Router constructor. Finance path unchanged (already structured data)."
+    },
+    {
+      "component": "Router (osa/router.py)",
+      "status": "complete",
+      "description": "WebAgent now receives bodega= parameter so Synthesizer and QueryStrategist have LLM access."
+    },
+    {
+      "component": "Evaluator (osa/evaluator.py)",
+      "status": "complete",
+      "description": "conversation_history parameter added to evaluate() and evaluate_stream(). Last 6 turns injected into LLM prompt as '[Conversation history]' block. _format_conversation_history() helper: caps at max_turns, 300 char per entry, User/Assistant labels."
+    },
+    {
+      "component": "Orchestrator (osa/orchestrator.py)",
+      "status": "complete",
+      "description": "conversation_history parameter threaded through run() and run_stream(). Passed directly to Evaluator. Egress Synapse event now includes dag_nodes (int) and dag_reasoning (str) for --verbose flag and external inspection."
+    },
+    {
+      "component": "octane chat REPL (main.py)",
+      "status": "complete",
+      "description": "conversation_history buffer maintained in-process. Each turn: user query appended before call, assistant reply appended after. Buffer bounded to last 12 entries (6 turns). Passed to run_stream() on every turn."
+    },
+    {
+      "component": "octane ask --verbose (main.py)",
+      "status": "complete",
+      "description": "--verbose / -v flag added. Shows DAG execution trace table after response: DAG node count, reasoning, per-node dispatch events with agent name and instruction, egress summary with agent list and success ratio."
+    }
+  ],
+  "tests_added": [
+    "test_synthesizer_news_with_llm",
+    "test_synthesizer_news_fallback_no_llm",
+    "test_synthesizer_news_empty_articles",
+    "test_synthesizer_search_with_llm",
+    "test_synthesizer_search_fallback_no_llm",
+    "test_query_strategist_llm_returns_variations",
+    "test_query_strategist_rejects_invalid_api",
+    "test_query_strategist_fallback_no_llm",
+    "test_query_strategist_keyword_news",
+    "test_query_strategist_llm_failure_falls_back",
+    "test_web_agent_news_uses_synthesizer",
+    "test_web_agent_search_uses_synthesizer",
+    "test_evaluator_injects_conversation_history",
+    "test_evaluator_no_history_still_works",
+    "test_format_conversation_history_truncates",
+    "test_orchestrator_run_accepts_conversation_history",
+    "test_egress_event_contains_dag_metadata"
+  ],
+  "gaps_addressed": [
+    "Web Synthesizer: news queries now return structured intelligence, not raw article dumps",
+    "Multi-turn chat continuity: conversation_history buffer ensures 'now do the same for Apple' works",
+    "DAG Visibility: --verbose flag on octane ask shows full execution trace table"
+  ],
+  "next_session": {
+    "session": 11,
+    "theme": "Shadows Integration — Perpetual Tasks + octane watch",
+    "targets": [
+      "Install shadow-task in oct_env, wire to existing Redis",
+      "Octane task registry: define @task functions for agent dispatch",
+      "First perpetual task: stock price monitor (Perpetual every=1h, automatic=True)",
+      "octane watch <ticker> command — starts Shadow worker, registers monitor task",
+      "Worker subprocess management from CLI",
+      "Tests: Shadows task registration, perpetual scheduling, worker lifecycle"
+    ]
+  }
+}
