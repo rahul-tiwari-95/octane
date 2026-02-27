@@ -34,3 +34,8 @@ dump.rdb
 
 # Sandbox experiments
 sandbox/oct_env/
+
+# Large installer files
+*.dmg
+*.pkg
+*.iso
