@@ -1,0 +1,112 @@
+{
+  "session": 13,
+  "title": "Developer Experience & Observable Internals",
+  "date": "2026-02-24",
+  "objectives": [
+    "octane dag '<query>' — Decomposer dry-run: show task DAG without executing any agents",
+    "octane pref show/set/reset — wire PreferenceManager to CLI",
+    "Rich octane ask footer — replace dim one-liner with styled Rule (agent tags, trace ID, hint)",
+    "octane trace visual timeline — colour-coded event types, DAG section, partial ID resolution",
+    "octane version splash screen — styled panel with version, Python, Shadows, agent tags",
+    "octane workflow list enrichment — add last-modified date, variable display, node count",
+    "12 new tests (89 → 101 total)"
+  ],
+  "completed": [
+    {
+      "task": "Part A — octane dag '<query>'",
+      "command": "octane dag \"<query>\"",
+      "detail": "New CLI command. Calls osa.pre_flight() silently (determines LLM vs keyword routing mode), then decomposer.decompose(query) — NO agents dispatched. Renders: header panel (query, routing mode, node count, wave count, reasoning), node table (index, wave, agent [colour-coded], sub-agent, template name, instruction), template description hint, 'Run octane ask ...' call-to-action.",
+      "routing_modes": [
+        "[green]LLM[/] when Bodega is reachable + model loaded",
+        "[yellow]keyword fallback[/] when Bodega offline"
+      ]
+    },
+    {
+      "task": "Part B — octane pref command group",
+      "commands": [
+        "octane pref show [--user <id>] — table: key, current value (green if customised), default, valid choices",
+        "octane pref set <key> <value> [--user <id>] — validates against _PREF_CHOICES; rejects unknown keys and invalid values",
+        "octane pref reset [key] [--user <id>] [--yes] — resets single key or all keys; prompts for confirmation on all-reset unless --yes"
+      ],
+      "pref_keys": ["verbosity (concise|detailed)", "expertise (beginner|intermediate|advanced)", "response_style (prose|bullets|code-first)", "domains (free text)"],
+      "detail": "pref_app = typer.Typer() mounted via app.add_typer(pref_app, name='pref'). All commands call PreferenceManager from octane/agents/pnl/preference_manager.py. _PREF_CHOICES dict in main.py maps keys to valid values for validation. Unknown keys rejected with helpful error listing valid keys."
+    },
+    {
+      "task": "Part C — Rich octane ask footer",
+      "detail": "Replaced the dim '[dim]Agents: ... | Events: ... | Duration: ... | Trace ID: ...[/]' one-liner with _print_ask_footer(). New footer: (1) Rule() separator with agent tags (bold colour-coded: web=cyan, code=yellow, memory=blue, sysstat=green, pnl=magenta) + duration + first 16 chars of trace ID. (2) dim hint line: 'Run octane trace <id> to inspect · octane dag \"...\" to preview routing'. Internal 'user', 'osa', 'osa.decomposer', 'osa.evaluator' agents filtered out of the visible tag list.",
+      "function": "_print_ask_footer(agents_used, event_count, duration_ms, correlation_id)"
+    },
+    {
+      "task": "Part D — octane trace visual timeline",
+      "detail": "Rewrote trace command from a basic Events table to a full visual timeline. Changes: (1) partial ID resolution — _resolve_trace_id() accepts first N chars, does prefix match across list_traces(). (2) Header panel now shows started timestamp (YYYY-MM-DD HH:MM:SS UTC), duration, status, agent tags (coloured), routing reasoning. (3) DAG section: if egress.payload.dag_nodes_json present, renders a node table (index, agent, sub-agent, instruction). (4) Timeline table: icon column (_EVENT_ICONS dict), delta-ms column, colour-coded event type (_EVENT_COLOURS dict), source→target, compact detail (picks most informative payload field). (5) Recent-traces list enriched with Started column, visible agent names, status emoji.",
+      "event_colours": {
+        "ingress": "bold white",
+        "guard": "bold yellow",
+        "decomposition": "bold cyan",
+        "decomposition_complete": "cyan",
+        "dispatch": "bold green",
+        "agent_complete": "green",
+        "memory_read": "blue",
+        "memory_write": "blue",
+        "egress": "bold magenta"
+      }
+    },
+    {
+      "task": "Part E — octane version splash screen",
+      "detail": "Replaced single-line 'Octane v0.1.0' print with a styled Rich Panel. Contents: 🔥 Octane vX.Y.Z, Python X.Y.Z (arm64), Shadows X.Y.Z (imported via 'import shadows'), agent tags (colour-coded, same palette as footer), 'Run octane --help' hint. Shadows version fetched at runtime via getattr(shadows, '__version__', 'unknown') — graceful fallback to 'not installed' if import fails.",
+      "panel_style": "border_style='cyan', padding=(1, 4)"
+    },
+    {
+      "task": "Part F — octane workflow list enrichment",
+      "detail": "Added three new columns to the workflow list table: (1) Modified — os.path.getmtime() formatted as YYYY-MM-DD HH:MM. (2) Variables column now distinguishes set values (dim key=bold value) from unset placeholders ({{key}} in yellow). (3) Description capped at 55 chars. Footer updated: 'N template(s) · octane workflow run <name> [--var key=value]'."
+    },
+    {
+      "task": "Part G — 12 new tests (89 → 101 total)",
+      "classes": [
+        "TestDagCommand (6 tests): test_dag_dryryn_does_not_dispatch_agents, test_dag_finance_query_routes_to_web_finance, test_dag_code_query_routes_to_code_agent, test_dag_nodes_have_required_metadata, test_resolve_trace_id_exact_match, test_resolve_trace_id_partial_prefix",
+        "TestPrefCommand (4 tests): test_pref_set_and_get_round_trip, test_pref_reset_restores_default, test_pref_invalid_key_rejected, test_pref_choices_exhaustive",
+        "TestVersionCommand (2 tests): test_version_output_contains_octane_version, test_version_output_contains_python"
+      ],
+      "fixes_during_authoring": [
+        "SynapseEventBus has no _traces dict — uses _events list + get_trace(); tests fixed to use synapse.emit(event) instead of injecting into _traces",
+        "typer.testing.CliRunner in this Typer version does not accept mix_stderr kwarg — removed from all three CliRunner() calls"
+      ]
+    }
+  ],
+  "files_modified": [
+    "octane/main.py",
+    "tests/test_agents.py"
+  ],
+  "files_created": [
+    "SessionHistory/Session_13.json"
+  ],
+  "test_results": {
+    "total": 101,
+    "passed": 101,
+    "failed": 0,
+    "duration_seconds": 0.58
+  },
+  "new_commands": {
+    "octane dag \"<query>\"": "Decomposer dry-run — shows task DAG (agent, sub-agent, wave, template, instruction) without executing",
+    "octane pref show": "Show all preference values with defaults and valid choices",
+    "octane pref set <key> <value>": "Set a preference (validated against allowed values)",
+    "octane pref reset [key]": "Reset a single key or all preferences to defaults"
+  },
+  "upgraded_commands": {
+    "octane trace": "Visual timeline with colour-coded events, DAG node table, partial ID resolution, enriched recent-traces list",
+    "octane version": "Styled Rich panel with version, Python, Shadows, colour-coded agent tags",
+    "octane ask footer": "Styled Rule with agent tags, duration, trace ID, and inspect hints",
+    "octane workflow list": "Added last-modified, variable display (with {{placeholder}} highlighting), node count"
+  },
+  "key_design_decisions": [
+    "octane dag never calls any agent.execute() — it only calls decomposer.decompose(). This makes it safe to run against any query as a preview.",
+    "Partial trace ID resolution: _resolve_trace_id() tries exact match first (get_trace returns events), then falls back to startswith() prefix match against list_traces(). Accepts as few as 8 chars.",
+    "_print_ask_footer() is a standalone function (not a method) so it can be reused from workflow run and future commands.",
+    "_EVENT_COLOURS and _EVENT_ICONS are module-level dicts — adding a new event type only requires one entry in each dict, not scattered if/else branches.",
+    "pref_app uses _PREF_CHOICES dict (not hardcoded in each command) as the single source of truth for valid values — validation and display both read from it.",
+    "CliRunner() in tests: Typer's CliRunner does not accept mix_stderr — tests use plain CliRunner() and check result.output only.",
+    "Shadows version: imported as 'import shadows' (not 'import shadow_task') — the installed package name is 'shadows' in oct_env."
+  ],
+  "cumulative_session_count": 13,
+  "cumulative_test_count": 101
+}

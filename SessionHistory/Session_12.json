@@ -1,14 +1,19 @@
 {
   "session": 12,
-  "title": "Workflow Templates + Streaming UX Polish",
-  "date": "2025-01-31",
+  "title": "Workflow Templates + Streaming UX Polish + Live Bug Fixes + Temporal Awareness",
+  "date": "2026-02-23",
   "objectives": [
     "Export reusable pipeline templates from live DAGs or persisted Synapse traces",
     "octane workflow export / list / run CLI commands",
     "Spinner UX for _ask() and _chat() — hides 2-5s pipeline phase before first LLM token",
     "Enrich decomposition_complete Synapse event with full DAG (dag_nodes_json + dag_original_query)",
     "Orchestrator.run_from_dag() — bypass Guard+Decomposer for pre-built DAGs",
-    "10 new tests; cumulative suite at 73/73"
+    "10 new tests; cumulative suite at 73/73",
+    "Fix AttributeError: 'MemoryAgent' has no attribute 'connect_pg' — duplicate class definition bug",
+    "Fix AttributeError: 'WebAgent' has no attribute '_format_web_results' — missing method",
+    "Harden _connect_memory_pg with try/except so infra failures never crash pre_flight",
+    "Install missing .venv packages: asyncpg, redis, shadow-task",
+    "Inject current date/time awareness throughout the pipeline to fix stale search data"
   ],
   "completed": [
     {
@@ -51,38 +56,127 @@
       "detail": "Same spinner pattern applied to the per-turn stream loop. Spinner starts before osa.run_stream(), stops on first token, label: '⚙  Working...'. First-token guard prints newline + 'Octane: ' prefix inline."
     },
     {
-      "task": "10 new tests (73/73 total)",
+      "task": "10 new tests (73/73 total) — workflow tests",
       "classes": [
         "TestWorkflowTemplate (6 tests): save_and_load_round_trip, fill_substitutes_variables, fill_with_overrides_takes_precedence, fill_leaves_unknown_placeholders_as_is, list_placeholders_returns_all_names, to_dag_returns_task_dag",
         "TestWorkflowExporter (4 tests): export_from_dag_produces_template, export_from_dag_substitutes_query_placeholder, export_from_trace_raises_on_missing_trace, export_from_trace_raises_on_missing_dag_nodes_json, export_from_trace_rebuilds_template"
       ],
       "note": "SynapseEvent requires correlation_id — added to all test constructors. 73 passed in 0.54s."
+    },
+    {
+      "task": "BUG FIX — Duplicate MemoryAgent class definition",
+      "root_cause": "octane/agents/memory/agent.py had two 'class MemoryAgent' definitions. Python silently uses the last one. The second (lines 196–311) was a stripped Redis-only copy missing connect_pg, remember, and recall. octane ask crashed with AttributeError: 'MemoryAgent' object has no attribute 'connect_pg'.",
+      "fix": "Removed the entire duplicate class (old lines 196–311). File is now 194 lines. The complete first definition (with connect_pg, remember, recall, _read, _write) is preserved.",
+      "lesson": "inspect.getsource(ClassName).count('class ClassName') == 1 is now a test pattern to prevent this."
+    },
+    {
+      "task": "BUG FIX — Missing _format_web_results on WebAgent",
+      "root_cause": "WebAgent._fetch_finance() called self._format_web_results(raw, query) in the no-ticker fallback path (line 76), but the method was never defined. Any finance query for a company without a known ticker symbol (e.g. 'netscout systems', small-cap stocks) crashed with AttributeError.",
+      "fix": "Added _format_web_results(self, raw, query) -> str implementation after _format_market_data. Handles web.results, top-level results, and discussions.results fallback. Formats up to 5 results with title, snippet (120 chars), and URL.",
+      "detail": "Method signature: def _format_web_results(self, raw: dict, query: str) -> str"
+    },
+    {
+      "task": "HARDENING — _connect_memory_pg try/except",
+      "detail": "Wrapped await memory_agent.connect_pg() in try/except Exception in Orchestrator._connect_memory_pg(). A catastrophic Postgres error must never propagate to crash pre_flight() and therefore 'octane ask'.",
+      "code": "try:\n    await memory_agent.connect_pg()\nexcept Exception as exc:\n    logger.warning('memory_pg_connect_error', error=str(exc))"
+    },
+    {
+      "task": ".venv package installation",
+      "packages": ["asyncpg", "redis", "shadow-task"],
+      "detail": "Installed via .venv/bin/pip install asyncpg redis shadow-task -q. These were already in oct_env but missing from the user's active .venv. Eliminates ModuleNotFoundError warnings on import."
+    },
+    {
+      "task": "Temporal awareness — octane/utils/clock.py (new file)",
+      "detail": "Single source of truth for current date/time. Functions: now_utc(), today_str() → 'YYYY-MM-DD', today_human() → 'Monday, February 23, 2026', month_year() → 'February 2026', year() → '2026'. All date injection across the codebase imports from here — no scattered datetime.now() calls."
+    },
+    {
+      "task": "Temporal awareness — date injected into 5 pipeline locations",
+      "locations": [
+        {
+          "file": "octane/agents/web/agent.py",
+          "change": "month_year() appended to no-ticker finance fallback search query sent to Brave (e.g. 'netscout systems price February 2026'). Output header now includes today_str(): 'Web results for ... (as of 2026-02-23):'"
+        },
+        {
+          "file": "octane/agents/web/query_strategist.py",
+          "change": "today_str() and month_year() injected into LLM prompt: 'Today is 2026-02-23 (February 2026). Query: ...'. LLM now generates date-scoped search variations. _STRATEGIST_SYSTEM renamed to _STRATEGIST_SYSTEM_BASE; rule added: include current month+year in time-sensitive variations."
+        },
+        {
+          "file": "octane/agents/web/synthesizer.py",
+          "change": "_NEWS_SYSTEM and _SEARCH_SYSTEM replaced by _NEWS_SYSTEM_BASE / _SEARCH_SYSTEM_BASE + _news_system() / _search_system() functions that prepend 'Today's date: {today_human()}.' at call time (not import time). Rules added: flag stale dates (>30 days old for news, any non-recent date for search)."
+        },
+        {
+          "file": "octane/osa/evaluator.py",
+          "change": "_build_system_prompt() now prepends \"Today's date: {today_human()}.\" to the system prompt. Rule added to _EVALUATOR_SYSTEM_BASE: 'If the data contains a date that is not today, note that it may be outdated.'"
+        }
+      ],
+      "impact": "Brave search returns February 2026 results instead of cached Oct 2025 pages. LLM synthesizer flags PitchBook-style stale data (e.g. 'price as of 27-Oct-2025') as outdated."
+    },
+    {
+      "task": "16 new regression tests (73 → 89 total)",
+      "classes": [
+        "TestMemoryAgentIntegrity (5 tests): test_only_one_memory_agent_class_is_importable, test_memory_agent_exposes_connect_pg, test_memory_agent_exposes_remember_and_recall, test_connect_pg_returns_false_when_asyncpg_missing, test_connect_pg_returns_false_when_postgres_unreachable",
+        "TestOrchestratorGracefulDegradation (2 tests): test_preflight_completes_when_bodega_offline, test_preflight_does_not_raise_on_connect_pg",
+        "TestWebAgentPublicAPI (4 tests): test_web_agent_has_all_format_methods, test_format_web_results_returns_string, test_format_web_results_handles_empty_results, test_all_agents_instantiate_without_error",
+        "TestClockUtility (5 tests): test_today_str_is_iso_format, test_today_human_contains_year, test_month_year_format, test_evaluator_system_prompt_contains_today, test_finance_fallback_query_includes_month_year"
+      ]
     }
   ],
   "files_modified": [
     "octane/osa/orchestrator.py",
     "octane/main.py",
+    "octane/agents/memory/agent.py",
+    "octane/agents/web/agent.py",
+    "octane/agents/web/synthesizer.py",
+    "octane/agents/web/query_strategist.py",
+    "octane/osa/evaluator.py",
     "tests/test_agents.py"
   ],
   "files_created": [
     "octane/workflow/__init__.py",
     "octane/workflow/template.py",
     "octane/workflow/exporter.py",
-    "octane/workflow/runner.py"
+    "octane/workflow/runner.py",
+    "octane/utils/clock.py",
+    "SessionHistory/Octane_Commands.txt"
   ],
   "test_results": {
-    "total": 73,
-    "passed": 73,
+    "total": 89,
+    "passed": 89,
     "failed": 0,
-    "duration_seconds": 0.54
+    "duration_seconds": 0.62
   },
   "key_design_decisions": [
     "{{variable}} placeholders in workflow JSON — regex _VAR_RE = r'\\{\\{(\\w+)\\}\\}'. Unknown vars left as-is (not silently dropped).",
     "export_from_dag auto-substitutes original_query → {{query}} so every exported template is immediately parameterisable.",
     "export_from_trace requires dag_nodes_json in the decomposition_complete payload (Octane ≥ Session 12). Raises ValueError with clear message for older traces.",
     "run_from_dag() skips Guard+Decomposer entirely — this is by design. Templates are pre-validated at export time.",
-    "Spinner pattern: status.start() → first-token check → status.stop() + print prefix inline. Covers guard-blocked case (no tokens) with a separate if first_token: status.stop() after loop."
+    "Spinner pattern: status.start() → first-token check → status.stop() + print prefix inline. Covers guard-blocked case (no tokens) with a separate if first_token: status.stop() after loop.",
+    "Duplicate class pattern: Python silently uses the last 'class X' definition in a file. inspect.getsource(cls).count('class ClassName') == 1 is now a standard test assertion.",
+    "Date injection: all wall-clock calls centralised in octane/utils/clock.py. System prompts call today_human() at runtime (not import time) so they are never stale between long-running sessions.",
+    "Search freshness: month_year() appended to Brave fallback queries. LLM strategist instructed to include current month+year in at least one variation for time-sensitive queries.",
+    "Two virtualenvs (.venv and sandbox/oct_env) both point to the same editable install. Package installs must be done in both if needed."
+  ],
+  "bugs_fixed": [
+    {
+      "bug": "AttributeError: 'MemoryAgent' object has no attribute 'connect_pg'",
+      "trigger": "octane ask '<any query>'",
+      "cause": "Duplicate class MemoryAgent in memory/agent.py — Python used the second (incomplete) definition",
+      "fix": "Removed duplicate class, kept first complete definition"
+    },
+    {
+      "bug": "AttributeError: 'WebAgent' object has no attribute '_format_web_results'",
+      "trigger": "octane ask 'what is the price of netscout systems inc.?' (any unrecognised company name)",
+      "cause": "Method called in finance fallback path (line 76) but never defined",
+      "fix": "Added _format_web_results(self, raw, query) implementation"
+    },
+    {
+      "bug": "Stale search results — data from Oct 2025 shown when today is Feb 2026",
+      "trigger": "octane ask 'how is netscout systems stock doing?'",
+      "cause": "No temporal context in search queries or LLM prompts — Brave returns cached pages, LLM has no date awareness",
+      "fix": "Created clock.py; injected date into 4 LLM prompts + Brave search query"
+    }
   ],
   "cumulative_session_count": 12,
-  "cumulative_test_count": 73
+  "cumulative_test_count": 89
 }
+

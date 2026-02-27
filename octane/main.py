@@ -5,8 +5,11 @@ Commands:
     octane ask       — Ask a question (routed through OSA)
     octane chat      — Interactive multi-turn chat session
     octane session   — Chat until END, then print full annotated session replay
-    octane trace     — View Synapse trace for a query
+    octane trace     — View Synapse trace for a query (visual timeline)
+    octane dag       — Dry-run decomposition — show task DAG without executing
+    octane pref      — Manage user preferences (show / set / reset)
     octane agents    — List registered agents
+    octane version   — Show version info
 """
 
 from __future__ import annotations
@@ -16,6 +19,7 @@ import asyncio
 import typer
 from rich.console import Console
 from rich.panel import Panel
+from rich.rule import Rule
 from rich.table import Table
 from rich.text import Text
 
@@ -228,111 +232,296 @@ async def _ask(query: str, verbose: bool = False):
         dag_nodes = egress.payload.get("dag_nodes", "?") if egress and egress.payload else "?"
         dag_reason = egress.payload.get("dag_reasoning", "") if egress and egress.payload else ""
 
-        console.print(
-            f"\n[dim]Agents: {', '.join(t.agents_used)} | "
-            f"Events: {len(real_events)} | "
-            f"Duration: {t.total_duration_ms}ms | "
-            f"Trace ID: [bold]{t.correlation_id}[/][/]"
+        _print_ask_footer(
+            agents_used=t.agents_used,
+            event_count=len(real_events),
+            duration_ms=t.total_duration_ms,
+            correlation_id=t.correlation_id,
         )
 
         if verbose:
             _print_dag_trace(t, real_events, dag_nodes, dag_reason)
 
 
+def _print_ask_footer(
+    agents_used: list[str],
+    event_count: int,
+    duration_ms: float,
+    correlation_id: str,
+) -> None:
+    """Print a styled Rich footer after every octane ask response.
+
+    Replaces the old dim one-liner. Shows:
+      • Trace ID — copy-paste ready for octane trace <id>
+      • Agent tags (colour-coded by type)
+      • Duration
+      • Hint to inspect with octane trace / octane dag
+    """
+    from rich.text import Text
+
+    _AGENT_COLOURS = {
+        "web": "cyan",
+        "code": "yellow",
+        "memory": "blue",
+        "sysstat": "green",
+        "pnl": "magenta",
+        "osa": "dim",
+        "user": "dim",
+        "osa.decomposer": "dim",
+        "osa.evaluator": "dim",
+    }
+
+    # Build agent tag line
+    tags = Text()
+    visible = [a for a in agents_used if a not in ("user", "osa", "osa.decomposer", "osa.evaluator")]
+    for i, a in enumerate(visible):
+        colour = _AGENT_COLOURS.get(a, "white")
+        tags.append(f" {a} ", style=f"bold {colour} on grey15")
+        if i < len(visible) - 1:
+            tags.append("  ", style="")
+
+    rule_text = Text()
+    rule_text.append("  ")
+    rule_text.append_text(tags)
+    rule_text.append(f"   {duration_ms:.0f}ms", style="dim")
+    rule_text.append(f"   trace: ", style="dim")
+    rule_text.append(correlation_id[:16], style="bold dim")
+    rule_text.append("  ", style="")
+
+    console.print()
+    console.print(Rule(rule_text, style="dim"))
+    console.print(
+        f"[dim]  Run [bold]octane trace {correlation_id[:8]}…[/bold] to inspect · "
+        f"[bold]octane dag \"…\"[/bold] to preview routing[/]"
+    )
+    console.print()
+
+
 # ── octane trace ──────────────────────────────────────────────
+
+# Colour mapping for each event type in the visual timeline
+_EVENT_COLOURS: dict[str, str] = {
+    "ingress":              "bold white",
+    "guard":                "bold yellow",
+    "decomposition":        "bold cyan",
+    "decomposition_complete": "cyan",
+    "dispatch":             "bold green",
+    "agent_complete":       "green",
+    "memory_read":          "blue",
+    "memory_write":         "blue",
+    "egress":               "bold magenta",
+    "preflight":            "dim",
+}
+
+_EVENT_ICONS: dict[str, str] = {
+    "ingress":              "→",
+    "guard":                "🛡",
+    "decomposition":        "🔀",
+    "decomposition_complete": "✔",
+    "dispatch":             "⚡",
+    "agent_complete":       "✅",
+    "memory_read":          "🧠",
+    "memory_write":         "💾",
+    "egress":               "←",
+    "preflight":            "·",
+}
 
 
 @app.command()
 def trace(
     correlation_id: str = typer.Argument(
         None,
-        help="Correlation ID to trace. If omitted, shows recent traces from disk.",
+        help="Correlation ID to trace. Partial IDs are accepted. "
+             "Omit to list recent traces.",
     ),
 ):
-    """🔍 View Synapse trace for a query lifecycle."""
+    """🔍 Visual timeline of a query lifecycle — events, agents, DAG, duration."""
+    asyncio.run(_trace(correlation_id))
+
+
+async def _trace(correlation_id: str | None):
     synapse = _get_synapse()
 
     if correlation_id:
-        t = synapse.get_trace(correlation_id)
-        if not t.events:
-            console.print(f"[yellow]No trace found for: {correlation_id}[/]")
+        # Resolve partial IDs — user can type first 8 chars
+        resolved = _resolve_trace_id(synapse, correlation_id)
+        if resolved is None:
+            console.print(f"[yellow]No trace found matching: [bold]{correlation_id}[/bold][/]")
+            console.print("[dim]Run 'octane trace' (no args) to list recent traces.[/]")
             return
 
-        started = t.started_at.strftime("%H:%M:%S") if t.started_at else "?"
+        t = synapse.get_trace(resolved)
+        real_events = [e for e in t.events if e.correlation_id != "preflight"]
+
+        if not real_events:
+            console.print(f"[yellow]Trace [bold]{resolved}[/bold] exists but has no events.[/]")
+            return
+
+        # ── Header panel ──────────────────────────────────────
+        started_str = t.started_at.strftime("%Y-%m-%d %H:%M:%S UTC") if t.started_at else "?"
+        agent_tags = _format_agent_tags(t.agents_used)
+
+        egress = next((e for e in real_events if e.event_type == "egress"), None)
+        dag_nodes_raw = egress.payload.get("dag_nodes_json", "") if egress and egress.payload else ""
+        dag_reason = egress.payload.get("dag_reasoning", "") if egress and egress.payload else ""
+
+        header_lines = [
+            f"[bold]Trace ID:[/]  {t.correlation_id}",
+            f"[bold]Started:[/]   {started_str}",
+            f"[bold]Duration:[/]  {t.total_duration_ms:.0f} ms",
+            f"[bold]Status:[/]    {'[green]✅ success[/]' if t.success else '[red]❌ failed[/]'}",
+            f"[bold]Agents:[/]    {agent_tags}",
+        ]
+        if dag_reason:
+            header_lines.append(f"[bold]Routing:[/]   [dim]{dag_reason[:100]}[/]")
+
         console.print(Panel(
-            f"[bold]Correlation ID:[/] {t.correlation_id}\n"
-            f"[bold]Started:[/] {started}\n"
-            f"[bold]Duration:[/] {t.total_duration_ms}ms\n"
-            f"[bold]Success:[/] {'✅' if t.success else '❌'}\n"
-            f"[bold]Agents:[/] {', '.join(t.agents_used)}",
+            "\n".join(header_lines),
             title="[bold blue]🔍 Synapse Trace[/]",
             border_style="blue",
         ))
 
-        table = Table(title="Events", show_lines=True)
-        table.add_column("#", style="dim", width=3)
-        table.add_column("Timestamp", style="dim", width=12)
-        table.add_column("Type", style="cyan")
-        table.add_column("Source", style="green")
-        table.add_column("Target", style="magenta")
-        table.add_column("Info", style="white")
+        # ── DAG section (if dag_nodes_json present) ───────────
+        if dag_nodes_raw:
+            import json as _json
+            try:
+                dag_nodes = _json.loads(dag_nodes_raw) if isinstance(dag_nodes_raw, str) else dag_nodes_raw
+                if dag_nodes:
+                    dag_table = Table(title="Task DAG", show_lines=False, box=None, padding=(0, 2))
+                    dag_table.add_column("Node", style="dim", width=4, justify="right")
+                    dag_table.add_column("Agent", style="cyan", width=12)
+                    dag_table.add_column("Sub-agent", style="green", width=14)
+                    dag_table.add_column("Instruction", style="white")
+                    for i, node in enumerate(dag_nodes, 1):
+                        dag_table.add_row(
+                            str(i),
+                            node.get("agent", "?"),
+                            node.get("metadata", {}).get("sub_agent", "—"),
+                            (node.get("instruction") or "")[:80],
+                        )
+                    console.print(dag_table)
+            except Exception:
+                pass  # malformed dag_nodes_json — skip silently
+
+        # ── Visual event timeline ─────────────────────────────
+        tl_table = Table(
+            title="Event Timeline",
+            show_lines=False,
+            box=None,
+            padding=(0, 2),
+        )
+        tl_table.add_column("", style="dim", width=2)   # icon
+        tl_table.add_column("Δt", style="dim", width=9, justify="right")
+        tl_table.add_column("Event", width=26)
+        tl_table.add_column("Source → Target", style="dim", width=32)
+        tl_table.add_column("Detail", style="white")
 
         t0 = t.started_at
-        for i, event in enumerate(t.events, 1):
-            if t0:
-                offset_ms = (event.timestamp - t0).total_seconds() * 1000
-                ts_display = f"+{offset_ms:.0f}ms"
-            else:
-                ts_display = "—"
+        for event in real_events:
+            offset = (
+                f"+{(event.timestamp - t0).total_seconds() * 1000:.0f}ms"
+                if t0 else "—"
+            )
+            icon = _EVENT_ICONS.get(event.event_type, "·")
+            colour = _EVENT_COLOURS.get(event.event_type, "white")
+            type_str = f"[{colour}]{event.event_type}[/]"
 
-            # Summarise the payload into one short line
-            info = ""
+            src_tgt = event.source
+            if event.target:
+                src_tgt += f" → {event.target}"
+
+            # Compact detail: pick the most informative payload field
+            detail = ""
             if event.error:
-                info = f"[red]ERR: {event.error[:60]}[/]"
+                detail = f"[red]✗ {event.error[:80]}[/]"
             elif event.payload:
-                # Pick the most meaningful payload field
-                for key in ("reasoning", "template", "output_preview", "query", "error"):
+                for key in ("template", "reasoning", "output_preview", "query",
+                            "approach", "agents_used", "tasks_succeeded", "agent"):
                     if key in event.payload:
-                        val = str(event.payload[key])[:80]
-                        info = f"[dim]{key}:[/] {val}"
+                        val = str(event.payload[key])
+                        label = {
+                            "template": "→",
+                            "reasoning": "reason:",
+                            "output_preview": "output:",
+                            "query": "q:",
+                            "approach": "plan:",
+                            "agents_used": "agents:",
+                            "tasks_succeeded": "ok:",
+                            "agent": "agent:",
+                        }.get(key, f"{key}:")
+                        detail = f"[dim]{label}[/] {val[:90]}"
                         break
 
-            table.add_row(
-                str(i),
-                ts_display,
-                event.event_type,
-                event.source,
-                event.target or "—",
-                info,
-            )
+            tl_table.add_row(icon, offset, type_str, src_tgt, detail)
 
-        console.print(table)
+        console.print(tl_table)
+        console.print(
+            f"[dim]  {len(real_events)} events · "
+            f"Run [bold]octane dag \"<query>\"[/bold] to preview routing before executing[/]"
+        )
+
     else:
-        # Show recent traces from disk (cross-process)
+        # ── Recent traces list ────────────────────────────────
         trace_ids = synapse.list_traces(limit=15)
         if not trace_ids:
             console.print("[yellow]No traces found. Run 'octane ask' first.[/]")
             return
 
-        table = Table(title="Recent Traces  (from ~/.octane/traces/)")
+        table = Table(title="Recent Traces  (~/.octane/traces/)", show_lines=False)
         table.add_column("Correlation ID", style="cyan")
-        table.add_column("Events", justify="right")
+        table.add_column("Started", style="dim", width=20)
+        table.add_column("Events", justify="right", style="dim")
         table.add_column("Duration", style="yellow", justify="right")
-        table.add_column("Status", justify="center")
+        table.add_column("Agents", style="green")
+        table.add_column("", justify="center", width=3)  # status
 
         for cid in trace_ids:
             if cid == "preflight":
                 continue
             t = synapse.get_trace(cid)
+            started_str = t.started_at.strftime("%m-%d %H:%M:%S") if t.started_at else "?"
+            visible_agents = [a for a in t.agents_used if a not in ("user", "osa", "osa.decomposer", "osa.evaluator")]
             table.add_row(
                 t.correlation_id,
+                started_str,
                 str(len(t.events)),
                 f"{t.total_duration_ms:.0f}ms",
+                ", ".join(visible_agents) or "—",
                 "✅" if t.success else "❌",
             )
 
         console.print(table)
-        console.print("[dim]Run: octane trace <correlation_id>  for full event log[/]")
+        console.print("[dim]  octane trace <id>   — full event timeline[/]")
+        console.print("[dim]  octane trace <id>   — partial IDs accepted (first 8 chars)[/]")
+
+
+def _resolve_trace_id(synapse, partial_id: str) -> str | None:
+    """Return a full correlation ID that starts with partial_id, or None."""
+    # Try exact match first
+    t = synapse.get_trace(partial_id)
+    if t.events:
+        return partial_id
+    # Try prefix match across stored traces
+    all_ids = synapse.list_traces(limit=50)
+    for cid in all_ids:
+        if cid.startswith(partial_id):
+            return cid
+    return None
+
+
+def _format_agent_tags(agents_used: list[str]) -> str:
+    """Return a Rich markup string of coloured agent tags."""
+    _AGENT_COLOURS = {
+        "web": "cyan", "code": "yellow", "memory": "blue",
+        "sysstat": "green", "pnl": "magenta",
+    }
+    parts = []
+    for a in agents_used:
+        if a in ("user", "osa", "osa.decomposer", "osa.evaluator"):
+            continue
+        c = _AGENT_COLOURS.get(a, "white")
+        parts.append(f"[bold {c}]{a}[/]")
+    return "  ".join(parts) if parts else "[dim]osa[/]"
 
 
 # ── octane chat ───────────────────────────────────────────────
@@ -901,6 +1090,244 @@ async def _watch_cancel(ticker: str):
         raise typer.Exit(1)
 
 
+# ── octane dag ────────────────────────────────────────────────
+
+
+@app.command()
+def dag(
+    query: str = typer.Argument(..., help="Query to dry-run through the Decomposer"),
+):
+    """🔀 Preview how Octane would decompose a query — no agents run.
+
+    Shows the task DAG that would be built for QUERY: which agent(s) would
+    handle it, what sub-agent hint is selected, and the routing reasoning.
+    Useful for understanding routing before committing to a full 'octane ask'.
+
+    Examples::
+
+        octane dag "what is AAPL trading at?"
+        octane dag "write a python script to sort a list"
+        octane dag "compare NVDA and AMD earnings"
+    """
+    asyncio.run(_dag(query))
+
+
+async def _dag(query: str):
+    from octane.osa.orchestrator import Orchestrator
+    from octane.osa.decomposer import PIPELINE_TEMPLATES
+
+    synapse = _get_synapse()
+    osa = Orchestrator(synapse)
+
+    # Run pre-flight silently — Bodega status affects LLM vs keyword routing
+    with console.status("[dim]Connecting to inference engine...[/]", spinner="dots"):
+        status = await osa.pre_flight()
+
+    routing_mode = (
+        "[green]LLM[/]" if (status["bodega_reachable"] and status["model_loaded"])
+        else "[yellow]keyword fallback[/]"
+    )
+
+    # Dry-run the Decomposer — does NOT dispatch any agents
+    with console.status("[dim]Decomposing...[/]", spinner="dots"):
+        task_dag = await osa.decomposer.decompose(query)
+
+    # ── Header ────────────────────────────────────────────────
+    console.print(Panel(
+        f"[bold]Query:[/]   {query}\n"
+        f"[bold]Routing:[/] {routing_mode}  ·  "
+        f"[bold]Nodes:[/] {len(task_dag.nodes)}  ·  "
+        f"[bold]Waves:[/] {len(task_dag.execution_order())}\n"
+        f"[bold]Reason:[/]  [dim]{task_dag.reasoning[:120] or '—'}[/]",
+        title="[bold cyan]🔀 DAG Dry-Run[/]",
+        border_style="cyan",
+    ))
+
+    # ── Node table ────────────────────────────────────────────
+    node_table = Table(show_lines=False, box=None, padding=(0, 2))
+    node_table.add_column("#", style="dim", width=3, justify="right")
+    node_table.add_column("Wave", style="dim", width=5, justify="center")
+    node_table.add_column("Agent", style="cyan", width=12)
+    node_table.add_column("Sub-agent", style="green", width=16)
+    node_table.add_column("Template", style="yellow", width=20)
+    node_table.add_column("Instruction", style="white")
+
+    # Build wave → node_id mapping
+    wave_map: dict[str, int] = {}
+    for wave_idx, wave in enumerate(task_dag.execution_order(), 1):
+        for node_id in wave:
+            wave_map[node_id] = wave_idx
+
+    for i, node in enumerate(task_dag.nodes, 1):
+        wave_num = wave_map.get(node.id, "?")
+        template = node.metadata.get("template", "—")
+        sub_agent = node.metadata.get("sub_agent", "—")
+
+        # Colour the agent cell by type
+        _AGENT_COLOURS = {
+            "web": "cyan", "code": "yellow", "memory": "blue",
+            "sysstat": "green", "pnl": "magenta",
+        }
+        ac = _AGENT_COLOURS.get(node.agent, "white")
+        agent_str = f"[bold {ac}]{node.agent}[/]"
+
+        node_table.add_row(
+            str(i),
+            str(wave_num),
+            agent_str,
+            sub_agent,
+            template,
+            (node.instruction or "")[:80],
+        )
+
+    console.print(node_table)
+
+    # ── Template description hint ─────────────────────────────
+    if task_dag.nodes:
+        first_template = task_dag.nodes[0].metadata.get("template", "")
+        tmpl_info = PIPELINE_TEMPLATES.get(first_template, {})
+        desc = tmpl_info.get("description", "")
+        if desc:
+            console.print(f"\n[dim]  Template description: {desc}[/]")
+
+    console.print(
+        f"\n[dim]  This DAG would dispatch {len(task_dag.nodes)} task(s). "
+        f"Run [bold]octane ask \"{query}\"[/bold] to execute.[/]"
+    )
+
+
+# ── octane pref ───────────────────────────────────────────────
+
+pref_app = typer.Typer(
+    name="pref",
+    help="⚙  Manage user preferences — controls verbosity, expertise, response style.",
+    no_args_is_help=True,
+)
+app.add_typer(pref_app, name="pref")
+
+# Valid values for each preference key — used for validation + autocomplete hints
+_PREF_CHOICES: dict[str, list[str]] = {
+    "verbosity":      ["concise", "detailed"],
+    "expertise":      ["beginner", "intermediate", "advanced"],
+    "response_style": ["prose", "bullets", "code-first"],
+    "domains":        [],   # free text — comma-separated list
+}
+
+
+@pref_app.command("show")
+def pref_show(
+    user_id: str = typer.Option("default", "--user", "-u", help="User ID"),
+):
+    """📋 Show all current preference values for a user.
+
+    Example::
+
+        octane pref show
+        octane pref show --user alice
+    """
+    asyncio.run(_pref_show(user_id))
+
+
+async def _pref_show(user_id: str):
+    from octane.agents.pnl.preference_manager import PreferenceManager, DEFAULTS
+
+    pm = PreferenceManager()
+    profile = await pm.get_all(user_id)
+
+    table = Table(title=f"Preferences — user: [bold]{user_id}[/]", show_lines=False, box=None, padding=(0, 2))
+    table.add_column("Key", style="cyan", width=20)
+    table.add_column("Value", style="bold white", width=18)
+    table.add_column("Default", style="dim", width=18)
+    table.add_column("Choices", style="dim")
+
+    for key, default in DEFAULTS.items():
+        current = profile.get(key, default)
+        is_custom = current != default
+        value_str = f"[bold green]{current}[/]" if is_custom else current
+        choices = ", ".join(_PREF_CHOICES.get(key, [])) or "free text"
+        table.add_row(key, value_str, default, choices)
+
+    console.print(table)
+    console.print("[dim]  Green = customised · Run: octane pref set <key> <value>[/]")
+
+
+@pref_app.command("set")
+def pref_set(
+    key: str = typer.Argument(..., help="Preference key (e.g. verbosity)"),
+    value: str = typer.Argument(..., help="New value"),
+    user_id: str = typer.Option("default", "--user", "-u", help="User ID"),
+):
+    """✏  Set a preference value.
+
+    Examples::
+
+        octane pref set verbosity detailed
+        octane pref set expertise beginner
+        octane pref set response_style bullets
+        octane pref set domains "technology,finance,science"
+    """
+    asyncio.run(_pref_set(user_id, key, value))
+
+
+async def _pref_set(user_id: str, key: str, value: str):
+    from octane.agents.pnl.preference_manager import PreferenceManager, DEFAULTS
+
+    if key not in DEFAULTS:
+        console.print(f"[red]Unknown preference key: [bold]{key}[/bold][/]")
+        console.print(f"[dim]Valid keys: {', '.join(DEFAULTS)}[/]")
+        raise typer.Exit(1)
+
+    choices = _PREF_CHOICES.get(key, [])
+    if choices and value not in choices:
+        console.print(f"[red]Invalid value [bold]{value!r}[/bold] for [bold]{key}[/bold][/]")
+        console.print(f"[dim]Valid values: {', '.join(choices)}[/]")
+        raise typer.Exit(1)
+
+    pm = PreferenceManager()
+    await pm.set(user_id, key, value)
+    console.print(f"[green]✅ {key}[/] = [bold]{value}[/]  [dim](user: {user_id})[/]")
+
+
+@pref_app.command("reset")
+def pref_reset(
+    key: str = typer.Argument(None, help="Key to reset. Omit to reset ALL preferences."),
+    user_id: str = typer.Option("default", "--user", "-u", help="User ID"),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Skip confirmation prompt"),
+):
+    """🔄 Reset a preference (or all preferences) to default values.
+
+    Examples::
+
+        octane pref reset verbosity
+        octane pref reset --yes           # reset all without prompting
+    """
+    asyncio.run(_pref_reset(user_id, key, yes))
+
+
+async def _pref_reset(user_id: str, key: str | None, skip_confirm: bool):
+    from octane.agents.pnl.preference_manager import PreferenceManager, DEFAULTS
+
+    pm = PreferenceManager()
+
+    if key:
+        if key not in DEFAULTS:
+            console.print(f"[red]Unknown preference key: {key}[/]")
+            raise typer.Exit(1)
+        await pm.delete(user_id, key)
+        console.print(f"[green]✅ {key}[/] reset to default: [bold]{DEFAULTS[key]}[/]  [dim](user: {user_id})[/]")
+    else:
+        if not skip_confirm:
+            confirm = console.input(
+                f"[yellow]Reset ALL preferences for user [bold]{user_id}[/bold]? [y/N]: [/]"
+            ).strip().lower()
+            if confirm not in ("y", "yes"):
+                console.print("[dim]Cancelled.[/]")
+                return
+        for k in DEFAULTS:
+            await pm.delete(user_id, k)
+        console.print(f"[green]✅ All preferences reset to defaults[/]  [dim](user: {user_id})[/]")
+
+
 # ── octane agents ─────────────────────────────────────────────
 
 
@@ -927,9 +1354,45 @@ def agents():
 
 @app.command()
 def version():
-    """📦 Show Octane version."""
+    """📦 Show Octane version, stack, and registered agents."""
+    import sys
+    import platform
     from octane import __version__
-    console.print(f"[bold cyan]🔥 Octane[/] v{__version__}")
+    from octane.osa.router import Router
+
+    synapse = _get_synapse()
+    router = Router(synapse)
+    agent_names = router.list_agents()
+
+    try:
+        import shadows as _shadows
+        shadows_ver = getattr(_shadows, "__version__", "unknown")
+    except ImportError:
+        shadows_ver = "not installed"
+
+    python_ver = f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"
+    arch = platform.machine()   # arm64 on Apple Silicon
+
+    # Build the agent tag line
+    _AGENT_COLOURS = {
+        "web": "cyan", "code": "yellow", "memory": "blue",
+        "sysstat": "green", "pnl": "magenta",
+    }
+    agent_parts = []
+    for name in agent_names:
+        c = _AGENT_COLOURS.get(name, "white")
+        agent_parts.append(f"[bold {c}]{name}[/]")
+    agents_line = "  ".join(agent_parts)
+
+    body = (
+        f"[bold cyan]🔥 Octane[/]  v[bold]{__version__}[/]\n\n"
+        f"[bold]Python:[/]  {python_ver}  ({arch})\n"
+        f"[bold]Shadows:[/] {shadows_ver}\n\n"
+        f"[bold]Agents:[/]  {agents_line}\n\n"
+        f"[dim]Run [bold]octane --help[/bold] for all commands.[/]"
+    )
+
+    console.print(Panel(body, border_style="cyan", padding=(1, 4)))
 
 
 # ── octane workflow ───────────────────────────────────────────
@@ -989,32 +1452,50 @@ def workflow_export(
 def workflow_list():
     """📋 List saved workflow templates."""
     from octane.workflow import list_workflows, WorkflowTemplate
+    import os
 
     files = list_workflows()
     if not files:
         console.print("[yellow]No workflows saved yet. Run: octane workflow export <trace_id>[/]")
         return
 
-    table = Table(title="Saved Workflows  (~/.octane/workflows/)")
+    table = Table(title="Saved Workflows  (~/.octane/workflows/)", show_lines=False)
     table.add_column("Name", style="cyan")
     table.add_column("Nodes", justify="right", style="yellow")
     table.add_column("Variables", style="green")
+    table.add_column("Modified", style="dim", width=18)
     table.add_column("Description", style="white")
 
     for f in files:
         try:
             t = WorkflowTemplate.load(f)
+            # Last-modified timestamp
+            mtime = os.path.getmtime(f)
+            from datetime import datetime as _dt
+            mod_str = _dt.fromtimestamp(mtime).strftime("%Y-%m-%d %H:%M")
+            # Variable display: show keys + default values, highlight placeholders
+            var_parts = []
+            for k, v in t.variables.items():
+                if v:
+                    var_parts.append(f"[dim]{k}[/]=[bold]{v}[/]")
+                else:
+                    var_parts.append(f"[bold yellow]{{{{[/][dim]{k}[/][bold yellow]}}}}[/]")
+            var_str = "  ".join(var_parts) if var_parts else "[dim]—[/]"
             table.add_row(
                 t.name,
                 str(len(t.nodes)),
-                ", ".join(f"[dim]{k}[/]=[bold]{v}[/]" for k, v in t.variables.items()) or "—",
-                t.description[:60] or "—",
+                var_str,
+                mod_str,
+                t.description[:55] or "—",
             )
         except Exception:
-            table.add_row(f.stem, "?", "?", "[red]parse error[/]")
+            table.add_row(f.stem, "?", "?", "?", "[red]parse error[/]")
 
     console.print(table)
-    console.print(f"[dim]{len(files)} template(s) · Run: octane workflow run <name>.workflow.json[/]")
+    console.print(
+        f"[dim]  {len(files)} template(s) · "
+        f"octane workflow run <name>.workflow.json [--var key=value][/]"
+    )
 
 
 @workflow_app.command("run")

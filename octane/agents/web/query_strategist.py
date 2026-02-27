@@ -90,11 +90,15 @@ class QueryStrategist:
             prompt=prompt,
             system=_STRATEGIST_SYSTEM_BASE,
             temperature=0.3,
-            max_tokens=256,
+            max_tokens=1024,  # reasoning models burn 300-800 tokens on <think> before emitting JSON
         )
 
-        # Strip think blocks and extract JSON
-        clean = re.sub(r"<think>.*?</think>", "", raw, flags=re.DOTALL).strip()
+        # Extract content after </think> block — preserve reasoning as debug log
+        if "</think>" in raw:
+            think_part, _, clean = raw.partition("</think>")
+            logger.debug("model_reasoning_trace", trace=think_part.replace("<think>", "").strip()[:300])
+        else:
+            clean = raw
         # Extract JSON array — handle models that wrap in markdown fences
         json_match = re.search(r"\[.*\]", clean, flags=re.DOTALL)
         if not json_match:

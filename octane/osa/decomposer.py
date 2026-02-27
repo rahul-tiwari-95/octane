@@ -167,14 +167,20 @@ class Decomposer:
             prompt=f'Query: "{query}"',
             system=_DECOMPOSER_SYSTEM,
             temperature=0.0,   # deterministic — classification, not generation
-            max_tokens=256,    # enough room for a thinking block + one token
+            max_tokens=1024,   # reasoning models burn 300-800 tokens on <think> before emitting the label
         )
 
-        # Strip <think>...</think> blocks emitted by reasoning models (DeepSeek-R1 etc.)
+        # Extract content after </think> block (reasoning models like bodega-raptor emit <think>…</think>)
+        # Using partition instead of regex so a truncated (unclosed) <think> is handled gracefully.
         import re
-        cleaned = re.sub(r"<think>.*?</think>", "", raw, flags=re.DOTALL).strip()
+        if "</think>" in raw:
+            _, _, after = raw.partition("</think>")
+            cleaned = after.strip()
+            logger.debug("model_reasoning_trace", trace=raw.partition("</think>")[0].replace("<think>", "").strip()[:300])
+        else:
+            cleaned = raw.strip()
         if not cleaned:
-            cleaned = raw  # fallback: use raw if stripping removed everything
+            cleaned = raw.strip()
 
         template_name = cleaned.strip().lower().strip('"\'.,;:\n ')
 

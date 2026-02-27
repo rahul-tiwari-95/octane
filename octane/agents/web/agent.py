@@ -52,8 +52,24 @@ class WebAgent(BaseAgent):
 
     # ── Finance ───────────────────────────────────────────────────────────
 
+    _TIMESERIES_KEYWORDS = frozenset([
+        "chart", "graph", "plot", "history", "historical", "timeseries",
+        "time series", "last month", "past month", "last week", "over time",
+        "price history", "trend", "ohlc", "candlestick", "30 day", "30-day",
+    ])
+
+    def _wants_timeseries(self, query: str) -> bool:
+        """Return True when the query needs historical price data, not just a snapshot."""
+        q = query.lower()
+        return any(kw in q for kw in self._TIMESERIES_KEYWORDS)
+
     async def _fetch_finance(self, query: str, request: AgentRequest) -> AgentResponse:
-        """Fetch market data. Extracts ticker symbol from query if present."""
+        """Fetch market data. Extracts ticker symbol from query if present.
+
+        When the query requests a chart / historical data, also fetches the
+        30-day timeseries and includes it as a CSV-formatted block so that a
+        downstream CodeAgent can plot it directly without re-fetching.
+        """
         ticker = self._extract_ticker(query)
 
         if ticker:
@@ -65,6 +81,14 @@ class WebAgent(BaseAgent):
                     correlation_id=request.correlation_id,
                 )
             summary = self._format_market_data(raw, ticker)
+
+            # If the query wants a chart/history, fetch the 30-day timeseries too
+            if self._wants_timeseries(query):
+                ts_raw = await self._intel.timeseries(ticker, period="1mo", interval="1d")
+                ts_rows = ts_raw.get("time_series", [])
+                if ts_rows:
+                    summary = summary + "\n\n" + self._format_timeseries_csv(ticker, ts_rows)
+                    raw = {"market_data": raw, "timeseries": ts_raw}
         else:
             # No ticker found — fall back to a date-enriched web search so
             # Brave returns current results, not cached pages from months ago.
@@ -117,6 +141,24 @@ class WebAgent(BaseAgent):
             f"{ticker}: ${price:.2f} {direction}{abs(change_pct):.2f}% today | "
             f"Volume: {volume:,} | Market Cap: {cap_str}"
         )
+
+    def _format_timeseries_csv(self, ticker: str, rows: list[dict]) -> str:
+        """Serialise timeseries rows as a labelled CSV block for downstream agents.
+
+        Downstream CodeAgent can parse this directly — no extra API calls needed.
+        Each row: {'timestamp': '2026-01-26 00:00:00', 'open':…, 'high':…,
+                   'low':…, 'close':…, 'volume':…}
+        """
+        lines = [f"# {ticker} 30-day price history (date,close,volume)"]
+        lines.append("date,close,volume")
+        for row in rows:
+            ts = row.get("timestamp", "")
+            # Normalise '2026-01-26 00:00:00' → '2026-01-26'
+            date_str = ts[:10] if ts else ""
+            close = round(row.get("close", 0), 2)
+            volume = row.get("volume", 0)
+            lines.append(f"{date_str},{close},{volume}")
+        return "\n".join(lines)
 
     def _format_web_results(self, raw: dict, query: str) -> str:
         """Turn a generic web_search response into a readable summary string.

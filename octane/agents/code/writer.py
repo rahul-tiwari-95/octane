@@ -14,17 +14,54 @@ from octane.tools.bodega_inference import BodegaInferenceClient
 
 logger = structlog.get_logger().bind(component="code.writer")
 
+# Regex that matches lines that look like Python code (rough heuristic)
+_PY_LINE_RE = re.compile(
+    r"^\s*(import |from |def |class |#|@|if |else:|elif |for |while |try:|except|"
+    r"with |return |raise |yield |async |await |print\(|[a-zA-Z_][a-zA-Z0-9_.]*\s*[=(+\-\[{])"
+)
+
+
+def _strip_prose_lines(code: str) -> str:
+    """Remove leading/trailing prose lines that aren't Python.
+
+    Prose lines: plain English sentences with no Python syntax markers.
+    We keep a line if it matches _PY_LINE_RE OR if it's blank OR if we're
+    already inside the code body (once first real code line is seen, stop
+    stripping from the front; strip only from the tail symmetrically).
+    """
+    lines = code.splitlines()
+    # Strip leading prose
+    start = 0
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        if not stripped or _PY_LINE_RE.match(line):
+            start = i
+            break
+    # Strip trailing prose (walk backwards)
+    end = len(lines)
+    for i in range(len(lines) - 1, start - 1, -1):
+        stripped = lines[i].strip()
+        if not stripped or _PY_LINE_RE.match(lines[i]) or stripped.startswith((")", "]", "}")):
+            end = i + 1
+            break
+    return "\n".join(lines[start:end])
+
 _SYSTEM_PROMPT = """\
 You are an expert Python developer. Write clean, complete, runnable Python code for the given task spec.
 Rules:
-- Output ONLY the Python source code, no markdown fences, no explanation
+- Output ONLY the Python source code, no markdown fences, no explanation, no prose
 - The code must be self-contained and runnable with `python solution.py`
 - Import only packages listed in requirements (plus stdlib)
 - Print the final answer or result to stdout
-- The script MUST complete in under 5 seconds. Use iterative algorithms, never recursion for sequences.
+- The script MUST complete in under 60 seconds.
 - No infinite loops. No sleep(). No blocking I/O unless explicitly asked.
 - Handle errors gracefully with try/except where appropriate
-- Keep it concise: solve the problem, don't over-engineer"""
+- Keep it concise: solve the problem, don't over-engineer
+- For charts/plots: the variable OUTPUT_DIR is pre-defined — save the figure with
+  plt.savefig(os.path.join(OUTPUT_DIR, 'chart.png'), dpi=150, bbox_inches='tight')
+  then call plt.close(). NEVER call plt.show() — it blocks the process.
+- When upstream data is provided as CSV, parse and use it directly. Do NOT
+  re-fetch data from the internet unless no data was provided."""
 
 
 class Writer:
@@ -61,12 +98,22 @@ class Writer:
                 system=_SYSTEM_PROMPT,
                 temperature=0.2,
             )
+            # Preserve <think> reasoning as a debug trace; extract code from after </think>
+            if "</think>" in raw:
+                think_part, _, code = raw.partition("</think>")
+                reasoning_trace = think_part.replace("<think>", "").strip()
+                logger.debug("model_reasoning_trace", trace=reasoning_trace[:500])
+            else:
+                code = raw
             # Strip accidental markdown fences
-            code = re.sub(r"^```[a-z]*\n?", "", raw.strip(), flags=re.MULTILINE)
+            code = re.sub(r"^```[a-z]*\n?", "", code.strip(), flags=re.MULTILINE)
             code = re.sub(r"\n?```$", "", code.strip(), flags=re.MULTILINE)
+            # Strip any leading/trailing prose lines that slipped through
+            # (lines that don't look like Python: no =, no import, no def, no #, no indent)
+            code = _strip_prose_lines(code)
             if not code.strip():
                 return None
-            return code
+            return code.strip()
         except Exception as e:
             logger.warning("write_llm_error", error=str(e))
             return None

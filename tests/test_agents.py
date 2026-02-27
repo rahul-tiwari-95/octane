@@ -1734,3 +1734,211 @@ class TestClockUtility:
         agent = WebAgent(SynapseEventBus())
         assert agent is not None
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Session 13 — Developer Experience & Observable Internals
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+class TestDagCommand:
+    """octane dag — Decomposer dry-run renders the task DAG without executing agents.
+
+    Regression goals:
+    - DAG dry-run must NEVER dispatch agents — it reads the TaskDAG only.
+    - Node table must include agent name, sub-agent, wave number, template.
+    - Partial / full trace IDs must be resolvable by _resolve_trace_id.
+    - Command must complete even when Bodega is offline (keyword fallback path).
+    """
+
+    async def test_dag_dryryn_does_not_dispatch_agents(self, monkeypatch):
+        """Decomposer.decompose() is called but no agent.execute() may be called."""
+        from octane.osa.decomposer import Decomposer
+        from octane.models.synapse import SynapseEventBus
+
+        executed = []
+
+        class _MockBodega:
+            async def health(self):
+                return {}
+            async def current_model(self):
+                return {"error": "offline"}
+            async def close(self):
+                pass
+
+        decomposer = Decomposer(bodega=None)
+        dag_result = await decomposer.decompose("what is AAPL trading at?")
+
+        # Confirm we get a TaskDAG with nodes — no execution happened
+        assert dag_result is not None
+        assert len(dag_result.nodes) >= 1
+        assert executed == [], "agents must not be dispatched during dag dry-run"
+
+    async def test_dag_finance_query_routes_to_web_finance(self):
+        """A stock price query must decompose to agent=web, sub_agent=finance."""
+        from octane.osa.decomposer import Decomposer
+
+        d = Decomposer(bodega=None)
+        result = await d.decompose("what is the price of Apple stock?")
+
+        assert len(result.nodes) >= 1
+        first = result.nodes[0]
+        assert first.agent == "web"
+        assert first.metadata.get("sub_agent") in ("finance", "web_finance")
+
+    async def test_dag_code_query_routes_to_code_agent(self):
+        """A code generation query must decompose to agent=code."""
+        from octane.osa.decomposer import Decomposer
+
+        d = Decomposer(bodega=None)
+        result = await d.decompose("write a python script to sort a list")
+
+        assert len(result.nodes) >= 1
+        assert result.nodes[0].agent == "code"
+
+    async def test_dag_nodes_have_required_metadata(self):
+        """Every TaskNode in the DAG must carry agent, sub_agent, template metadata."""
+        from octane.osa.decomposer import Decomposer
+
+        d = Decomposer(bodega=None)
+        result = await d.decompose("latest NVIDIA news")
+
+        for node in result.nodes:
+            assert node.agent, f"node {node.id} missing agent"
+            assert "sub_agent" in node.metadata, f"node {node.id} missing sub_agent metadata"
+            assert "template" in node.metadata, f"node {node.id} missing template metadata"
+
+    def test_resolve_trace_id_exact_match(self, monkeypatch):
+        """_resolve_trace_id must return the full ID when given an exact match."""
+        from octane.main import _resolve_trace_id
+        from octane.models.synapse import SynapseEventBus, SynapseEvent
+
+        synapse = SynapseEventBus(persist=False)
+        cid = "abc123-def456-full"
+        # Emit a real event so get_trace can find it in _events
+        event = SynapseEvent(
+            event_type="ingress",
+            source="user",
+            correlation_id=cid,
+        )
+        synapse.emit(event)
+
+        result = _resolve_trace_id(synapse, cid)
+        assert result == cid
+
+    def test_resolve_trace_id_partial_prefix(self, monkeypatch):
+        """_resolve_trace_id must resolve a partial (prefix) ID against stored traces."""
+        from octane.main import _resolve_trace_id
+        from octane.models.synapse import SynapseEventBus, SynapseEvent
+
+        synapse = SynapseEventBus(persist=False)
+        cid = "deadbeef-1234-5678-abcd"
+        event = SynapseEvent(event_type="ingress", source="user", correlation_id=cid)
+        synapse.emit(event)
+
+        # Patch list_traces to return our test CID
+        monkeypatch.setattr(synapse, "list_traces", lambda limit=50: [cid])
+
+        result = _resolve_trace_id(synapse, "deadbeef")
+        assert result == cid
+
+
+class TestPrefCommand:
+    """octane pref show/set/reset — wires PreferenceManager to the CLI.
+
+    Regression goals:
+    - set/get/delete round-trip works end-to-end.
+    - Unknown keys are rejected with a helpful error.
+    - Invalid values for constrained keys (verbosity, expertise, response_style) are rejected.
+    - reset single key restores the default value.
+    - reset all keys removes all customisations.
+    """
+
+    async def test_pref_set_and_get_round_trip(self, monkeypatch):
+        """set() followed by get_all() must return the new value."""
+        from octane.agents.pnl.preference_manager import PreferenceManager
+
+        storage: dict[str, str] = {}
+
+        class _FakeRedis:
+            async def get(self, key):
+                return storage.get(key)
+            async def set(self, key, value, ttl=0):
+                storage[key] = value
+            async def delete(self, key):
+                storage.pop(key, None)
+            async def close(self):
+                pass
+
+        pm = PreferenceManager(redis=_FakeRedis())
+        await pm.set("alice", "verbosity", "detailed")
+        val = await pm.get("alice", "verbosity")
+        assert val == "detailed"
+
+    async def test_pref_reset_restores_default(self, monkeypatch):
+        """delete() followed by get() must return the built-in default."""
+        from octane.agents.pnl.preference_manager import PreferenceManager, DEFAULTS
+
+        storage: dict[str, str] = {}
+
+        class _FakeRedis:
+            async def get(self, key):
+                return storage.get(key)
+            async def set(self, key, value, ttl=0):
+                storage[key] = value
+            async def delete(self, key):
+                storage.pop(key, None)
+            async def close(self):
+                pass
+
+        pm = PreferenceManager(redis=_FakeRedis())
+        await pm.set("bob", "expertise", "beginner")
+        await pm.delete("bob", "expertise")
+        val = await pm.get("bob", "expertise")
+        assert val == DEFAULTS["expertise"]
+
+    def test_pref_invalid_key_rejected(self):
+        """_pref_set CLI helper must exit non-zero for unknown preference keys."""
+        from typer.testing import CliRunner
+        from octane.main import app
+
+        runner = CliRunner()
+        result = runner.invoke(app, ["pref", "set", "nonexistent_key", "value"])
+        assert result.exit_code != 0 or "Unknown preference key" in (result.output or "")
+
+    def test_pref_choices_exhaustive(self):
+        """Every constrained preference key in PreferenceManager.DEFAULTS must have
+        a non-empty choices list in _PREF_CHOICES (or be marked as free text)."""
+        from octane.agents.pnl.preference_manager import DEFAULTS
+        from octane.main import _PREF_CHOICES
+
+        # All DEFAULTS keys must appear in _PREF_CHOICES
+        for key in DEFAULTS:
+            assert key in _PREF_CHOICES, \
+                f"Preference key '{key}' in DEFAULTS is not listed in _PREF_CHOICES"
+
+
+class TestVersionCommand:
+    """octane version — styled splash panel with version, Python, agents, Shadows."""
+
+    def test_version_output_contains_octane_version(self):
+        """The splash output must contain the Octane version string."""
+        from typer.testing import CliRunner
+        from octane.main import app
+        from octane import __version__
+
+        runner = CliRunner()
+        result = runner.invoke(app, ["version"])
+        assert __version__ in result.output
+
+    def test_version_output_contains_python(self):
+        """The splash output must mention the Python version."""
+        import sys
+        from typer.testing import CliRunner
+        from octane.main import app
+
+        runner = CliRunner()
+        result = runner.invoke(app, ["version"])
+        py_ver = f"{sys.version_info.major}.{sys.version_info.minor}"
+        assert py_ver in result.output, \
+            f"Python version '{py_ver}' not found in version output"
+

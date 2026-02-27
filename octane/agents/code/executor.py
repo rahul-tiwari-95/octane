@@ -23,7 +23,7 @@ import structlog
 
 logger = structlog.get_logger().bind(component="code.executor")
 
-TIMEOUT_SECONDS = 60
+TIMEOUT_SECONDS = 120
 MAX_OUTPUT_CHARS = 4000
 
 # Where output files (charts, CSVs) are saved permanently
@@ -124,11 +124,13 @@ class Executor:
         )
 
     def _collect_artifacts(self, tmpdir: str, output_dir: Path) -> list[str]:
-        """Collect artifact files from both tmpdir and output_dir.
+        """Collect artifact files from both tmpdir root and output_dir.
 
         Scripts may write to OUTPUT_DIR directly (already in output_dir) or
-        to their cwd (tmpdir). Both locations are scanned; tmpdir files are
-        copied, output_dir files are already in place.
+        to their cwd (tmpdir). Only the ROOT of tmpdir is scanned — subdirectories
+        are ignored to avoid picking up pip-installed package data (e.g. matplotlib
+        test CSVs, numpy validation files). OUTPUT_DIR is scanned recursively but
+        only files at the top level are collected (scripts write to its root).
         Returns list of filenames found.
         """
         saved: list[str] = []
@@ -139,19 +141,20 @@ class Executor:
                 saved.append(item.name)
                 logger.info("artifact_found", file=item.name, path=str(item))
 
-        # Files the script wrote to cwd (tmpdir) — copy them over
-        for root, _, files in os.walk(tmpdir):
-            for fname in files:
-                if Path(fname).suffix.lower() in _ARTIFACT_EXTENSIONS:
-                    src = Path(root) / fname
-                    dst = output_dir / fname
-                    if fname not in saved:  # avoid double-counting
-                        try:
-                            shutil.copy2(src, dst)
-                            saved.append(fname)
-                            logger.info("artifact_saved", file=fname, path=str(dst))
-                        except Exception as e:
-                            logger.warning("artifact_copy_failed", file=fname, error=str(e))
+        # Files the script wrote to cwd root (tmpdir) — copy them over.
+        # Only scan the root of tmpdir, NOT subdirectories, to avoid pip-installed
+        # package data (e.g. matplotlib/mpl-data, numpy test sets).
+        tmpdir_path = Path(tmpdir)
+        for item in tmpdir_path.iterdir():
+            if item.is_file() and item.suffix.lower() in _ARTIFACT_EXTENSIONS:
+                if item.name not in saved:
+                    dst = output_dir / item.name
+                    try:
+                        shutil.copy2(item, dst)
+                        saved.append(item.name)
+                        logger.info("artifact_saved", file=item.name, path=str(dst))
+                    except Exception as e:
+                        logger.warning("artifact_copy_failed", file=item.name, error=str(e))
         return saved
 
     async def _run_subprocess(
