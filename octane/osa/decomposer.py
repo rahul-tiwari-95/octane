@@ -8,12 +8,17 @@ Falls back to keyword heuristics if Bodega is unavailable.
 
 from __future__ import annotations
 
+import asyncio
 import structlog
 
 from octane.models.dag import TaskDAG, TaskNode
 from octane.osa.dag_planner import DAGPlanner
+from octane.tools.topology import ModelTier
 
 logger = structlog.get_logger().bind(component="osa.decomposer")
+
+# Sentinel: distinguish "use default BodegaRouter" from "explicitly no LLM"
+_UNSET = object()
 
 # ── Pipeline Templates ────────────────────────────────────────────────────────
 # The LLM chooses from these. Adding a new capability = adding a template here.
@@ -86,8 +91,12 @@ class Decomposer:
     Phase 3+: Generates arbitrary multi-step parallel DAGs from scratch.
     """
 
-    def __init__(self, bodega=None) -> None:
-        # Bodega client injected by Orchestrator (avoids circular imports)
+    def __init__(self, bodega=_UNSET) -> None:
+        # Bodega client injected by Orchestrator (avoids circular imports).
+        # Pass bodega=None explicitly to disable LLM (fallback to keywords).
+        if bodega is _UNSET:
+            from octane.tools.bodega_router import BodegaRouter
+            bodega = BodegaRouter()
         self._bodega = bodega
         self._dag_planner = DAGPlanner(bodega=bodega)
 
@@ -147,10 +156,13 @@ class Decomposer:
         """
         if self._bodega is not None:
             try:
-                result = await self._classify_with_llm(query)
+                result = await asyncio.wait_for(
+                    self._classify_with_llm(query),
+                    timeout=8.0,  # fast fallback to keywords if LLM stalls
+                )
                 if result:
                     return result[0], result[1], "llm"
-            except Exception as exc:
+            except (asyncio.TimeoutError, Exception) as exc:
                 logger.warning("llm_classification_failed", error=str(exc), fallback="keywords")
 
         # Fallback: keyword heuristics
@@ -166,6 +178,7 @@ class Decomposer:
         raw = await self._bodega.chat_simple(
             prompt=f'Query: "{query}"',
             system=_DECOMPOSER_SYSTEM,
+            tier=ModelTier.FAST,
             temperature=0.0,   # deterministic — classification, not generation
             max_tokens=1024,   # reasoning models burn 300-800 tokens on <think> before emitting the label
         )

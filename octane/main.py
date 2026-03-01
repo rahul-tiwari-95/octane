@@ -131,6 +131,75 @@ async def _health():
         await bodega.close()
 
 
+# ── octane sysstat ───────────────────────────────────────────
+
+
+@app.command()
+def sysstat():
+    """📊 Live system snapshot — RAM, CPU, loaded model (no Bodega required)."""
+    asyncio.run(_sysstat())
+
+
+async def _sysstat():
+    from octane.agents.sysstat.agent import SysStatAgent
+    from octane.models.schemas import AgentRequest
+    from octane.tools.bodega_inference import BodegaInferenceClient
+    from rich.table import Table
+
+    synapse = _get_synapse()
+    bodega = BodegaInferenceClient()
+
+    try:
+        agent = SysStatAgent(synapse, bodega)
+        request = AgentRequest(query="sysstat", source="cli")
+        response = await agent.run(request)
+
+        if not response.success:
+            console.print(f"[red]sysstat failed: {response.error}[/]")
+            return
+
+        data = response.data
+        system = data.get("system", {})
+        model = data.get("model", {})
+
+        # ── System table ──────────────────────────────────────────────
+        sys_tbl = Table(show_header=False, box=None, padding=(0, 2))
+        sys_tbl.add_column("Metric", style="cyan")
+        sys_tbl.add_column("Value", style="white")
+
+        ram_used = system.get("ram_used_gb", 0)
+        ram_total = system.get("ram_total_gb", 0)
+        ram_pct = system.get("ram_percent", 0)
+        ram_color = "green" if ram_pct < 70 else "yellow" if ram_pct < 90 else "red"
+
+        sys_tbl.add_row("RAM", f"[{ram_color}]{ram_used:.1f} / {ram_total:.1f} GB ({ram_pct}%)[/]")
+        sys_tbl.add_row("CPU", f"{system.get('cpu_percent', '?')}% ({system.get('cpu_count', '?')} cores)")
+        sys_tbl.add_row("Available", f"{system.get('ram_available_gb', 0):.1f} GB free")
+        sys_tbl.add_row("Uptime", f"{system.get('uptime_hours', 0):.1f} h")
+
+        # ── Model table ───────────────────────────────────────────────
+        mod_tbl = Table(show_header=False, box=None, padding=(0, 2))
+        mod_tbl.add_column("Key", style="magenta")
+        mod_tbl.add_column("Value", style="white")
+
+        if "error" in model:
+            mod_tbl.add_row("Status", f"[yellow]⚠ {model['error']}[/]")
+        else:
+            model_name = model.get("model", model.get("model_path", "—"))
+            mod_tbl.add_row("Model", f"[green]{model_name}[/]")
+            if model.get("loaded"):
+                mod_tbl.add_row("Status", "[green]✓ loaded[/]")
+            if model.get("context_length"):
+                mod_tbl.add_row("Context", f"{model['context_length']:,} tokens")
+
+        console.print(Panel(sys_tbl, title="[bold cyan]💻 System[/]", border_style="cyan"))
+        console.print(Panel(mod_tbl, title="[bold magenta]🧠 Model[/]", border_style="magenta"))
+        console.print(f"[dim]Duration: {response.duration_ms}ms[/]")
+
+    finally:
+        await bodega.close()
+
+
 # ── octane ask ────────────────────────────────────────────────
 
 
@@ -533,20 +602,34 @@ def chat():
     asyncio.run(_chat())
 
 
+# Slash commands available inside the chat REPL
+_CHAT_HELP = """[bold]Slash commands:[/]
+  [cyan]/help[/]          — show this message
+  [cyan]/trace [id][/]    — show Synapse trace for last response (or a specific id)
+  [cyan]/history[/]       — print current conversation history
+  [cyan]/clear[/]         — clear conversation history and start fresh
+  [cyan]/exit[/]          — end the session (also: exit, quit, q)
+"""
+
+
 async def _chat():
     from octane.osa.orchestrator import Orchestrator
 
     synapse = _get_synapse()
-    osa = Orchestrator(synapse)
+    # HIL interactive=True in chat — high-risk decisions get presented to user
+    osa = Orchestrator(synapse, hil_interactive=True)
     session_id = f"chat_{int(__import__('time').time())}"
 
-    # Rolling conversation buffer — last 6 turns injected into every Evaluator call
+    # Rolling conversation buffer — last 6 turns (12 entries) injected into Evaluator
     conversation_history: list[dict[str, str]] = []
+    # Track correlation IDs for /trace
+    last_correlation_id: str | None = None
 
     console.print(Panel(
         "[bold green]Octane Chat[/]\n"
         "[dim]Type your message and press Enter. "
-        "Type [bold]exit[/bold] or [bold]quit[/bold] to end the session.[/]",
+        "Use [bold cyan]/help[/bold cyan] for slash commands, "
+        "[bold]exit[/bold] or [bold]quit[/bold] to end the session.[/]",
         border_style="green",
     ))
 
@@ -572,19 +655,61 @@ async def _chat():
         if not query:
             continue
 
+        # ── Slash commands ────────────────────────────────────────────────
+        if query.startswith("/"):
+            parts = query.split(maxsplit=1)
+            cmd = parts[0].lower()
+
+            if cmd == "/help":
+                console.print(_CHAT_HELP)
+                continue
+
+            elif cmd == "/clear":
+                conversation_history.clear()
+                console.print("[dim]✓ Conversation history cleared.[/]\n")
+                continue
+
+            elif cmd == "/history":
+                if not conversation_history:
+                    console.print("[dim]No history yet.[/]\n")
+                else:
+                    for i, msg in enumerate(conversation_history, 1):
+                        role_tag = "[bold cyan]You:[/]" if msg["role"] == "user" else "[bold green]Octane:[/]"
+                        preview = msg["content"][:120].replace("\n", " ")
+                        console.print(f"  {i}. {role_tag} {preview}")
+                    console.print()
+                continue
+
+            elif cmd == "/trace":
+                cid = parts[1].strip() if len(parts) > 1 else last_correlation_id
+                if cid:
+                    asyncio.get_event_loop().run_until_complete(
+                        _trace(cid)
+                    ) if False else None
+                    # Use the synapse we already have
+                    _print_synapse_trace(synapse, cid)
+                else:
+                    console.print("[yellow]No trace available yet — ask something first.[/]\n")
+                continue
+
+            else:
+                console.print(f"[yellow]Unknown command '{cmd}'. Type /help for options.[/]\n")
+                continue
+
+        # ── Normal query ──────────────────────────────────────────────────
         if query.lower() in ("exit", "quit", "bye", "q"):
             console.print("[dim]Goodbye.[/]")
             break
 
         turn += 1
-        # Add user turn to history before processing
         conversation_history.append({"role": "user", "content": query})
 
-        # Spinner covers guard → decompose → dispatch → first Evaluator token
         _status = console.status("[dim]⚙  Working...[/]", spinner="dots")
         _status.start()
         response_parts: list[str] = []
         _first = True
+
+        # Capture correlation_id from the egress event after streaming
         async for chunk in osa.run_stream(
             query,
             session_id=session_id,
@@ -596,20 +721,60 @@ async def _chat():
                 _first = False
             console.print(chunk, end="")
             response_parts.append(chunk)
+
         if _first:
-            _status.stop()  # no tokens (guard blocked, etc.)
-        console.print()  # newline after stream ends
+            _status.stop()
         console.print()
 
-        # Add assistant turn to history
         assistant_reply = "".join(response_parts).strip()
         conversation_history.append({"role": "assistant", "content": assistant_reply})
 
-        # Keep history bounded to last 12 entries (6 turns)
+        # Extract correlation_id from most recent egress event
+        egress_events = [
+            e for e in synapse._events
+            if e.event_type == "egress"
+        ]
+        if egress_events:
+            last_correlation_id = egress_events[-1].correlation_id
+            console.print(
+                f"[dim]  ↳ trace: {last_correlation_id[:16]}…  "
+                f"(/trace to inspect)[/]\n"
+            )
+        else:
+            console.print()
+
         if len(conversation_history) > 12:
             conversation_history = conversation_history[-12:]
 
     console.print(f"[dim]Session {session_id} — {turn} turn(s)[/]")
+
+
+def _print_synapse_trace(synapse, correlation_id: str) -> None:
+    """Print a compact inline Synapse trace for use inside /trace slash command."""
+    from rich.table import Table
+    events = [e for e in synapse._events if e.correlation_id == correlation_id]
+    if not events:
+        console.print(f"[yellow]No events found for {correlation_id}[/]\n")
+        return
+    table = Table(title=f"Trace: {correlation_id[:24]}…", show_header=True, header_style="bold")
+    table.add_column("Event", style="cyan", no_wrap=True, width=26)
+    table.add_column("Source → Target", width=28)
+    table.add_column("Details", overflow="fold")
+    for ev in events:
+        target = getattr(ev, "target", "—") or "—"
+        details = ""
+        payload = getattr(ev, "payload", None) or {}
+        if isinstance(payload, dict):
+            if "agents_used" in payload:
+                details = f"agents: {', '.join(payload['agents_used'])}"
+            elif "template" in payload:
+                details = f"template: {payload['template']}"
+            elif "output_preview" in payload:
+                details = payload["output_preview"][:60]
+        table.add_row(ev.event_type, f"{ev.source} → {target}", details)
+    console.print(table)
+    console.print()
+
 
 
 # ── octane feedback ───────────────────────────────────────────
@@ -865,6 +1030,30 @@ def _get_watch_shadow():
     return "octane", settings.redis_url
 
 
+async def _ensure_shadow_group(shadow_name: str, redis_url: str) -> None:
+    """Pre-create the Shadows consumer group, silently ignoring BUSYGROUP.
+
+    The installed version of Shadows checks ``"BUSYGROUP" not in repr(e)`` to
+    swallow duplicate-group errors, but in recent redis-py builds
+    ``repr(ResponseError)`` returns ``'server:ResponseError'`` (no message
+    text), so the guard never fires and the error propagates.  Creating the
+    group here before Shadow.__aenter__ runs works around the bug.
+    """
+    import redis.asyncio as aioredis
+    client = aioredis.from_url(redis_url, decode_responses=True)
+    try:
+        await client.xgroup_create(
+            name=f"{shadow_name}:stream",
+            groupname="shadows-workers",
+            id="0-0",
+            mkstream=True,
+        )
+    except Exception:
+        pass  # BUSYGROUP or any other error — group already exists, carry on
+    finally:
+        await client.aclose()
+
+
 @watch_app.command("start")
 def watch_start(
     ticker: str = typer.Argument(..., help="Ticker symbol, e.g. AAPL or BTC"),
@@ -893,6 +1082,7 @@ async def _watch_start(ticker: str, interval_hours: float):
     from octane.config import settings
 
     shadow_name, redis_url = _get_watch_shadow()
+    await _ensure_shadow_group(shadow_name, redis_url)
 
     # ── 1. Schedule the perpetual task via Shadow ──────────────
     console.print(f"[dim]Connecting to Redis at {redis_url}...[/]")
@@ -1352,6 +1542,85 @@ def agents():
 # ── octane version ────────────────────────────────────────────
 
 
+# ── octane model ──────────────────────────────────────────────
+
+model_app = typer.Typer(
+    name="model",
+    help="🧠 Manage the loaded LLM (reload, switch, inspect).",
+    no_args_is_help=True,
+)
+app.add_typer(model_app, name="model")
+
+
+@model_app.command("reload-parser")
+def model_reload_parser(
+    parser: str = typer.Option("qwen3", "--parser", "-p", help="Reasoning parser name (qwen3, harmony, etc.)"),
+):
+    """🔄 Reload the current model with reasoning_parser enabled.
+
+    Unloads the running model and reloads the exact same model with the
+    reasoning parser activated.  After this, Octane receives native
+    reasoning_content from the API — no manual <think> token stripping needed.
+
+    Examples::
+
+        octane model reload-parser
+        octane model reload-parser --parser qwen3
+    """
+    asyncio.run(_model_reload_parser(parser))
+
+
+async def _model_reload_parser(parser: str) -> None:
+    from octane.tools.bodega_inference import BodegaInferenceClient
+    from octane.agents.sysstat.model_manager import ModelManager
+
+    bodega = BodegaInferenceClient()
+    manager = ModelManager(bodega)
+
+    # Show current model
+    info = await bodega.current_model()
+    if not info.get("loaded"):
+        console.print("[red]No model currently loaded.[/]")
+        return
+
+    model_path = info["model_info"]["model_path"]
+    console.print(f"[dim]Current model: [bold]{model_path}[/bold][/]")
+    console.print(f"[dim]Reloading with reasoning_parser=[bold]{parser}[/bold]...[/]")
+    console.print("[yellow]⚠  Model will be unloaded briefly — Octane will be offline for ~5–15s.[/]")
+
+    try:
+        result = await manager.reload_with_reasoning_parser(reasoning_parser=parser)
+        console.print(f"[green]✅ Model reloaded with reasoning_parser={parser!r}[/]")
+        console.print(f"[dim]Bodega response: {result}[/]")
+    except Exception as exc:
+        console.print(f"[red]Reload failed: {exc}[/]")
+
+
+@model_app.command("info")
+def model_info():
+    """🔍 Show the currently loaded model and its configuration."""
+    asyncio.run(_model_info())
+
+
+async def _model_info() -> None:
+    from octane.tools.bodega_inference import BodegaInferenceClient
+    bodega = BodegaInferenceClient()
+    info = await bodega.current_model()
+    if not info.get("loaded"):
+        console.print("[yellow]No model currently loaded.[/]")
+        return
+    mi = info["model_info"]
+    console.print(Panel(
+        f"[bold]Model:[/]    {mi.get('model_path')}\n"
+        f"[bold]Type:[/]     {mi.get('model_type', 'lm')}\n"
+        f"[bold]Context:[/]  {mi.get('context_length', '?')} tokens\n"
+        f"[bold]Parser:[/]   {mi.get('reasoning_parser', '[dim]none[/dim]')}",
+        title="🧠 Loaded Model",
+        border_style="cyan",
+        padding=(0, 2),
+    ))
+
+
 @app.command()
 def version():
     """📦 Show Octane version, stack, and registered agents."""
@@ -1607,6 +1876,957 @@ async def _workflow_run(file_str: str, var_list: list[str], query_override: str,
         if verbose:
             dag_reason = egress.payload.get("dag_reasoning", "") if egress and egress.payload else ""
             _print_dag_trace(t, real_events, dag_nodes, dag_reason)
+
+
+# ── octane research ───────────────────────────────────────────
+
+research_app = typer.Typer(
+    name="research",
+    help="🔬 Long-running background research workflows (powered by Shadows).",
+    no_args_is_help=True,
+)
+app.add_typer(research_app, name="research")
+
+
+# ══════════════════════════════════════════════════════════════
+# octane db  — Schema migrations
+# ══════════════════════════════════════════════════════════════
+
+db_app = typer.Typer(
+    name="db",
+    help="🗄 Postgres schema migrations.",
+    no_args_is_help=True,
+)
+app.add_typer(db_app, name="db")
+
+
+@db_app.command("migrate")
+def db_migrate():
+    """📦 Apply pending schema migrations (idempotent, safe to run repeatedly)."""
+    asyncio.run(_db_migrate())
+
+
+async def _db_migrate():
+    from octane.tools.migrations import MigrationRunner
+    console.print("[dim]Running migrations…[/]")
+    runner = MigrationRunner()
+    result = await runner.migrate()
+    if result.error:
+        console.print(f"[red]❌ Migration failed: {result.error}[/]")
+        raise typer.Exit(1)
+    if result.applied:
+        console.print(
+            f"[green]✅ Migration [bold]{result.version}[/bold] applied.[/]\n"
+            f"[dim]Tables: {', '.join(sorted(result.tables))}[/]"
+        )
+    else:
+        console.print(
+            f"[green]✅ Schema already current (version [bold]{result.version}[/bold]).[/]\n"
+            f"[dim]Tables: {', '.join(sorted(result.tables))}[/]"
+        )
+
+
+@db_app.command("status")
+def db_status():
+    """📊 Show migration versions and per-table row counts."""
+    asyncio.run(_db_status())
+
+
+async def _db_status():
+    from octane.tools.migrations import MigrationRunner
+    runner = MigrationRunner()
+    status = await runner.status()
+
+    if not status.pg_available:
+        console.print("[red]❌ Postgres unavailable.[/]")
+        raise typer.Exit(1)
+
+    # Version panel
+    if status.applied_versions:
+        ver_str = "[green]" + ", ".join(status.applied_versions) + "[/]"
+    else:
+        ver_str = "[yellow]none applied[/]"
+    pending_str = (
+        "[yellow]pending: " + ", ".join(status.pending_versions) + "[/]"
+        if status.pending_versions
+        else "[dim]up to date[/]"
+    )
+    console.print(Panel(
+        f"Applied: {ver_str}\n{pending_str}",
+        title="[bold]Schema Migrations[/]",
+        border_style="cyan",
+    ))
+
+    if not status.table_counts:
+        console.print("[dim]No tables found.[/]")
+        return
+
+    tbl = Table(title="Tables", show_lines=False)
+    tbl.add_column("Table", style="cyan")
+    tbl.add_column("Rows", justify="right", style="green")
+    for name, count in sorted(status.table_counts.items()):
+        tbl.add_row(name, str(count) if count >= 0 else "?")
+    console.print(tbl)
+
+
+@db_app.command("reset")
+def db_reset(
+    yes: bool = typer.Option(False, "--yes", "-y", help="Skip confirmation prompt"),
+):
+    """💥 Drop all tables and re-apply schema.  [red bold]DEV ONLY.[/]"""
+    if not yes:
+        confirm = typer.confirm(
+            "⚠️  This will DROP all Octane tables. Continue?", default=False
+        )
+        if not confirm:
+            console.print("[dim]Aborted.[/]")
+            raise typer.Exit(0)
+    asyncio.run(_db_reset())
+
+
+async def _db_reset():
+    from octane.tools.migrations import MigrationRunner
+    console.print("[yellow]Dropping all tables and re-applying schema…[/]")
+    runner = MigrationRunner()
+    ok = await runner.reset()
+    if ok:
+        console.print("[green]✅ Schema reset complete.[/]")
+    else:
+        console.print("[red]❌ Reset failed — check logs.[/]")
+        raise typer.Exit(1)
+
+
+def _get_research_shadow():
+    """Return (shadow_name, redis_url) for the research namespace."""
+    from octane.config import settings
+    return "octane", settings.redis_url
+
+
+@research_app.command("start")
+def research_start(
+    topic: str = typer.Argument(..., help="Research topic or question"),
+    every: float = typer.Option(6.0, "--every", "-e", help="Cycle interval in hours (default: 6)"),
+    depth: str = typer.Option("deep", "--depth", "-d",
+                              help="Research depth: shallow (2 angles), deep (4, default), exhaustive (8)"),
+):
+    """🔬 Start a background research workflow.
+
+    Schedules a perpetual Shadows task that runs the full OSA pipeline for
+    TOPIC every EVERY hours — extracting content, synthesising findings,
+    and storing them in Postgres for review via ``octane research report``.
+
+    The ``--depth`` flag controls how many parallel search angles are used
+    per cycle:
+
+    \\b
+        shallow    — 2 angles (fastest, good for quick market checks)
+        deep       — 4 angles (default, balanced coverage)
+        exhaustive — 8 angles (most thorough, use for deep-dive research)
+
+    Examples::
+
+        octane research start "NVDA earnings outlook"
+        octane research start "Apple Vision Pro market reception" --every 12
+        octane research start "Fed rate decision impact" --depth exhaustive --every 3
+    """
+    _valid_depths = {"shallow", "deep", "exhaustive"}
+    if depth not in _valid_depths:
+        console.print(f"[red]Invalid depth '{depth}'. Must be one of: {', '.join(sorted(_valid_depths))}[/]")
+        raise typer.Exit(1)
+    asyncio.run(_research_start(topic, every, depth))
+
+
+async def _research_start(topic: str, interval_hours: float, depth: str = "deep"):
+    import subprocess
+    import sys
+    import time
+    from shadows import Shadow
+    from octane.research.models import ResearchTask
+    from octane.research.store import ResearchStore
+    from octane.tasks.research import research_cycle
+    from octane.tasks.worker_process import read_pid, PID_FILE
+    from octane.config import settings
+
+    shadow_name, redis_url = _get_research_shadow()
+    await _ensure_shadow_group(shadow_name, redis_url)
+
+    # ── 1. Create and register the task metadata ───────────────────────────
+    task = ResearchTask(topic=topic, interval_hours=interval_hours)
+    store = ResearchStore(redis_url=redis_url, postgres_url=settings.postgres_url)
+    await store.register_task(task)
+    await store.log_entry(task.id, f"🔬 Research task created: {topic}")
+
+    # ── 2. Schedule via Shadows ────────────────────────────────────────────
+    console.print(f"[dim]Scheduling research task [bold]{task.id}[/bold]…[/]")
+    try:
+        async with Shadow(name=shadow_name, url=redis_url) as shadow:
+            shadow.register(research_cycle)
+            await shadow.add(research_cycle, key=task.id)(
+                task_id=task.id,
+                topic=topic,
+                interval_hours=interval_hours,
+                depth=depth,
+            )
+        console.print(
+            f"[green]✅ Research started[/]\n"
+            f"  [bold]ID:[/]     [cyan]{task.id}[/]\n"
+            f"  [bold]Topic:[/]  {topic}\n"
+            f"  [bold]Every:[/]  {interval_hours}h  ·  "
+            f"[bold]Depth:[/] {depth}\n"
+        )
+    except Exception as exc:
+        console.print(f"[red]Failed to schedule task: {exc}[/]")
+        await store.close()
+        raise typer.Exit(1)
+
+    # ── 3. Ensure the worker subprocess is running ─────────────────────────
+    existing_pid = read_pid()
+    if existing_pid:
+        console.print(f"[dim]Worker already running (PID {existing_pid}) — task picked up automatically.[/]")
+        await store.close()
+        return
+
+    console.print("[dim]Starting Octane background worker…[/]")
+    proc = subprocess.Popen(
+        [sys.executable, "-m", "octane.tasks.worker_process",
+         "--shadows-name", shadow_name, "--redis-url", redis_url],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    time.sleep(0.8)
+    pid = read_pid()
+    if pid:
+        console.print(f"[green]🚀 Worker started (PID {pid})[/]")
+    else:
+        console.print(f"[green]🚀 Worker launched (PID ~{proc.pid})[/]")
+
+    console.print(
+        f"\n[dim]Run [bold]octane research log {task.id}[/bold] to follow progress.\n"
+        f"Run [bold]octane research log {task.id} --follow[/bold] to stream live.[/]"
+    )
+    await store.close()
+
+
+@research_app.command("status")
+def research_status():
+    """📊 List all active research tasks."""
+    asyncio.run(_research_status())
+
+
+async def _research_status():
+    from octane.research.store import ResearchStore
+    from octane.config import settings
+    from octane.tasks.worker_process import read_pid
+
+    _, redis_url = _get_research_shadow()
+    store = ResearchStore(redis_url=redis_url, postgres_url=settings.postgres_url)
+    tasks = await store.list_tasks()
+    await store.close()
+
+    pid = read_pid()
+    worker_line = (
+        f"[green]🟢 Running (PID {pid})[/]" if pid else "[red]🔴 Not running[/]"
+    )
+    console.print(Panel(worker_line, title="[bold]Octane Worker[/]", border_style="cyan"))
+
+    if not tasks:
+        console.print("[dim]No research tasks found. Run: octane research start \"<topic>\"[/]")
+        return
+
+    from rich.table import Table as _Table
+    tbl = _Table(title="Active Research Tasks", show_lines=False)
+    tbl.add_column("ID", style="cyan", width=10)
+    tbl.add_column("Topic", style="white")
+    tbl.add_column("Every", style="yellow", justify="right", width=7)
+    tbl.add_column("Depth", style="blue", justify="right", width=10)
+    tbl.add_column("Cycles", style="green", justify="right", width=7)
+    tbl.add_column("Findings", style="magenta", justify="right", width=9)
+    tbl.add_column("Age", style="dim", justify="right", width=8)
+    tbl.add_column("Status", width=8)
+
+    for t in tasks:
+        age_str = f"{t.age_hours:.1f}h"
+        status_str = "[green]active[/]" if t.is_active else "[red]stopped[/]"
+        tbl.add_row(
+            t.id, t.topic[:55], f"{t.interval_hours}h",
+            getattr(t, "depth", "deep"),
+            str(t.cycle_count), str(t.finding_count),
+            age_str, status_str,
+        )
+    console.print(tbl)
+    console.print(
+        "[dim]  octane research log <id>          — view progress log\n"
+        "  octane research report <id>       — synthesise all findings\n"
+        "  octane research stop <id>         — cancel task[/]"
+    )
+
+
+@research_app.command("log")
+def research_log(
+    task_id: str = typer.Argument(..., help="Research task ID"),
+    follow: bool = typer.Option(False, "--follow", "-f", help="Stream new entries in real time"),
+    n: int = typer.Option(50, "--lines", "-n", help="Number of recent log lines to show"),
+):
+    """📋 Show the research progress log.
+
+    Use ``--follow`` to stream live entries as the background task runs.
+
+    Examples::
+
+        octane research log abc12345
+        octane research log abc12345 --follow
+    """
+    asyncio.run(_research_log(task_id, follow, n))
+
+
+async def _research_log(task_id: str, follow: bool, n: int):
+    from octane.research.store import ResearchStore
+    from octane.config import settings
+    import time as _time
+
+    _, redis_url = _get_research_shadow()
+    store = ResearchStore(redis_url=redis_url, postgres_url=settings.postgres_url)
+
+    task = await store.get_task(task_id)
+    if task is None:
+        console.print(f"[yellow]No task found with ID: [bold]{task_id}[/][/]")
+        console.print("[dim]Run 'octane research status' to see all tasks.[/]")
+        await store.close()
+        return
+
+    console.print(Panel(
+        f"[bold]ID:[/]    {task.id}\n"
+        f"[bold]Topic:[/] {task.topic}\n"
+        f"[bold]Every:[/] {task.interval_hours}h  ·  "
+        f"[bold]Depth:[/] {getattr(task, 'depth', 'deep')}  ·  "
+        f"[bold]Cycles:[/] {task.cycle_count}  ·  "
+        f"[bold]Findings:[/] {task.finding_count}",
+        title="[bold cyan]🔬 Research Task[/]",
+        border_style="cyan",
+    ))
+
+    # ── Print existing entries ─────────────────────────────────────────────
+    entries = await store.get_log(task_id, n=n)
+    if not entries:
+        console.print("[dim]No log entries yet — task may not have run yet.[/]")
+    else:
+        for line in entries:
+            _print_log_line(line)
+
+    if not follow:
+        await store.close()
+        return
+
+    # ── Follow mode: poll for new entries ──────────────────────────────────
+    console.print("[dim]  Following… (Ctrl+C to stop)[/]")
+    seen = len(entries)
+    last_cycle = task.cycle_count
+    last_findings = task.finding_count
+    try:
+        while True:
+            await asyncio.sleep(2.0)
+            all_entries = await store.get_log(task_id, n=_LOG_FOLLOW_BUFFER)
+            new = all_entries[seen:]
+            for line in new:
+                _print_log_line(line)
+            seen = len(all_entries)
+            # Re-fetch task state and print a compact refresh when counts change
+            refreshed = await store.get_task(task_id)
+            if refreshed and (
+                refreshed.cycle_count != last_cycle
+                or refreshed.finding_count != last_findings
+            ):
+                last_cycle = refreshed.cycle_count
+                last_findings = refreshed.finding_count
+                console.print(
+                    f"[bold cyan]  ↺ Status:[/] Cycles={last_cycle}  "
+                    f"Findings={last_findings}  "
+                    f"(next cycle in ~{refreshed.interval_hours}h)"
+                )
+    except (KeyboardInterrupt, asyncio.CancelledError):
+        console.print("\n[dim]Stopped following.[/]")
+    finally:
+        await store.close()
+
+
+_LOG_FOLLOW_BUFFER = 200  # max entries fetched during --follow polling
+
+
+def _print_log_line(line: str) -> None:
+    """Colour-code a single research log line for terminal output."""
+    if "✅" in line or "complete" in line.lower():
+        console.print(f"[green]{line}[/]")
+    elif "⚠" in line or "warn" in line.lower() or "error" in line.lower():
+        console.print(f"[yellow]{line}[/]")
+    elif "⚙" in line or "start" in line.lower():
+        console.print(f"[cyan]{line}[/]")
+    else:
+        console.print(f"[dim]{line}[/]")
+
+
+@research_app.command("report")
+def research_report(
+    task_id: str = typer.Argument(..., help="Research task ID"),
+    raw: bool = typer.Option(False, "--raw", help="Print raw findings without LLM synthesis"),
+    cycles: int = typer.Option(None, "--cycles", "-c", help="Use only the last N cycles"),
+    since: str = typer.Option(None, "--since", help="Include findings on/after ISO date (e.g. 2026-01-01)"),
+    export: str = typer.Option(None, "--export", "-o", help="Save report to this file path (.md)"),
+):
+    """📄 Synthesise all findings into a final research report.
+
+    Pulls every stored finding for the task and passes them through the
+    ResearchSynthesizer for a cohesive narrative.  Use ``--raw`` to skip
+    synthesis and print findings sequentially.
+
+    Examples::
+
+        octane research report abc12345
+        octane research report abc12345 --raw
+        octane research report abc12345 --cycles 3
+        octane research report abc12345 --since 2026-01-01
+        octane research report abc12345 --export ~/reports/nvda.md
+    """
+    asyncio.run(_research_report(task_id, raw, cycles=cycles, since=since, export=export))
+
+
+async def _research_report(
+    task_id: str,
+    raw_mode: bool,
+    *,
+    cycles: int | None = None,
+    since: str | None = None,
+    export: str | None = None,
+):
+    import pathlib
+    from datetime import datetime, timezone
+    from octane.research.store import ResearchStore
+    from octane.research.synthesizer import ResearchSynthesizer
+    from octane.config import settings
+
+    _, redis_url = _get_research_shadow()
+    store = ResearchStore(redis_url=redis_url, postgres_url=settings.postgres_url)
+
+    task = await store.get_task(task_id)
+    if task is None:
+        console.print(f"[yellow]No task found: [bold]{task_id}[/][/]")
+        await store.close()
+        return
+
+    console.print(Panel(
+        f"[bold]Topic:[/]    {task.topic}\n"
+        f"[bold]Cycles:[/]   {task.cycle_count}  ·  "
+        f"[bold]Age:[/]      {task.age_hours:.1f}h",
+        title=f"[bold magenta]📄 Research Report — {task_id}[/]",
+        border_style="magenta",
+    ))
+
+    # Parse --since
+    since_dt: datetime | None = None
+    if since:
+        try:
+            since_dt = datetime.fromisoformat(since).replace(tzinfo=timezone.utc)
+        except ValueError:
+            console.print(f"[red]Invalid --since date: {since!r}. Use ISO format, e.g. 2026-01-01.[/]")
+            await store.close()
+            return
+
+    if raw_mode:
+        # ── Raw mode: fetch findings directly, print sequentially ──────────
+        findings = await store.get_findings(task_id)
+        await store.close()
+
+        if not findings:
+            console.print(
+                f"[yellow]No findings stored yet for [bold]{task_id}[/].[/]"
+            )
+            return
+
+        if since_dt:
+            findings = [f for f in findings if (f.created_at or datetime.min.replace(tzinfo=timezone.utc)) >= since_dt]
+        if cycles:
+            findings = findings[-cycles:]
+
+        if not findings:
+            console.print("[yellow]No findings match the specified filters.[/]")
+            return
+
+        for f in findings:
+            ts_str = f.created_at.strftime("%m-%d %H:%M UTC") if f.created_at else "unknown"
+            console.print(Panel(
+                f.content,
+                title=f"[dim]Cycle {f.cycle_num}  ·  {ts_str}  ·  {f.word_count} words[/]",
+                border_style="dim",
+            ))
+        return
+
+    # ── Synthesis mode via ResearchSynthesizer ─────────────────────────────
+    from octane.tools.bodega_inference import BodegaInferenceClient
+
+    bodega = BodegaInferenceClient()
+    try:
+        with console.status("[dim]⚙  Synthesising findings…[/]", spinner="dots"):
+            synth = ResearchSynthesizer(store, bodega=bodega)
+            report_text = await synth.generate(
+                task_id,
+                cycles=cycles,
+                since=since_dt,
+            )
+    except Exception as exc:
+        console.print(f"[yellow]Synthesis unavailable ({exc}) — falling back to plain format.[/]\n")
+        plain_synth = ResearchSynthesizer(store, bodega=None)
+        report_text = await plain_synth.generate(task_id, cycles=cycles, since=since_dt)
+    finally:
+        await store.close()
+        await bodega.close()
+
+    console.print(Panel(
+        report_text,
+        title=f"[bold green]🔬 Synthesised Report: {task.topic}[/]",
+        border_style="green",
+        padding=(1, 2),
+    ))
+
+    # ── Export to file ─────────────────────────────────────────────────────
+    if export:
+        out_path = pathlib.Path(export).expanduser()
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_text(report_text, encoding="utf-8")
+        console.print(f"[dim]  ✅ Report saved → {out_path}[/]")
+
+
+@research_app.command("stop")
+def research_stop(
+    task_id: str = typer.Argument(..., help="Research task ID to cancel"),
+):
+    """🛑 Stop a background research task."""
+    asyncio.run(_research_stop(task_id))
+
+
+async def _research_stop(task_id: str):
+    from shadows import Shadow
+    from octane.research.store import ResearchStore
+    from octane.config import settings
+
+    shadow_name, redis_url = _get_research_shadow()
+    store = ResearchStore(redis_url=redis_url, postgres_url=settings.postgres_url)
+
+    task = await store.get_task(task_id)
+    if task is None:
+        console.print(f"[yellow]No task found: [bold]{task_id}[/][/]")
+        await store.close()
+        return
+
+    # Cancel in Shadows
+    try:
+        async with Shadow(name=shadow_name, url=redis_url) as shadow:
+            await shadow.cancel(task_id)
+        console.print(f"[green]✅ Shadows task [bold]{task_id}[/bold] cancelled.[/]")
+    except Exception as exc:
+        console.print(f"[yellow]Shadows cancel: {exc} (updating status anyway)[/]")
+
+    # Mark stopped in Redis metadata
+    await store.update_task_status(task_id, "stopped")
+    await store.log_entry(task_id, "🛑 Task stopped by user")
+    await store.close()
+
+    console.print(
+        f"[dim]Findings retained — run "
+        f"[bold]octane research report {task_id}[/bold] to read the report.[/]"
+    )
+
+
+@research_app.command("list")
+def research_list():
+    """📋 List all research tasks with findings counts and last-run time."""
+    asyncio.run(_research_list())
+
+
+async def _research_list():
+    from octane.research.store import ResearchStore
+    from octane.config import settings
+
+    _, redis_url = _get_research_shadow()
+    store = ResearchStore(redis_url=redis_url, postgres_url=settings.postgres_url)
+    tasks = await store.list_tasks()
+    await store.close()
+
+    if not tasks:
+        console.print("[dim]No research tasks found.[/]")
+        console.print("[dim]Start one with: octane research start \"<topic>\"[/]")
+        return
+
+    tbl = Table(
+        title="Research Tasks",
+        show_lines=True,
+        border_style="cyan",
+    )
+    tbl.add_column("ID",       style="cyan",    width=10)
+    tbl.add_column("Topic",    style="white",   min_width=30)
+    tbl.add_column("Depth",    style="blue",    width=10, justify="center")
+    tbl.add_column("Cycles",   style="green",   width=7,  justify="right")
+    tbl.add_column("Findings", style="magenta", width=9,  justify="right")
+    tbl.add_column("Every",    style="yellow",  width=7,  justify="right")
+    tbl.add_column("Age",      style="dim",     width=8,  justify="right")
+    tbl.add_column("Status",   width=9,         justify="center")
+
+    for t in tasks:
+        age_h = t.age_hours
+        age_str = f"{age_h:.0f}h" if age_h >= 1 else f"{int(age_h * 60)}m"
+        if t.is_active:
+            status_str = "[green]● active[/]"
+        else:
+            status_str = "[red]◼ stopped[/]"
+        depth_val = getattr(t, "depth", "deep")
+
+        tbl.add_row(
+            t.id,
+            t.topic[:60],
+            depth_val,
+            str(t.cycle_count),
+            str(t.finding_count),
+            f"{t.interval_hours}h",
+            age_str,
+            status_str,
+        )
+
+    console.print(tbl)
+    console.print(
+        "[dim]  octane research log <id>       — view progress log\n"
+        "  octane research report <id>    — synthesise findings\n"
+        "  octane research stop <id>      — cancel task[/]"
+    )
+
+
+# ══════════════════════════════════════════════════════════════
+# Session 18A — Files CLI
+# ══════════════════════════════════════════════════════════════
+
+files_app = typer.Typer(
+    name="files",
+    help="📁 Index and search local files (Session 18A).",
+    no_args_is_help=True,
+)
+app.add_typer(files_app, name="files")
+
+
+@files_app.command("add")
+def files_add(
+    path: str = typer.Argument(..., help="File or folder path to index"),
+    project: str = typer.Option("", "--project", "-p", help="Project name (optional)"),
+    recursive: bool = typer.Option(True, "--recursive/--no-recursive", help="Recurse into subdirectories"),
+):
+    """📄 Index a file or folder into Postgres."""
+    asyncio.run(_files_add(path, project, recursive))
+
+
+async def _files_add(path: str, project: str, recursive: bool):
+    from octane.tools.pg_client import PgClient
+    from octane.tools.structured_store import FileIndexer, ProjectStore
+    pg = PgClient()
+    await pg.connect()
+    if not pg.available:
+        console.print("[red]Postgres unavailable — cannot index files.[/]")
+        return
+
+    project_id = None
+    if project:
+        ps = ProjectStore(pg)
+        row = await ps.create(project)
+        project_id = row["id"] if row else None
+
+    indexer = FileIndexer(pg, project_id=project_id)
+    from pathlib import Path
+    p = Path(path).expanduser().resolve()
+    if p.is_file():
+        row = await indexer.index_file(p)
+        if row:
+            console.print(f"[green]✅ Indexed:[/] {p.name}  ({row.get('word_count',0)} words)")
+        else:
+            console.print(f"[yellow]Skipped or failed: {p}[/]")
+    elif p.is_dir():
+        rows = await indexer.index_folder(p, recursive=recursive)
+        console.print(f"[green]✅ Indexed {len(rows)} files from {p}[/]")
+    else:
+        console.print(f"[red]Path not found: {path}[/]")
+    await pg.close()
+
+
+@files_app.command("list")
+def files_list(
+    project: str = typer.Option("", "--project", "-p", help="Filter by project"),
+    limit: int = typer.Option(20, "--limit", "-n"),
+):
+    """📋 List indexed files."""
+    asyncio.run(_files_list(project, limit))
+
+
+async def _files_list(project: str, limit: int):
+    from octane.tools.pg_client import PgClient
+    from octane.tools.structured_store import ProjectStore
+    pg = PgClient()
+    await pg.connect()
+    if not pg.available:
+        console.print("[red]Postgres unavailable.[/]"); return
+
+    project_id = None
+    if project:
+        ps = ProjectStore(pg)
+        row = await ps.get(project)
+        project_id = row["id"] if row else None
+
+    if project_id is not None:
+        rows = await pg.fetch(
+            "SELECT id, filename, extension, word_count, indexed_at FROM user_files "
+            "WHERE project_id=$1 ORDER BY indexed_at DESC LIMIT $2",
+            project_id, limit,
+        )
+    else:
+        rows = await pg.fetch(
+            "SELECT id, filename, extension, word_count, indexed_at FROM user_files "
+            "ORDER BY indexed_at DESC LIMIT $1", limit
+        )
+
+    if not rows:
+        console.print("[dim]No files indexed yet. Run [bold]octane files add <path>[/bold].[/]")
+        await pg.close(); return
+
+    from rich.table import Table
+    table = Table(title="Indexed Files")
+    table.add_column("ID", style="dim")
+    table.add_column("Filename")
+    table.add_column("Ext", style="cyan")
+    table.add_column("Words", justify="right")
+    table.add_column("Indexed At", style="dim")
+    for r in rows:
+        table.add_row(
+            str(r["id"]), r["filename"], r["extension"],
+            str(r["word_count"]),
+            str(r["indexed_at"])[:19],
+        )
+    console.print(table)
+    await pg.close()
+
+
+@files_app.command("search")
+def files_search(
+    query: str = typer.Argument(..., help="Semantic search query"),
+    limit: int = typer.Option(5, "--limit", "-n"),
+):
+    """🔍 Semantic search across indexed files."""
+    asyncio.run(_files_search(query, limit))
+
+
+async def _files_search(query: str, limit: int):
+    from octane.tools.pg_client import PgClient
+    from octane.tools.structured_store import EmbeddingEngine
+    pg = PgClient()
+    await pg.connect()
+    if not pg.available:
+        console.print("[red]Postgres unavailable.[/]"); return
+
+    engine = EmbeddingEngine(pg)
+    results = await engine.semantic_search(query, source_type="user_file", limit=limit)
+    if not results:
+        console.print("[dim]No results. Have you indexed any files? Run [bold]octane files add <path>[/bold].[/]")
+        await pg.close(); return
+
+    for i, r in enumerate(results, 1):
+        dist = r.get("distance", 0)
+        console.print(f"\n[bold cyan]#{i}[/] [dim](distance={dist:.3f})[/]")
+        console.print(r.get("chunk_text", "")[:300])
+    await pg.close()
+
+
+@files_app.command("stats")
+def files_stats(
+    project: str = typer.Option("", "--project", "-p"),
+):
+    """📊 Show indexing statistics."""
+    asyncio.run(_files_stats(project))
+
+
+async def _files_stats(project: str):
+    from octane.tools.pg_client import PgClient
+    from octane.tools.structured_store import FileIndexer, ProjectStore
+    pg = PgClient()
+    await pg.connect()
+    if not pg.available:
+        console.print("[red]Postgres unavailable.[/]"); return
+
+    project_id = None
+    if project:
+        ps = ProjectStore(pg)
+        row = await ps.get(project)
+        project_id = row["id"] if row else None
+
+    indexer = FileIndexer(pg, project_id=project_id)
+    stats = await indexer.stats(project_id=project_id)
+    console.print(f"[bold]Total files:[/] {stats['total_files']}")
+    console.print(f"[bold]Total words:[/] {stats['total_words']:,}")
+    if stats["by_extension"]:
+        from rich.table import Table
+        table = Table(title="By Extension")
+        table.add_column("Extension"); table.add_column("Files", justify="right"); table.add_column("Words", justify="right")
+        for row in stats["by_extension"]:
+            table.add_row(row["extension"], str(row["n"]), str(int(row.get("words") or 0)))
+        console.print(table)
+    await pg.close()
+
+
+@files_app.command("reindex")
+def files_reindex(
+    path: str = typer.Argument(..., help="File to force-reindex"),
+):
+    """🔄 Force re-index a file (ignores cached hash)."""
+    asyncio.run(_files_reindex(path))
+
+
+async def _files_reindex(path: str):
+    from octane.tools.pg_client import PgClient
+    from octane.tools.structured_store import FileIndexer
+    pg = PgClient()
+    await pg.connect()
+    if not pg.available:
+        console.print("[red]Postgres unavailable.[/]"); return
+    indexer = FileIndexer(pg)
+    row = await indexer.reindex(path)
+    if row:
+        console.print(f"[green]✅ Re-indexed:[/] {row.get('filename')} ({row.get('word_count',0)} words)")
+    else:
+        console.print(f"[yellow]Reindex failed for: {path}[/]")
+    await pg.close()
+
+
+# ══════════════════════════════════════════════════════════════
+# Session 18A — Project CLI
+# ══════════════════════════════════════════════════════════════
+
+project_app = typer.Typer(
+    name="project",
+    help="🗂  Manage research projects (Session 18A).",
+    no_args_is_help=True,
+)
+app.add_typer(project_app, name="project")
+
+
+@project_app.command("list")
+def project_list(
+    all_: bool = typer.Option(False, "--all", "-a", help="Include archived projects"),
+):
+    """📋 List all projects."""
+    asyncio.run(_project_list(all_))
+
+
+async def _project_list(include_archived: bool):
+    from octane.tools.pg_client import PgClient
+    from octane.tools.structured_store import ProjectStore
+    pg = PgClient()
+    await pg.connect()
+    if not pg.available:
+        console.print("[red]Postgres unavailable.[/]"); return
+
+    ps = ProjectStore(pg)
+    rows = await ps.list(include_archived=include_archived)
+    if not rows:
+        console.print("[dim]No projects. Run [bold]octane project create <name>[/bold].[/]")
+        await pg.close(); return
+
+    from rich.table import Table
+    table = Table(title="Projects")
+    table.add_column("ID", style="dim"); table.add_column("Name", style="bold")
+    table.add_column("Status", style="cyan"); table.add_column("Created", style="dim")
+    for r in rows:
+        table.add_row(str(r["id"]), r["name"], r["status"], str(r["created_at"])[:10])
+    console.print(table)
+    await pg.close()
+
+
+@project_app.command("create")
+def project_create(
+    name: str = typer.Argument(..., help="Project name"),
+    description: str = typer.Option("", "--desc", "-d"),
+):
+    """➕ Create a new project."""
+    asyncio.run(_project_create(name, description))
+
+
+async def _project_create(name: str, description: str):
+    from octane.tools.pg_client import PgClient
+    from octane.tools.structured_store import ProjectStore
+    pg = PgClient()
+    await pg.connect()
+    if not pg.available:
+        console.print("[red]Postgres unavailable.[/]"); return
+    ps = ProjectStore(pg)
+    row = await ps.create(name, description)
+    if row:
+        console.print(f"[green]✅ Project created:[/] [bold]{name}[/] (ID {row['id']})")
+    else:
+        console.print(f"[red]Failed to create project: {name}[/]")
+    await pg.close()
+
+
+@project_app.command("show")
+def project_show(
+    name: str = typer.Argument(..., help="Project name"),
+):
+    """🔍 Show project details and content counts."""
+    asyncio.run(_project_show(name))
+
+
+async def _project_show(name: str):
+    from octane.tools.pg_client import PgClient
+    from octane.tools.structured_store import ProjectStore
+    pg = PgClient()
+    await pg.connect()
+    if not pg.available:
+        console.print("[red]Postgres unavailable.[/]"); return
+    ps = ProjectStore(pg)
+    row = await ps.get(name)
+    if not row:
+        console.print(f"[yellow]Project not found: {name}[/]"); await pg.close(); return
+
+    pid = row["id"]
+    pages = await pg.fetchval("SELECT COUNT(*) FROM web_pages WHERE project_id=$1", pid)
+    files = await pg.fetchval("SELECT COUNT(*) FROM user_files WHERE project_id=$1", pid)
+    artifacts = await pg.fetchval("SELECT COUNT(*) FROM generated_artifacts WHERE project_id=$1", pid)
+    findings = await pg.fetchval("SELECT COUNT(*) FROM research_findings_v2 WHERE project_id=$1", pid)
+
+    console.print(f"[bold cyan]Project:[/] {row['name']}  (ID {pid})")
+    console.print(f"  Status:    {row['status']}")
+    console.print(f"  Created:   {str(row['created_at'])[:19]}")
+    if row.get("description"):
+        console.print(f"  Desc:      {row['description']}")
+    console.print(f"\n  [bold]Web pages:[/]   {pages or 0}")
+    console.print(f"  [bold]Files:[/]       {files or 0}")
+    console.print(f"  [bold]Artifacts:[/]   {artifacts or 0}")
+    console.print(f"  [bold]Findings v2:[/] {findings or 0}")
+    await pg.close()
+
+
+@project_app.command("archive")
+def project_archive(
+    name: str = typer.Argument(..., help="Project name to archive"),
+):
+    """📦 Archive a project (soft-delete)."""
+    asyncio.run(_project_archive(name))
+
+
+async def _project_archive(name: str):
+    from octane.tools.pg_client import PgClient
+    from octane.tools.structured_store import ProjectStore
+    pg = PgClient()
+    await pg.connect()
+    if not pg.available:
+        console.print("[red]Postgres unavailable.[/]"); return
+    ps = ProjectStore(pg)
+    ok = await ps.archive(name)
+    if ok:
+        console.print(f"[green]✅ Archived:[/] {name}")
+    else:
+        console.print(f"[yellow]Project not found: {name}[/]")
+    await pg.close()
 
 
 # ── Entry point ───────────────────────────────────────────────

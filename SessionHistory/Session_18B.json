@@ -1,0 +1,82 @@
+{
+  "session": "18B",
+  "date": "2026-02-27",
+  "title": "Deep Research Mode + Live --follow + Bug Fixes",
+  "tests_baseline": 261,
+  "tests_final": 285,
+  "tests_added": 24,
+  "status": "complete",
+
+  "bug_fixes": [
+    {
+      "bug": "Findings: 0 in --follow header",
+      "fix": "Re-fetch task state on every poll iteration; print compact status refresh line when cycle_count or finding_count changes",
+      "file": "octane/main.py (_research_log)"
+    },
+    {
+      "bug": "finding_count not reflected in --follow header at startup (rendered once before any cycle runs)",
+      "fix": "Same re-fetch on poll loop — also updated Panel to show depth field",
+      "file": "octane/main.py"
+    }
+  ],
+
+  "synapse_events_in_follow": {
+    "description": "_ResearchSynapse subclass overrides emit() to schedule store.log_entry() via asyncio.ensure_future(). Every notable pipeline event now streams to Redis log in real time.",
+    "event_types_mapped": [
+      "ingress", "guard_block", "decomposition_start", "decomposition_complete",
+      "dispatch", "agent_start", "agent_complete", "agent_error",
+      "code_success", "code_healed", "code_attempt_failed", "code_debug_invoked",
+      "code_exhausted", "catalyst_success", "egress"
+    ],
+    "silent_events": ["preflight", "hil_complete", "catalyst_failed"],
+    "file": "octane/tasks/research.py (_ResearchSynapse, _event_label)"
+  },
+
+  "18B_features": {
+    "AngleGenerator": {
+      "file": "octane/research/angles.py",
+      "description": "Generates N parallel search angles from a topic. LLM-powered with keyword fallback.",
+      "depths": {"shallow": 2, "deep": 4, "exhaustive": 8},
+      "llm_system_prompt": "Financial research analyst — returns JSON array of {query, angle} objects"
+    },
+    "depth_flag": {
+      "cli": "octane research start '<topic>' --depth deep|shallow|exhaustive",
+      "default": "deep",
+      "validation": "Rejects unknown values with Exit(1)",
+      "files": ["octane/main.py", "octane/research/models.py"]
+    },
+    "parallel_angle_queries": {
+      "description": "research_cycle now runs all angle sub-queries in parallel via asyncio.gather(). Results are joined with ---separator before storing.",
+      "file": "octane/tasks/research.py"
+    },
+    "url_dedup": {
+      "description": "Per-task Redis SET (research:urls:{task_id}) tracks SHA-256 hashes of fetched URLs. 30-day TTL. Helpers: _is_url_seen / _mark_url_seen.",
+      "file": "octane/tasks/research.py"
+    },
+    "chunk_embedding": {
+      "description": "After content assembly, EmbeddingEngine.embed_and_store() chunks and stores pgvector embeddings (source_type=research_finding). Non-blocking — error is logged and skipped.",
+      "file": "octane/tasks/research.py"
+    }
+  },
+
+  "status_table_update": {
+    "new_column": "Depth",
+    "header_new_field": "Depth shown alongside Every/Cycles/Findings in --follow Panel"
+  },
+
+  "files_modified": [
+    "octane/tasks/research.py",
+    "octane/research/models.py",
+    "octane/main.py",
+    "tests/test_agents.py"
+  ],
+  "files_created": [
+    "octane/research/angles.py"
+  ],
+
+  "next_session_candidates": [
+    "Session 19: Portfolio Intelligence — PnL agent reads positions table, tracks P&L vs research findings",
+    "Session 19: Rolling synthesis — semantic_search across all research_finding chunks for cross-cycle insight",
+    "Session 19: Research report upgrade — include embedding-based similarity search to surface related findings"
+  ]
+}

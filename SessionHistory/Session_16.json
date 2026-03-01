@@ -1,0 +1,149 @@
+{
+  "session": 16,
+  "title": "HIL Manager · Decision Ledger · Checkpoint Manager · Chat Polish",
+  "date": "2026-02-27",
+  "test_count_before": 157,
+  "test_count_after": 194,
+  "tests_added": 37,
+  "all_passing": true,
+
+  "goals": [
+    "Decision + DecisionLedger Pydantic models (risk, confidence, needs_human)",
+    "Checkpoint model + CheckpointManager (in-memory snapshots, revert, clear)",
+    "HILManager — auto-approve by hil_level, asyncio.to_thread(input) for non-blocking prompts, Rich display",
+    "PolicyEngine.assess_dag() — (agent, sub_agent) risk table + critical/high keyword escalation",
+    "Wire HIL + Checkpoint into Orchestrator.run() and run_stream()",
+    "Chat slash commands (/help, /trace, /clear, /history) + inline trace printer",
+    "octane sysstat command — quick system snapshot without Bodega dependency",
+    "hil_interactive=True in octane chat (real human prompts in interactive sessions)"
+  ],
+
+  "files_created": [
+    "octane/models/decisions.py",
+    "octane/models/checkpoints.py",
+    "octane/osa/checkpoint_manager.py",
+    "octane/osa/hil_manager.py"
+  ],
+
+  "files_modified": [
+    "octane/osa/policy.py",
+    "octane/osa/orchestrator.py",
+    "octane/main.py",
+    "tests/test_agents.py"
+  ],
+
+  "architecture": {
+    "Decision": {
+      "fields": ["id (uuid4)", "correlation_id", "action", "reasoning", "risk_level (low/medium/high/critical)", "confidence (0.0-1.0)", "reversible", "task_id", "agent", "status (pending/auto_approved/human_approved/human_modified/human_declined)", "human_feedback"],
+      "properties": ["needs_human", "is_resolved", "is_approved"]
+    },
+    "DecisionLedger": {
+      "methods": ["add(decision)"],
+      "properties": ["pending", "needs_human_review", "auto_approved", "declined", "any_declined", "summary()"]
+    },
+    "Checkpoint": {
+      "fields": ["id", "correlation_id", "checkpoint_type (plan/pre_execution/post_execution/pre_synthesis)", "dag", "completed_tasks", "pending_tasks", "accumulated_results", "decisions", "approved_decisions", "memory_context", "user_profile"],
+      "properties": ["task_count", "progress_pct"]
+    },
+    "CheckpointManager": {
+      "methods": ["create()", "revert()", "list_checkpoints()", "latest()", "clear()"],
+      "storage": "in-memory dict[correlation_id → list[Checkpoint]]"
+    },
+    "HILManager": {
+      "auto_approve_logic": {
+        "relaxed": "low or medium risk → auto",
+        "balanced": "low risk AND confidence >= 0.85 → auto (default)",
+        "strict": "low risk AND reversible → auto"
+      },
+      "interactive_false": "all decisions auto_approved — safe for batch/test mode",
+      "input_method": "asyncio.to_thread(input, prompt) — non-blocking event loop"
+    },
+    "PolicyEngine.assess_dag": {
+      "risk_table": "(agent, sub_agent) → (risk_level, reversible, confidence)",
+      "keyword_escalation": "critical keywords → critical, high keywords → at-least-high",
+      "returns": "DecisionLedger with one Decision per TaskNode"
+    }
+  },
+
+  "orchestrator_changes": {
+    "new_param": "hil_interactive: bool = False",
+    "new_attrs": ["self.hil = HILManager(interactive=hil_interactive)", "self.checkpoint_mgr = CheckpointManager()"],
+    "run_flow": [
+      "1. guard.check_input",
+      "2. policy.check_query_length",
+      "3. decomposer.decompose → dag",
+      "4. [NEW] policy.assess_dag(dag) → ledger",
+      "5. [NEW] checkpoint_mgr.create(plan checkpoint)",
+      "6. [NEW] hil.review_ledger(ledger) — auto or interactive",
+      "7. route + dispatch (parallel within waves)",
+      "8. evaluator.evaluate",
+      "9. egress event (now includes hil_summary)"
+    ]
+  },
+
+  "main_py_changes": {
+    "chat": {
+      "hil_interactive": true,
+      "slash_commands": ["/help", "/trace [id]", "/clear", "/history", "/exit"],
+      "correlation_id_display": "dim trace hint after each response",
+      "_print_synapse_trace": "inline Rich table for /trace command"
+    },
+    "sysstat": {
+      "command": "octane sysstat",
+      "description": "Quick system snapshot — RAM, CPU, loaded model. No topology or server recommendation.",
+      "panels": ["💻 System (RAM, CPU, Available, Uptime)", "🧠 Model (name, status, context_length)"]
+    }
+  },
+
+  "test_classes_added": [
+    {
+      "class": "TestDecisionModel",
+      "tests": 9,
+      "covers": ["needs_human property variants", "is_resolved", "is_approved for all statuses"]
+    },
+    {
+      "class": "TestDecisionLedger",
+      "tests": 6,
+      "covers": ["add/pending", "any_declined", "summary counts", "needs_human_review filter"]
+    },
+    {
+      "class": "TestCheckpointManager",
+      "tests": 6,
+      "covers": ["create", "latest", "list_checkpoints", "revert drops later", "revert raises on bad id", "clear"]
+    },
+    {
+      "class": "TestHILManagerAutoApprove",
+      "tests": 8,
+      "covers": ["non-interactive auto-approves all", "balanced level", "relaxed level", "strict level"]
+    },
+    {
+      "class": "TestPolicyEngineAssessDag",
+      "tests": 6,
+      "covers": ["web=low", "code=high", "critical keyword escalation", "high keyword escalation", "one decision per node", "memory write=medium"]
+    },
+    {
+      "class": "TestOrchestratorHILWiring",
+      "tests": 2,
+      "covers": ["hil/checkpoint_mgr attrs present", "egress event contains hil_summary"]
+    }
+  ],
+
+  "design_decisions": [
+    "hil_interactive=False default ensures zero behavior change for octane ask / octane trace / octane health",
+    "CheckpointManager.revert() preserves accumulated_results — no re-fetching of completed work",
+    "asyncio.to_thread(input, ...) in HILManager matches BrowserAgent._human_assist pattern already in codebase",
+    "assess_dag() on PolicyEngine (not Orchestrator) keeps risk logic testable in isolation",
+    "_print_synapse_trace() is a standalone helper — reusable from /trace and future octane trace --inline flag",
+    "octane sysstat is a subset of octane health (no Bodega recommendation table) for quick terminal glance"
+  ],
+
+  "phase_plan_alignment": {
+    "phase": 2,
+    "milestone": "M2.3 — Human-in-the-Loop oversight layer complete",
+    "next_session_candidates": [
+      "Session 17: Checkpoint revert UI in chat (/revert <id>), Synapse persistence to Redis, background DAG worker",
+      "Session 17: MemoryAgent vector search (pgvector), multi-session recall, memory pruning",
+      "Session 17: CodeAgent sandbox hardening (resource limits, timeout, output capture)"
+    ]
+  }
+}

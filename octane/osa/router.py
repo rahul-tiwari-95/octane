@@ -17,6 +17,8 @@ from octane.models.synapse import SynapseEventBus
 from octane.tools.bodega_inference import BodegaInferenceClient
 from octane.tools.bodega_intel import BodegaIntelClient
 from octane.tools.redis_client import RedisClient
+from octane.tools.pg_client import PgClient
+from octane.tools.structured_store import ArtifactStore, WebPageStore
 
 logger = structlog.get_logger().bind(component="osa.router")
 
@@ -29,10 +31,15 @@ class Router:
         self.bodega = bodega or BodegaInferenceClient()
         self.intel = BodegaIntelClient()
         self.redis = RedisClient()
+        self.pg = PgClient()
+        self._page_store = WebPageStore(self.pg)
+        self._artifact_store = ArtifactStore(self.pg)
 
         self._agents: dict[str, BaseAgent] = {
-            "web": WebAgent(synapse, intel=self.intel, bodega=self.bodega),
-            "code": CodeAgent(synapse, bodega=self.bodega),
+            "web": WebAgent(synapse, intel=self.intel, bodega=self.bodega,
+                            page_store=self._page_store),
+            "code": CodeAgent(synapse, bodega=self.bodega,
+                              artifact_store=self._artifact_store),
             "memory": MemoryAgent(synapse, redis=self.redis),
             "sysstat": SysStatAgent(synapse, self.bodega),
             "pnl": PnLAgent(synapse, redis=self.redis),

@@ -1,0 +1,88 @@
+{
+  "session": "18A",
+  "title": "Structured Storage Foundation",
+  "date": "2026-02-27",
+  "baseline_tests": 220,
+  "final_tests": 261,
+  "tests_added": 41,
+  "status": "complete",
+
+  "objectives": [
+    "Normalized Postgres schema (10 tables) for projects, web pages, files, artifacts, embeddings",
+    "Python store wrappers: ProjectStore, WebPageStore, ArtifactStore, FileIndexer, EmbeddingEngine",
+    "octane files CLI (add / list / search / stats / reindex)",
+    "octane project CLI (list / create / show / archive)",
+    "Wire WebPageStore into WebAgent (page persistence on every fetch)",
+    "Wire ArtifactStore into CodeAgent (artifact persistence on successful generation)",
+    "Inject stores via Router constructor",
+    "41 new tests — all 261 passing"
+  ],
+
+  "files_created": [
+    "octane/tools/schema.sql",
+    "octane/tools/structured_store.py"
+  ],
+
+  "files_modified": [
+    "octane/tools/pg_client.py",
+    "octane/main.py",
+    "octane/agents/web/agent.py",
+    "octane/agents/code/agent.py",
+    "octane/osa/router.py",
+    "tests/test_agents.py"
+  ],
+
+  "schema_tables": [
+    "projects",
+    "web_pages",
+    "user_files",
+    "generated_artifacts",
+    "research_findings_v2",
+    "portfolio_positions",
+    "tracked_jobs",
+    "tags",
+    "content_tags",
+    "embeddings"
+  ],
+
+  "store_classes": {
+    "ProjectStore": "create / get / list / archive / delete",
+    "WebPageStore": "store / seen (SHA-256 dedup) / get / recent / count",
+    "ArtifactStore": "register / query / get",
+    "FileIndexer": "index_file / index_folder / reindex / stats (text/pdf/docx/image)",
+    "EmbeddingEngine": "embed_and_store / semantic_search (pgvector <=> operator, 384-dim)"
+  },
+
+  "cli_commands": {
+    "files": ["add <path>", "list", "search <query>", "stats", "reindex <path>"],
+    "project": ["list", "create <name>", "show <name>", "archive <name>"]
+  },
+
+  "agent_wiring": {
+    "WebAgent": "page_store=None param; _store_pages() fire-and-forget; called in _fetch_news + _fetch_search",
+    "CodeAgent": "artifact_store=None param; ArtifactStore.register() called on validation.passed=True",
+    "Router": "PgClient + WebPageStore + ArtifactStore created in __init__; injected into WebAgent + CodeAgent"
+  },
+
+  "test_classes_added": [
+    "TestProjectStore (5 tests)",
+    "TestWebPageStore (7 tests)",
+    "TestArtifactStore (4 tests)",
+    "TestChunkText (4 tests)",
+    "TestFileIndexer (4 tests)",
+    "TestEmbeddingEngine (5 tests)",
+    "TestWebAgentPageStore (5 tests)",
+    "TestCodeAgentArtifactStore (4 tests)",
+    "TestRouterStoreInjection (3 tests)"
+  ],
+
+  "known_notes": [
+    "EmbeddingEngine falls back to zero-vectors (all-MiniLM-L6-v2 loaded lazily; skipped if offline)",
+    "FileIndexer skips files with unchanged SHA-256 hash to avoid redundant re-indexing",
+    "WebPageStore uses SHA-256(url.lower().rstrip('/')) for URL deduplication",
+    "schema.sql applied by PgClient._ensure_schema() on first pool connection",
+    "pgvector extension required for embeddings table (CREATE EXTENSION IF NOT EXISTS vector)"
+  ],
+
+  "next_session": "18B — Deep Research Mode: ResearchEventPublisher, AngleGenerator, --depth flag, chunk storage during extraction, rolling cross-cycle synthesis"
+}

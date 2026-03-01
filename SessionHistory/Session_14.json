@@ -1,0 +1,168 @@
+{
+  "session": 14,
+  "date": "2026-02-27",
+  "title": "Catalysts — Deterministic Finance Modules + Structured Upstream Results",
+  "status": "complete",
+  "started_at": "2026-02-27T18:00:00Z",
+  "completed_at": "2026-02-27T20:55:00Z",
+
+  "goals": [
+    "Fix <think> token handling: max_tokens=256 caused truncated think blocks; switch to partition('</think>') approach",
+    "Preserve model reasoning traces as structured debug logs (not strip them)",
+    "Flow structured upstream_results through AgentRequest.context from orchestrator (Step 4)",
+    "Build CatalystRegistry with keyword matching + structural data resolution (Option B)",
+    "Implement finance catalysts F1-F5: price_chart, return_calculator, portfolio_projection, technical_indicators, allocation_pie",
+    "Wire CatalystRegistry inside CodeAgent as first-pass check before LLM pipeline",
+    "Add Executor.get_output_dir() helper for deterministic artifact paths",
+    "Achieve 122/122 tests passing"
+  ],
+
+  "deliverables": {
+    "new_files": [
+      "octane/catalysts/__init__.py — Package init, exports CatalystRegistry",
+      "octane/catalysts/registry.py — CatalystRegistry with match() and _resolve_data()",
+      "octane/catalysts/finance/__init__.py",
+      "octane/catalysts/finance/price_chart.py — F1: price line chart + volume bars",
+      "octane/catalysts/finance/return_calculator.py — F2: absolute/pct P&L calculator",
+      "octane/catalysts/finance/portfolio_projection.py — F3: Monte Carlo DCA projection",
+      "octane/catalysts/finance/technical_indicators.py — F4: RSI-14, SMA-20/50, MACD chart",
+      "octane/catalysts/finance/allocation_pie.py — F5: portfolio allocation donut chart"
+    ],
+    "modified_files": [
+      "octane/osa/decomposer.py — max_tokens 256→1024, re.sub→partition('</think>')",
+      "octane/agents/web/query_strategist.py — max_tokens 256→1024, same partition approach",
+      "octane/agents/code/writer.py — preserve reasoning trace via logger.debug instead of stripping",
+      "octane/osa/orchestrator.py — _inject_upstream_data returns tuple[str, dict], 3 dispatch sites updated",
+      "octane/agents/code/agent.py — fully rewritten: CatalystRegistry check before LLM pipeline",
+      "octane/agents/code/executor.py — added get_output_dir(correlation_id) helper"
+    ],
+    "test_results": "122 passed, 0 failed, 0 warnings in 1.61s"
+  },
+
+  "architecture": {
+    "think_token_fix": {
+      "root_cause": "max_tokens=256 caused the reasoning model to be cut off mid-<think> block before emitting </think>. re.sub(r'<think>.*?</think>', ...) never matched, so raw <think>... text became the answer.",
+      "fix": "max_tokens=1024 in decomposer and query_strategist. All three files now use raw.partition('</think>') which is resilient to truncation — if </think> absent, the entire raw response is treated as the answer.",
+      "reasoning_trace": "writer.py now logs the thinking block at DEBUG level as 'model_reasoning_trace' instead of discarding it. Decomposer logs as 'model_reasoning' with first 300 chars."
+    },
+    "upstream_results_injection": {
+      "change": "_inject_upstream_data(node, accumulated, query) now returns tuple[str, dict[str, Any]] instead of str",
+      "text_part": "The instruction text passed as AgentRequest.query (unchanged behaviour)",
+      "dict_part": "upstream_results dict: {dep_node_id: dep_response.data or {'output': dep_response.output}}",
+      "context_key": "request.context['upstream_results'] — catalysts read this directly, LLM pipeline ignores it"
+    },
+    "catalyst_registry": {
+      "matching": "Keyword matching (no LLM): count trigger word hits per catalyst, pick highest scorer with >=1 hit",
+      "data_resolution": "Option B structural matching: checks if upstream data contains required key (time_series→timeseries, market_data→market_data). Returns None if required data missing → falls through to LLM.",
+      "api": "CatalystRegistry.match(query, upstream_results) → (catalyst_fn, resolved_data) | None",
+      "fallthrough": "Loud fallthrough on any exception: logger.warning('catalyst_failed_falling_through') then LLM pipeline"
+    },
+    "catalyst_signatures": {
+      "all": "def catalyst_fn(resolved_data: dict, output_dir: str, *, correlation_id='', instruction='') -> dict",
+      "return_keys": ["artifacts (list of saved file paths)", "summary (human-readable string)", "ticker (str)", "plus catalyst-specific keys (chart_path, rsi, pct_return, etc.)"]
+    },
+    "code_agent_flow": [
+      "1. extract upstream_results from request.context",
+      "2. CatalystRegistry.match(task, upstream_results) → if match: _run_catalyst()",
+      "3. _run_catalyst(): call fn, wrap as AgentResponse(success=True, data=result, metadata={'via_catalyst': fn.__name__})",
+      "4. On catalyst exception → loud warning → fall through to _run_llm_pipeline()",
+      "5. _run_llm_pipeline(): original Planner→Writer→Executor→Validator→Debugger loop (unchanged)"
+    ]
+  },
+
+  "catalysts_roadmap": {
+    "finance": [
+      "F1: price_chart — ✅ COMPLETE",
+      "F2: return_calculator — ✅ COMPLETE",
+      "F3: portfolio_projection — ✅ COMPLETE",
+      "F4: technical_indicators — ✅ COMPLETE",
+      "F5: allocation_pie — ✅ COMPLETE"
+    ],
+    "research": [
+      "R1: citation_formatter — format BibTeX/APA from arxiv metadata",
+      "R2: paper_summary_card — structured abstract + key findings card",
+      "R3: keyword_cooccurrence — build co-occurrence matrix from paper abstracts",
+      "R4: timeline_builder — chronological chart of publication dates",
+      "R5: citation_graph — directed graph of references"
+    ],
+    "career": [
+      "C1: resume_diff — highlight delta between resume and job description",
+      "C2: skill_gap_radar — radar chart of required vs current skills",
+      "C3: salary_benchmarker — salary band chart from scraped data",
+      "C4: linkedin_headline_generator — deterministic headline variants",
+      "C5: cover_letter_template — structured cover letter with slot filling"
+    ],
+    "health": [
+      "H1: calorie_tracker — daily intake bar chart",
+      "H2: macro_pie — macronutrient breakdown donut",
+      "H3: sleep_trend — sleep duration line chart",
+      "H4: workout_volume — weekly training volume bar chart",
+      "H5: hr_zone_chart — heart rate zone histogram"
+    ],
+    "content": [
+      "CT1: reading_time_estimator — word count → read time badge",
+      "CT2: flesch_score — readability scorer",
+      "CT3: headline_ab_variants — generate A/B headline options",
+      "CT4: tag_cloud — word frequency tag cloud render",
+      "CT5: engagement_predictor — keyword density + length heuristic score"
+    ]
+  },
+
+  "bugs_fixed": [
+    {
+      "id": "B1",
+      "title": "buy_match regex captures share quantity instead of buy price",
+      "file": "octane/catalysts/finance/return_calculator.py",
+      "root_cause": "Pattern (?:bought?|...|at)\\s+\\$?\\s*NUMBER matched 'bought 10 shares' → buy_price=10 instead of 'at $500' → buy_price=500",
+      "fix": "Two-step lookup: first try 'at|paid|buy price' with required $ sign, then fallback to 'bought $X' with required $ sign"
+    },
+    {
+      "id": "B2",
+      "title": "price_chart._extract_ticker doesn't check top-level 'symbol' key",
+      "file": "octane/catalysts/finance/price_chart.py",
+      "root_cause": "_extract_ticker only checked 'ticker' key at top level, not 'symbol'. Finance agent returns data with 'symbol' key.",
+      "fix": "Check ('ticker', 'symbol') loop at top level before nested market_data search"
+    },
+    {
+      "id": "B3",
+      "title": "portfolio_projection._parse_params: 'initial $100/month' matches as initial=100",
+      "file": "octane/catalysts/finance/portfolio_projection.py",
+      "root_cause": "init_match regex matched 'initial' keyword then captured the next dollar amount '$100/month' → initial=100 instead of 500",
+      "fix": "Resolve monthly contribution first, then check postfix pattern '$X initial' before forward-keyword pattern. Also de-duplicates initial from monthly in fallback."
+    },
+    {
+      "id": "B4",
+      "title": "technical_indicators MACD plot: signal_line x-axis offset matches macd_line length",
+      "file": "octane/catalysts/finance/technical_indicators.py",
+      "root_cause": "macd_line has N elements, signal_line has N-8 elements. Both were plotted against dates[offset_macd:] of length N → dimension mismatch ValueError.",
+      "fix": "Use separate offset_macd, offset_signal, offset_hist variables, each computed as len(dates) - len(series)"
+    },
+    {
+      "id": "B5",
+      "title": "technical_indicators tight_layout warning with shared-x gridspec",
+      "file": "octane/catalysts/finance/technical_indicators.py",
+      "root_cause": "plt.tight_layout() incompatible with shared-x axes in GridSpec",
+      "fix": "fig.set_layout_engine('constrained') — matplotlib's preferred API for this layout pattern"
+    }
+  ],
+
+  "test_coverage": {
+    "new_test_classes": [
+      "TestReturnCalculator (3 tests) — basic return, summary string, no-price error",
+      "TestPriceChart (4 tests) — saves PNG, correct stats, empty timeseries error, insufficient data error",
+      "TestPortfolioProjection (2 tests) — saves chart + financials, total_invested formula",
+      "TestTechnicalIndicators (2 tests) — RSI + MACD chart, insufficient data error",
+      "TestExecutorGetOutputDir (2 tests) — creates dir + returns path, default run_id"
+    ],
+    "new_tests_added": 13,
+    "total_tests": 122,
+    "previously": 101
+  },
+
+  "next_session_candidates": [
+    "Session 15: Research catalysts R1-R5 (citation_formatter, paper_summary_card, etc.)",
+    "Session 15 alt: End-to-end integration test — real Bodega query → WebAgent → CatalystRegistry → price_chart artifact",
+    "Session 15 alt: Memory agent persistence — SQLite or file-backed memory with recall scoring",
+    "Session 15 alt: Career catalysts C1-C5 (resume_diff, skill_gap_radar, etc.)"
+  ]
+}

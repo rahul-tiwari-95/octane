@@ -12,6 +12,10 @@ class OctaneSettings(BaseSettings):
         default="http://localhost:44468",
         description="Bodega Inference Engine base URL",
     )
+    bodega_topology: str = Field(
+        default="auto",
+        description="Model topology: auto|compact|balanced|power",
+    )
 
     # --- Bodega Intelligence — consolidated server (:44469) ---
     bodega_intel_url: str = Field(

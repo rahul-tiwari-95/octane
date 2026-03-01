@@ -1,0 +1,48 @@
+{
+  "session": 17,
+  "title": "Long-Running Background Research Workflows",
+  "status": "complete",
+  "tests_before": 194,
+  "tests_after": 220,
+  "new_files": [
+    "octane/research/__init__.py",
+    "octane/research/models.py",
+    "octane/research/store.py",
+    "octane/tasks/research.py"
+  ],
+  "modified_files": [
+    "octane/tasks/__init__.py",
+    "octane/main.py",
+    "tests/test_agents.py"
+  ],
+  "commands_added": [
+    "octane research start <topic> [--every HOURS]",
+    "octane research status",
+    "octane research log <task-id> [--follow] [-n N]",
+    "octane research report <task-id> [--raw]",
+    "octane research stop <task-id>"
+  ],
+  "architecture": {
+    "ResearchTask": "Pydantic model — 8-char ID, topic, interval_hours, status, cycle_count, finding_count",
+    "ResearchFinding": "Pydantic model — per-cycle synthesis output with agents_used, sources, word_count, preview",
+    "ResearchStore": "Dual-layer store: Redis (task metadata + log ring-buffer cap=200 + cycle counter + active SET) + Postgres (research_findings table)",
+    "research_cycle": "Shadows Perpetual task (every=6h default) — deferred imports for cloudpickle safety, runs full OSA pipeline via Orchestrator.run_stream(), stores finding to Postgres",
+    "octane_tasks": "Now includes [monitor_ticker, research_cycle]",
+    "worker_process": "Shared with octane watch — research_cycle auto-registered via octane_tasks"
+  },
+  "test_classes_added": [
+    "TestResearchTask (5 tests)",
+    "TestResearchFinding (3 tests)",
+    "TestResearchStore (10 tests)",
+    "TestResearchCycleUnit (4 tests)",
+    "TestResearchCLI (4 tests)"
+  ],
+  "key_design_decisions": [
+    "All imports deferred inside research_cycle body for cloudpickle serialisation safety",
+    "ResearchStore accepts _redis/_pg DI params for testability; sets _postgres_url=None to fully disable Postgres in tests",
+    "Patch targets are source modules (octane.research.store.ResearchStore etc.) not octane.tasks.research.* since imports are local",
+    "Pipeline mock uses MagicMock (not AsyncMock) for rpush/ltrim — these are sync queue calls in the redis pipeline pattern",
+    "research_report --raw uses Rich Panels; default synthesises findings via Synthesizer.synthesize_with_content()",
+    "research_log --follow polls get_log() every 2s, tracks seen-count, prints new entries until Ctrl+C"
+  ]
+}

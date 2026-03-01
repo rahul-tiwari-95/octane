@@ -13,6 +13,13 @@ Session 10:
 - conversation_history buffer for multi-turn chat continuity
 - run_stream() accepts optional conversation_history
 - DAG execution metadata surfaced in egress event for --verbose flag
+
+Session 16:
+- HILManager wired: PolicyEngine.assess_dag() → HILManager.review_ledger()
+- CheckpointManager creates plan checkpoint after decomposition
+- run() and run_stream() emit hil_summary in egress events
+- HIL is non-interactive by default (auto-approves) — octane chat sets
+  interactive=True to enable human review prompts
 """
 
 from __future__ import annotations
@@ -20,6 +27,7 @@ from __future__ import annotations
 import asyncio
 import uuid
 from collections.abc import AsyncIterator
+from typing import Any
 
 import structlog
 
@@ -31,15 +39,24 @@ from octane.osa.router import Router
 from octane.osa.evaluator import Evaluator
 from octane.osa.policy import PolicyEngine
 from octane.osa.guard import Guard
+from octane.osa.hil_manager import HILManager
+from octane.osa.checkpoint_manager import CheckpointManager
 from octane.tools.bodega_inference import BodegaInferenceClient
 
 logger = structlog.get_logger().bind(component="osa")
+
+# ── Timeout constants (module-level so tests can monkeypatch them) ────────────
+# Per-chunk timeout for the eval stream. 120 s accommodates slow reasoning models
+# with long <think> blocks. Tests monkeypatch this to 0.1 s for fast execution.
+_EVAL_CHUNK_TIMEOUT: float = 120.0
+# Safety cap on _eval_gen.aclose() so a hung drain never blocks a cancellation.
+_EVAL_ACLOSE_TIMEOUT: float = 5.0
 
 
 class Orchestrator:
     """The brain of Octane. Every query flows through here."""
 
-    def __init__(self, synapse: SynapseEventBus) -> None:
+    def __init__(self, synapse: SynapseEventBus, hil_interactive: bool = False) -> None:
         self.synapse = synapse
         self.bodega = BodegaInferenceClient()
         self.decomposer = Decomposer(bodega=self.bodega)
@@ -47,6 +64,8 @@ class Orchestrator:
         self.evaluator = Evaluator(bodega=self.bodega)
         self.policy = PolicyEngine()
         self.guard = Guard()
+        self.hil = HILManager(interactive=hil_interactive)
+        self.checkpoint_mgr = CheckpointManager()
         self._preflight_done = False
         # Memory agent reference (resolved lazily from router to avoid circular import)
         self._memory_agent = None
@@ -186,7 +205,25 @@ class Orchestrator:
                     "Try rephrasing, or ask about web search, code, news, finance, or system status."
                 )
 
-        # STEP 3.5: MEMORY RECALL — inject prior context for chat continuity
+        # STEP 3.5: HIL — assess DAG risk, create plan checkpoint, review decisions
+        ledger = self.policy.assess_dag(dag)
+        await self.checkpoint_mgr.create(
+            correlation_id=correlation_id,
+            dag=dag,
+            results={},
+            decisions=ledger.decisions,
+            checkpoint_type="plan",
+        )
+        await self.hil.review_ledger(ledger, user_profile={})
+
+        self.synapse.emit(SynapseEvent(
+            correlation_id=correlation_id,
+            event_type="hil_complete",
+            source="osa.hil",
+            payload=ledger.summary(),
+        ))
+
+        # STEP 3.6: MEMORY RECALL — inject prior context for chat continuity
         memory_agent = self._get_memory_agent()
         prior_context: str | None = None
         if memory_agent and session_id != "cli":
@@ -222,8 +259,8 @@ class Orchestrator:
 
                 agent = self.router.get_agent(node.agent)
                 if agent:
-                    # DATA INJECTION: enrich instruction with upstream results
-                    instruction = _inject_upstream_data(
+                    # DATA INJECTION: enrich instruction with upstream results (text + structured)
+                    instruction, upstream_results = _inject_upstream_data(
                         node, accumulated, dag.original_query
                     )
                     task_request = AgentRequest(
@@ -232,6 +269,7 @@ class Orchestrator:
                         session_id=session_id,
                         source="osa",
                         metadata=node.metadata,
+                        context={"upstream_results": upstream_results},
                     )
                     wave_requests.append((node, agent, task_request))
                 else:
@@ -243,12 +281,30 @@ class Orchestrator:
                         correlation_id=correlation_id,
                     )
 
-            # Execute wave in parallel
+            # Execute wave in parallel — 90 s ceiling so a hung agent never blocks forever
             if wave_requests:
-                wave_responses = await asyncio.gather(
-                    *[agent.run(req) for _, agent, req in wave_requests],
-                    return_exceptions=False,
-                )
+                try:
+                    wave_responses = await asyncio.wait_for(
+                        asyncio.gather(
+                            *[agent.run(req) for _, agent, req in wave_requests],
+                            return_exceptions=False,
+                        ),
+                        timeout=90.0,
+                    )
+                except asyncio.TimeoutError:
+                    logger.warning(
+                        "wave_dispatch_timeout",
+                        wave_agents=[n.agent for n, _, _ in wave_requests],
+                    )
+                    wave_responses = [
+                        AgentResponse(
+                            agent=n.agent,
+                            success=False,
+                            error="Agent timed out (90 s ceiling)",
+                            correlation_id=correlation_id,
+                        )
+                        for n, _, _ in wave_requests
+                    ]
                 for (node, _, _), response in zip(wave_requests, wave_responses):
                     accumulated[node.task_id] = response
                     results.append(response)
@@ -278,6 +334,7 @@ class Orchestrator:
                 "tasks_succeeded": sum(1 for r in results if r.success),
                 "dag_nodes": len(dag.nodes),
                 "dag_reasoning": dag.reasoning,
+                "hil_summary": ledger.summary(),
             },
         ))
 
@@ -356,6 +413,17 @@ class Orchestrator:
                 )
                 return
 
+        # HIL — assess DAG risk + checkpoint (same as run())
+        ledger = self.policy.assess_dag(dag)
+        await self.checkpoint_mgr.create(
+            correlation_id=correlation_id,
+            dag=dag,
+            results={},
+            decisions=ledger.decisions,
+            checkpoint_type="plan",
+        )
+        await self.hil.review_ledger(ledger, user_profile={})
+
         # Memory recall
         memory_agent = self._get_memory_agent()
         prior_context: str | None = None
@@ -383,7 +451,7 @@ class Orchestrator:
             for node in wave:
                 agent = self.router.get_agent(node.agent)
                 if agent:
-                    instruction = _inject_upstream_data(
+                    instruction, upstream_results = _inject_upstream_data(
                         node, accumulated, dag.original_query
                     )
                     task_request = AgentRequest(
@@ -392,6 +460,7 @@ class Orchestrator:
                         session_id=session_id,
                         source="osa",
                         metadata=node.metadata,
+                        context={"upstream_results": upstream_results},
                     )
                     wave_requests.append((node, agent, task_request))
                 else:
@@ -402,23 +471,71 @@ class Orchestrator:
                     )
 
             if wave_requests:
-                wave_responses = await asyncio.gather(
-                    *[agent.run(req) for _, agent, req in wave_requests],
-                )
+                try:
+                    wave_responses = await asyncio.wait_for(
+                        asyncio.gather(
+                            *[agent.run(req) for _, agent, req in wave_requests],
+                        ),
+                        timeout=90.0,
+                    )
+                except asyncio.TimeoutError:
+                    logger.warning(
+                        "wave_dispatch_timeout",
+                        wave_agents=[n.agent for n, _, _ in wave_requests],
+                    )
+                    wave_responses = [
+                        AgentResponse(
+                            agent=n.agent,
+                            success=False,
+                            error="Agent timed out (90 s ceiling)",
+                            correlation_id=correlation_id,
+                        )
+                        for n, _, _ in wave_requests
+                    ]
                 for (node, _, _), response in zip(wave_requests, wave_responses):
                     accumulated[node.task_id] = response
                     results.append(response)
 
-        # Stream evaluate — collect full output for memory write
+        # Stream evaluate — collect full output for memory write.
+        # asyncio.timeout() inside an async generator is unreliable in Python
+        # 3.13 when the generator is suspended between yields.  Instead we put
+        # a hard wall-clock cap on each individual __anext__() call, which is a
+        # plain coroutine that asyncio.wait_for() handles correctly.
         full_output_parts: list[str] = []
-        async for chunk in self.evaluator.evaluate_stream(
+        _eval_gen = self.evaluator.evaluate_stream(
             query, results,
             prior_context=prior_context,
             user_profile=user_profile,
             conversation_history=conversation_history,
-        ):
-            full_output_parts.append(chunk)
-            yield chunk
+        )
+        try:
+            while True:
+                try:
+                    chunk = await asyncio.wait_for(
+                        _eval_gen.__anext__(),
+                        timeout=_EVAL_CHUNK_TIMEOUT,
+                    )
+                except StopAsyncIteration:
+                    break
+                except asyncio.TimeoutError:
+                    logger.warning(
+                        "eval_stream_chunk_timeout",
+                        timeout=_EVAL_CHUNK_TIMEOUT,
+                        partial_words=len("".join(full_output_parts).split()),
+                    )
+                    # Fall back to raw concatenation so we always produce output
+                    if not full_output_parts:
+                        concat = "\n\n---\n\n".join(r.output for r in results if r.output)
+                        full_output_parts.append(concat)
+                        yield concat
+                    break
+                full_output_parts.append(chunk)
+                yield chunk
+        finally:
+            try:
+                await asyncio.wait_for(_eval_gen.aclose(), timeout=_EVAL_ACLOSE_TIMEOUT)
+            except Exception:
+                pass
 
         full_output = "".join(full_output_parts).strip()
 
@@ -433,6 +550,7 @@ class Orchestrator:
             target="user",
             payload={
                 "output_preview": full_output[:200],
+                "word_count": len(full_output.split()),
                 "agents_used": [r.agent for r in results],
                 "mode": "stream",
                 "dag_nodes": len(dag.nodes),
@@ -509,7 +627,7 @@ class Orchestrator:
             for node in wave:
                 agent = self.router.get_agent(node.agent)
                 if agent:
-                    instruction = _inject_upstream_data(node, accumulated, query)
+                    instruction, upstream_results = _inject_upstream_data(node, accumulated, query)
                     self.synapse.emit(SynapseEvent(
                         correlation_id=correlation_id,
                         event_type="dispatch",
@@ -523,6 +641,7 @@ class Orchestrator:
                         session_id=session_id,
                         source="osa",
                         metadata=node.metadata,
+                        context={"upstream_results": upstream_results},
                     )
                     wave_requests.append((node, agent, task_request))
                 else:
@@ -540,16 +659,41 @@ class Orchestrator:
                     accumulated[node.task_id] = response
                     results.append(response)
 
-        # Evaluate → stream
+        # Evaluate → stream (same per-__anext__ timeout guard as run_stream)
         full_output_parts: list[str] = []
-        async for chunk in self.evaluator.evaluate_stream(
+        _eval_gen = self.evaluator.evaluate_stream(
             query, results,
             prior_context=prior_context,
             user_profile=user_profile,
             conversation_history=conversation_history,
-        ):
-            full_output_parts.append(chunk)
-            yield chunk
+        )
+        try:
+            while True:
+                try:
+                    chunk = await asyncio.wait_for(
+                        _eval_gen.__anext__(),
+                        timeout=_EVAL_CHUNK_TIMEOUT,
+                    )
+                except StopAsyncIteration:
+                    break
+                except asyncio.TimeoutError:
+                    logger.warning(
+                        "eval_stream_chunk_timeout",
+                        timeout=_EVAL_CHUNK_TIMEOUT,
+                        partial_words=len("".join(full_output_parts).split()),
+                    )
+                    if not full_output_parts:
+                        concat = "\n\n---\n\n".join(r.output for r in results if r.output)
+                        full_output_parts.append(concat)
+                        yield concat
+                    break
+                full_output_parts.append(chunk)
+                yield chunk
+        finally:
+            try:
+                await asyncio.wait_for(_eval_gen.aclose(), timeout=_EVAL_ACLOSE_TIMEOUT)
+            except Exception:
+                pass
 
         full_output = "".join(full_output_parts).strip()
 
@@ -577,31 +721,48 @@ def _inject_upstream_data(
     node: TaskNode,
     accumulated: dict[str, AgentResponse],
     original_query: str,
-) -> str:
-    """Build the instruction for a node, injecting results from its dependencies.
+) -> tuple[str, dict[str, Any]]:
+    """Build the instruction and structured upstream data for a node.
 
-    For root nodes (no depends_on): instruction is unchanged.
-    For dependent nodes: upstream outputs are prepended as DATA CONTEXT so the
-    agent (especially CodeAgent) has real data to work with instead of guessing.
+    Returns:
+        (instruction_str, upstream_results_dict)
+
+        instruction_str — enriched text instruction with upstream outputs
+            prepended as DATA CONTEXT (consumed by the LLM pipeline).
+        upstream_results_dict — raw structured results keyed by dep node_id
+            (consumed by CatalystRegistry; bypasses LLM entirely).
+
+    For root nodes (no depends_on): instruction is unchanged, upstream_results empty.
     """
     if not node.depends_on:
-        return node.instruction
+        return node.instruction, {}
 
     upstream_parts: list[str] = []
+    upstream_results: dict[str, Any] = {}
+
     for dep_id in node.depends_on:
         dep_response = accumulated.get(dep_id)
-        if dep_response and dep_response.success and dep_response.output:
-            output = dep_response.output.strip()
-            if len(output) > 800:
-                output = output[:800] + "\n... [truncated]"
-            upstream_parts.append(f"[Data from {dep_response.agent} agent]\n{output}")
+        if dep_response and dep_response.success:
+            # Structured payload — whatever the upstream agent returned as data
+            if dep_response.data:
+                upstream_results[dep_id] = dep_response.data
+            elif dep_response.output:
+                # Fallback: agents that only set output (no structured data)
+                upstream_results[dep_id] = {"output": dep_response.output}
+            # Text payload — for LLM context injection
+            if dep_response.output:
+                output = dep_response.output.strip()
+                if len(output) > 800:
+                    output = output[:800] + "\n... [truncated]"
+                upstream_parts.append(f"[Data from {dep_response.agent} agent]\n{output}")
 
     if not upstream_parts:
-        return node.instruction
+        return node.instruction, upstream_results
 
     context_block = "\n\n".join(upstream_parts)
-    return (
+    instruction = (
         f"{node.instruction}\n\n"
         f"Use the following real data retrieved from upstream agents:\n\n"
         f"{context_block}"
     )
+    return instruction, upstream_results

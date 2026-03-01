@@ -6,6 +6,7 @@ Model loading/unloading is done ONLY by SysStat.ModelManager.
 
 from __future__ import annotations
 
+import asyncio
 import json
 from collections.abc import AsyncIterator
 from typing import Any
@@ -77,6 +78,17 @@ class BodegaInferenceClient:
         response.raise_for_status()
         result = response.json()
 
+        # If the model was loaded with reasoning_parser="qwen3", Bodega extracts
+        # the <think> block into message["reasoning_content"] automatically.
+        # Log it at DEBUG and strip it so callers always receive clean content.
+        message = result.get("choices", [{}])[0].get("message", {})
+        if reasoning := message.get("reasoning_content"):
+            logger.debug(
+                "model_reasoning_content",
+                trace=reasoning[:400],
+                model=model,
+            )
+
         logger.debug(
             "chat_completion",
             model=model,
@@ -112,12 +124,20 @@ class BodegaInferenceClient:
         system: str = "",
         temperature: float = 0.7,
         max_tokens: int = 2048,
+        total_timeout: float = 90.0,
     ) -> AsyncIterator[str]:
         """Streaming chat: yields text chunks as they arrive from Bodega.
 
         Uses the OpenAI-compatible SSE format (data: {...} lines).
         Each yielded value is a raw text fragment — callers print them
         immediately to give the user a real-time typing effect.
+
+        Args:
+            total_timeout: Passed to httpx as the read-timeout between SSE
+                lines.  NOTE: callers (e.g. Orchestrator.run_stream) apply a
+                per-__anext__() asyncio.wait_for() guard as the primary
+                wall-clock cap, because asyncio.timeout() inside a suspended
+                async generator is unreliable on Python 3.13.
 
         Usage:
             async for chunk in bodega.chat_stream(prompt, system=sys):
@@ -136,23 +156,34 @@ class BodegaInferenceClient:
             "stream": True,
         }
 
-        client = await self._get_client()
-        async with client.stream("POST", "/v1/chat/completions", json=payload) as response:
-            response.raise_for_status()
-            async for line in response.aiter_lines():
-                if not line.startswith("data:"):
-                    continue
-                data = line[5:].strip()
-                if data == "[DONE]":
-                    break
-                try:
-                    chunk = json.loads(data)
-                    delta = chunk["choices"][0].get("delta", {})
-                    text = delta.get("content", "")
-                    if text:
-                        yield text
-                except (json.JSONDecodeError, KeyError, IndexError):
-                    continue
+        # Use a fresh, no-keepalive client for each stream request.
+        # The shared pool client forces httpcore to DRAIN the remaining response
+        # body before returning the connection to the pool.  If Bodega is still
+        # generating when the caller cancels (e.g. via asyncio.wait_for on
+        # __anext__()), that drain blocks indefinitely — preventing the
+        # cancelled task from finishing and therefore blocking wait_for itself.
+        # A no-keepalive client closes the TCP socket immediately on cleanup.
+        async with httpx.AsyncClient(
+            base_url=self.base_url,
+            timeout=httpx.Timeout(connect=5.0, read=total_timeout, write=10.0, pool=5.0),
+            limits=httpx.Limits(max_connections=1, max_keepalive_connections=0),
+        ) as stream_client:
+            async with stream_client.stream("POST", "/v1/chat/completions", json=payload) as response:
+                response.raise_for_status()
+                async for line in response.aiter_lines():
+                    if not line.startswith("data:"):
+                        continue
+                    data = line[5:].strip()
+                    if data == "[DONE]":
+                        break
+                    try:
+                        chunk = json.loads(data)
+                        delta = chunk["choices"][0].get("delta", {})
+                        text = delta.get("content", "")
+                        if text:
+                            yield text
+                    except (json.JSONDecodeError, KeyError, IndexError):
+                        continue
 
     # ---- Health & Info ----
 

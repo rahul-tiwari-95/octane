@@ -19,6 +19,7 @@ Fallback: single-node DAG using the existing keyword classifier.
 
 from __future__ import annotations
 
+import asyncio
 import re
 
 import structlog
@@ -84,20 +85,43 @@ class DAGPlanner:
     async def plan(self, query: str) -> TaskDAG | None:
         """Attempt to build a multi-node DAG.
 
-        Returns None if planning fails or produces a trivial 1-node plan
-        (caller should fall back to single-node Decomposer path).
+        Resolution order:
+          1. Domain pipeline match  — keyword-based, zero latency, no LLM
+          2. LLM planning           — full multi-step plan via Bodega
+          3. Returns None           — caller falls back to single-node Decomposer
+
+        Returns None if planning fails or produces a trivial 1-node plan.
         """
+        from octane.osa.domain_pipelines import match_domain, build_dag as build_domain_dag
+
+        # Step 1: Try domain pipeline (no LLM round-trip)
+        domain = match_domain(query)
+        if domain:
+            domain_dag = build_domain_dag(query, domain)
+            if domain_dag and len(domain_dag.nodes) > 1:
+                logger.info(
+                    "dag_domain_match",
+                    domain=domain,
+                    nodes=len(domain_dag.nodes),
+                    query=query[:80],
+                )
+                return domain_dag
+
+        # Step 2: LLM planning (requires Bodega)
         if self._bodega is None:
             return None
 
         try:
-            raw = await self._bodega.chat_simple(
-                prompt=f'Query: "{query}"',
-                system=_PLANNER_SYSTEM,
-                temperature=0.0,
-                max_tokens=400,
+            raw = await asyncio.wait_for(
+                self._bodega.chat_simple(
+                    prompt=f'Query: "{query}"',
+                    system=_PLANNER_SYSTEM,
+                    temperature=0.0,
+                    max_tokens=400,
+                ),
+                timeout=8.0,  # fast fallback to keyword decomposition if LLM stalls
             )
-        except Exception as exc:
+        except (asyncio.TimeoutError, Exception) as exc:
             logger.warning("dag_planner_llm_failed", error=str(exc))
             return None
 

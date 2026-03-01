@@ -1,13 +1,17 @@
 """Code Agent coordinator.
 
-Pipeline: Planner → Writer → Executor → Validator → (Debugger → Writer → Executor) × N
+Pipeline: Planner -> Writer -> Executor -> Validator -> (Debugger -> Writer -> Executor) x N
 
-Self-healing loop:
+Before entering the LLM pipeline, CodeAgent checks the CatalystRegistry for a
+deterministic pre-written solution. If a catalyst matches the query + upstream data,
+it runs directly and returns -- no LLM call, no sandbox execution needed.
+
+Self-healing loop (LLM path):
     1. Plan the task
     2. Write initial code
     3. Execute in isolated subprocess
     4. Validate output
-    5. If failed and retries remain: Debugger rewrites → back to step 3
+    5. If failed and retries remain: Debugger rewrites -> back to step 3
     6. Return best result (or final error if all retries exhausted)
 """
 
@@ -21,9 +25,11 @@ from octane.agents.code.executor import Executor
 from octane.agents.code.planner import Planner
 from octane.agents.code.validator import Validator
 from octane.agents.code.writer import Writer
+from octane.catalysts.registry import CatalystRegistry
 from octane.models.schemas import AgentRequest, AgentResponse
 from octane.models.synapse import SynapseEvent
 from octane.tools.bodega_inference import BodegaInferenceClient
+from octane.tools.structured_store import ArtifactStore
 
 logger = structlog.get_logger().bind(component="code.agent")
 
@@ -31,11 +37,12 @@ MAX_RETRIES = 3
 
 
 class CodeAgent(BaseAgent):
-    """Code Agent — generates, executes, and self-heals Python code."""
+    """Code Agent -- generates, executes, and self-heals Python code."""
 
     name = "code"
 
-    def __init__(self, synapse, bodega: BodegaInferenceClient | None = None) -> None:
+    def __init__(self, synapse, bodega: BodegaInferenceClient | None = None,
+                 artifact_store: ArtifactStore | None = None) -> None:
         super().__init__(synapse)
         bodega = bodega or BodegaInferenceClient()
         self.planner = Planner(bodega=bodega)
@@ -43,16 +50,96 @@ class CodeAgent(BaseAgent):
         self.executor = Executor()
         self.validator = Validator()
         self.debugger = Debugger(bodega=bodega)
+        self.catalyst_registry = CatalystRegistry()
+        self._artifact_store = artifact_store
 
     async def execute(self, request: AgentRequest) -> AgentResponse:
-        """Run the full plan → write → execute → validate → debug loop."""
-        task = request.query
+        """Run the plan -> write -> execute -> validate -> debug loop.
 
-        # ── PLAN ──────────────────────────────────────────────────────────
+        Checks CatalystRegistry first. If a catalyst matches, returns immediately
+        without touching the LLM pipeline or sandbox executor.
+        """
+        task = request.query
+        upstream_results: dict = request.context.get("upstream_results", {})
+
+        # -- CATALYST CHECK ----------------------------------------------------
+        catalyst_match = self.catalyst_registry.match(task, upstream_results)
+        if catalyst_match:
+            return await self._run_catalyst(catalyst_match, task, request)
+
+        # -- LLM PIPELINE ------------------------------------------------------
+        return await self._run_llm_pipeline(task, request)
+
+    async def _run_catalyst(
+        self,
+        catalyst_match: tuple,
+        task: str,
+        request: AgentRequest,
+    ) -> AgentResponse:
+        """Execute a matched catalyst function and wrap result as AgentResponse."""
+        catalyst_fn, resolved_data = catalyst_match
+        output_dir = self.executor.get_output_dir(request.correlation_id)
+
+        try:
+            result = catalyst_fn(
+                resolved_data,
+                output_dir,
+                correlation_id=request.correlation_id,
+                instruction=task,
+            )
+            summary = result.get("summary", "Catalyst completed successfully.")
+            artifacts = result.get("artifacts", [])
+
+            self.synapse.emit(SynapseEvent(
+                correlation_id=request.correlation_id or "unknown",
+                event_type="catalyst_success",
+                source="code.agent",
+                payload={
+                    "catalyst": catalyst_fn.__name__,
+                    "artifacts": artifacts,
+                    "output_dir": output_dir,
+                },
+            ))
+            logger.info(
+                "catalyst_success",
+                catalyst=catalyst_fn.__name__,
+                artifacts=len(artifacts),
+                output_dir=output_dir,
+            )
+
+            output_lines = [f"Catalyst: {catalyst_fn.__name__}", "", summary]
+            if artifacts:
+                output_lines += ["", "Saved files:"] + [f"  {a}" for a in artifacts]
+
+            return AgentResponse(
+                agent=self.name,
+                success=True,
+                output="\n".join(output_lines),
+                data=result,
+                correlation_id=request.correlation_id,
+                metadata={"via_catalyst": catalyst_fn.__name__},
+            )
+
+        except Exception as exc:
+            # Catalyst failed -- log loudly and fall through to LLM pipeline
+            logger.warning(
+                "catalyst_failed_falling_through",
+                catalyst=catalyst_fn.__name__,
+                error=str(exc),
+            )
+            self.synapse.emit(SynapseEvent(
+                correlation_id=request.correlation_id or "unknown",
+                event_type="catalyst_failed",
+                source="code.agent",
+                payload={"catalyst": catalyst_fn.__name__, "error": str(exc)},
+            ))
+            return await self._run_llm_pipeline(task, request)
+
+    async def _run_llm_pipeline(self, task: str, request: AgentRequest) -> AgentResponse:
+        """Full LLM code-gen pipeline (Planner -> Writer -> Executor -> Validator -> Debugger)."""
         spec = await self.planner.plan(task)
         logger.info("plan_ready", approach=spec.get("approach", "")[:80])
 
-        # ── WRITE ─────────────────────────────────────────────────────────
         code = await self.writer.write(spec)
         requirements = spec.get("requirements", [])
 
@@ -63,14 +150,11 @@ class CodeAgent(BaseAgent):
         for attempt in range(1, MAX_RETRIES + 1):
             logger.info("executing_attempt", attempt=attempt)
 
-            # ── EXECUTE ───────────────────────────────────────────────────
             exec_result = await self.executor.run(
                 code,
                 requirements=requirements,
                 correlation_id=request.correlation_id,
             )
-
-            # ── VALIDATE ──────────────────────────────────────────────────
             validation = self.validator.validate(exec_result)
 
             if validation["passed"]:
@@ -106,7 +190,6 @@ class CodeAgent(BaseAgent):
             if not validation["should_retry"] or attempt == MAX_RETRIES:
                 break
 
-            # ── DEBUG → REWRITE ───────────────────────────────────────────
             logger.info("invoking_debugger", attempt=attempt)
             self.synapse.emit(SynapseEvent(
                 correlation_id=request.correlation_id or "unknown",
@@ -122,9 +205,20 @@ class CodeAgent(BaseAgent):
                 logger.warning("debugger_no_change_stopping", attempt=attempt)
                 break
 
-        # ── FORMAT RESPONSE ───────────────────────────────────────────────
         if validation.get("passed"):
             output_text = self._format_success(task, spec, code, exec_result, validation)
+            # Persist generated artifact (fire-and-forget, non-blocking)
+            if self._artifact_store is not None:
+                try:
+                    await self._artifact_store.register(
+                        content=code,
+                        artifact_type="code",
+                        language=spec.get("language", "python"),
+                        description=task[:200],
+                        session_id=request.correlation_id or "",
+                    )
+                except Exception as _ae:
+                    logger.warning("artifact_store_error", error=str(_ae))
             return AgentResponse(
                 agent=self.name,
                 success=True,
@@ -170,37 +264,26 @@ class CodeAgent(BaseAgent):
         output_dir = exec_result.get("output_dir")
 
         lines = [
-            f"✅ Code executed successfully ({duration:.0f}ms)",
+            f"Code executed successfully ({duration:.0f}ms)",
             f"Task: {task}",
         ]
-
         if artifacts and output_dir:
             lines.append("")
-            lines.append("── Saved files ──")
+            lines.append("Saved files:")
             for f in artifacts:
-                lines.append(f"  📄 {output_dir}/{f}")
-
-        lines += [
-            "",
-            "── Output ──",
-            output or "(no stdout)",
-            "",
-            "── Code ──",
-            "```python",
-            code.strip(),
-            "```",
-        ]
+                lines.append(f"  {output_dir}/{f}")
+        lines += ["", "Output:", output or "(no stdout)", "", "Code:", "```python", code.strip(), "```"]
         return "\n".join(lines)
 
     def _format_failure(self, task: str, error: str | None, code: str) -> str:
         lines = [
-            f"❌ Code execution failed after {MAX_RETRIES} attempts",
+            f"Code execution failed after {MAX_RETRIES} attempts",
             f"Task: {task}",
             "",
-            "── Last Error ──",
+            "Last Error:",
             error or "Unknown error",
             "",
-            "── Last Code Attempt ──",
+            "Last Code Attempt:",
             "```python",
             code.strip(),
             "```",

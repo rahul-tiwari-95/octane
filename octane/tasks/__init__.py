@@ -10,9 +10,10 @@ Public surface
 """
 
 from .monitor import monitor_ticker
+from .research import research_cycle
 
 # Task collection path consumed by shadows Worker:
 #   Worker.run(tasks=["octane.tasks:octane_tasks"])
-octane_tasks = [monitor_ticker]
+octane_tasks = [monitor_ticker, research_cycle]
 
-__all__ = ["monitor_ticker", "octane_tasks"]
+__all__ = ["monitor_ticker", "research_cycle", "octane_tasks"]

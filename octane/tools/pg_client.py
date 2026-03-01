@@ -184,6 +184,8 @@ class PgClient:
         """Create tables if they don't exist. Safe to call repeatedly."""
         if not self.available or self._pool is None:
             return
+
+        # ── Session 17: memory tables ──────────────────────────────────────
         try:
             async with self._pool.acquire() as conn:
                 await conn.execute(_DDL_CHUNKS)
@@ -200,6 +202,18 @@ class PgClient:
         except Exception:
             logger.info("pg_vector_unavailable", hint="pgVector extension not installed — cold tier disabled")
             self.vector_enabled = False
+
+        # ── Session 18A: structured storage schema ─────────────────────────
+        try:
+            import os
+            schema_path = os.path.join(os.path.dirname(__file__), "schema.sql")
+            with open(schema_path) as f:
+                ddl = f.read()
+            async with self._pool.acquire() as conn:
+                await conn.execute(ddl)
+            logger.info("pg_schema_ready", table="structured_storage_18a")
+        except Exception as exc:
+            logger.warning("pg_schema_18a_error", error=str(exc))
 
     def _redacted_dsn(self) -> str:
         """Log-safe DSN (hides password if present)."""

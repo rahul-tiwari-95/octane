@@ -8,15 +8,20 @@ Phase 3+: Quality scoring, confidence gates, re-execution triggers.
 
 from __future__ import annotations
 
+import asyncio
 import re
 from collections.abc import AsyncIterator
 
 import structlog
 
 from octane.models.schemas import AgentResponse
+from octane.tools.topology import ModelTier
 from octane.utils.clock import today_human
 
 logger = structlog.get_logger().bind(component="osa.evaluator")
+
+# Sentinel: distinguish "use default BodegaRouter" from "explicitly no LLM"
+_UNSET = object()
 
 _EVALUATOR_SYSTEM_BASE = """\
 You are the Octane Evaluator. Given the results from one or more specialized \
@@ -73,7 +78,11 @@ class Evaluator:
     Falls back to passthrough concatenation if Bodega is unavailable.
     """
 
-    def __init__(self, bodega=None) -> None:
+    def __init__(self, bodega=_UNSET) -> None:
+        # Pass bodega=None explicitly to disable LLM (concatenation fallback).
+        if bodega is _UNSET:
+            from octane.tools.bodega_router import BodegaRouter
+            bodega = BodegaRouter()
         self._bodega = bodega
 
     async def evaluate(
@@ -164,11 +173,15 @@ class Evaluator:
             f"Synthesize a direct response to the user's query."
         )
 
-        response = await self._bodega.chat_simple(
-            prompt=prompt,
-            system=system,
-            temperature=0.3,
-            max_tokens=1024,
+        response = await asyncio.wait_for(
+            self._bodega.chat_simple(
+                prompt=prompt,
+                system=system,
+                tier=ModelTier.REASON,
+                temperature=0.3,
+                max_tokens=512,  # research synthesis needs key facts, not long essays
+            ),
+            timeout=30.0,  # evaluator synthesis: 30 s cap
         )
         return response.strip()
 
@@ -256,8 +269,9 @@ class Evaluator:
             async for chunk in self._bodega.chat_stream(
                 prompt=prompt,
                 system=system,
+                tier=ModelTier.REASON,
                 temperature=0.3,
-                max_tokens=1024,
+                max_tokens=512,  # research synthesis: key facts only, not essays
             ):
                 raw_buffer += chunk
 
@@ -290,12 +304,24 @@ class Evaluator:
         except Exception as exc:
             logger.warning("stream_failed", error=str(exc), fallback="evaluate()")
             # Graceful fallback to non-streaming
-            result = await self.evaluate(
-                original_query, results,
-                prior_context=prior_context,
-                user_profile=user_profile,
-                conversation_history=conversation_history,
-            )
+            try:
+                result = await self.evaluate(
+                    original_query, results,
+                    prior_context=prior_context,
+                    user_profile=user_profile,
+                    conversation_history=conversation_history,
+                )
+            except Exception as eval_exc:
+                logger.warning(
+                    "evaluate_fallback_failed",
+                    error=str(eval_exc),
+                    fallback="concatenation",
+                )
+                # Last resort: plain concatenation so we always yield something
+                successful_outputs = [r.output for r in results if r.success and r.output]
+                result = "\n\n---\n\n".join(successful_outputs) if successful_outputs else (
+                    "\n\n---\n\n".join(r.output for r in results if r.output)
+                )
             yield result
 
 

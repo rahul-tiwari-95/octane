@@ -1,0 +1,129 @@
+{
+  "session": 15,
+  "date": "2026-02-27",
+  "title": "Deep Web Intelligence — trafilatura + Playwright + Full-Text Synthesis",
+  "status": "complete",
+  "started_at": "2026-02-27T00:00:00Z",
+  "completed_at": "2026-02-27T17:14:00Z",
+
+  "goals": [
+    "Install trafilatura and playwright in oct_env with Chromium binary",
+    "Upgrade BodegaInferenceClient to natively handle reasoning_content from qwen3 models",
+    "Add ModelManager.reload_with_reasoning_parser() for safe 16GB reload",
+    "Add octane model reload-parser CLI command",
+    "Build ContentExtractor: async trafilatura wrapper with ExtractedContent dataclass",
+    "Build BrowserAgent: full Playwright implementation with cookie persistence and interactive flag",
+    "Upgrade Synthesizer with synthesize_with_content() and chunked pre-summarization",
+    "Wire ContentExtractor + BrowserAgent into WebAgent._fetch_search and ._fetch_news",
+    "Make extractor and browser injectable in WebAgent for testability",
+    "Write Session 15 tests — 18 new tests across ContentExtractor, BrowserAgent, Synthesizer, WebAgent"
+  ],
+
+  "deliverables": [
+    {
+      "file": "octane/tools/bodega_inference.py",
+      "change": "chat() now extracts reasoning_content natively: logs at DEBUG, returns clean content. Works alongside existing <think>...</think> partition fallback in callers."
+    },
+    {
+      "file": "octane/agents/sysstat/model_manager.py",
+      "change": "Added reload_with_reasoning_parser(reasoning_parser, tool_call_parser): unloads current model then reloads same model_path with parser kwargs. Safe for 16GB RAM."
+    },
+    {
+      "file": "octane/main.py",
+      "change": "Added model_app Typer sub-app with reload-parser command. Also fixed syntax error on line 1460 (agent_parts = []s → agent_parts = [])."
+    },
+    {
+      "file": "octane/agents/web/content_extractor.py",
+      "change": "Full rewrite from ExtractedArticle / extract_urls() API to ExtractedContent dataclass + extract_url(url) / extract_batch(urls, top_n) / _chunk_text(). asyncio.to_thread() wraps all trafilatura calls. Graceful degradation: method='unavailable' if not installed, method='failed' on error. max_chars_per_source=3000 default."
+    },
+    {
+      "file": "octane/agents/web/browser.py",
+      "change": "Full implementation replacing Phase 1 stub. BrowserAgent(interactive=False/True). scrape(url) → str | None. Chain: headless+cookies → headless → headed+human-assist (interactive only). Cookie persistence at ~/.octane/browser/cookies/<domain>.json. asyncio.to_thread(input, ...) for blocking-free terminal prompt. Playwright graceful degradation."
+    },
+    {
+      "file": "octane/agents/web/synthesizer.py",
+      "change": "Added _CHUNK_SYSTEM_BASE + _FULL_TEXT_SYSTEM_BASE prompts. Added _chunk_system() / _full_text_system() helpers. Added Synthesizer._MAX_CHARS_DIRECT=3000 / _MAX_CHARS_CHUNK=6000 class constants. Added _summarize_chunk(): pre-compresses articles >3000 chars in a focused LLM pass. Added synthesize_with_content(query, extracted_articles): filters usable articles, chunk-summarizes long texts, final LLM synthesis at max_tokens=768, plain fallback."
+    },
+    {
+      "file": "octane/agents/web/agent.py",
+      "change": "Added imports for ContentExtractor, ExtractedContent, BrowserAgent. WebAgent.__init__ now accepts optional extractor and browser kwargs (injectable for tests). Default: ContentExtractor() + BrowserAgent(interactive=False). Added _enrich_with_browser() helper (max 2 headless retries). Updated _fetch_news: extract article URLs → extract_batch → enrich → synthesize_with_content; fallback to synthesize_news. Updated _fetch_search: same cascade; fallback to synthesize_search."
+    },
+    {
+      "file": "tests/test_agents.py",
+      "change": "Updated test_web_agent_routes_news, test_web_agent_routes_search_by_default, test_web_agent_news_uses_synthesizer, test_web_agent_search_uses_synthesizer to inject mock extractor (no real network). Added 18 new tests: TestContentExtractor (5), TestBrowserAgent (3), TestSynthesizerWithContent (5), TestWebAgentFullTextPath (4) + 1 fixed syntax + 18 total new = 140 passing."
+    },
+    {
+      "file": "octane/agents/web/agent.py",
+      "change": "(Post-session addition) _extract_ticker() made async. Added _resolve_ticker_via_web() — queries Bodega Intel web_search('{query} stock ticker symbol') then asks LLM for single ticker (max_tokens=10, temperature=0.0). Fixes unknown company names like DoorDash → DASH. self._bodega stored on WebAgent for direct access. Fixed typo: 'meta`qsevf g' → 'meta' in name_map. _fetch_finance updated to await _extract_ticker()."
+    },
+    {
+      "file": "tests/test_agents.py",
+      "change": "(Post-session addition) Added 17 new tests across 5 new test classes: TestContentExtractorEdgeCases (5), TestBrowserAgentChain (3), TestSynthesizerChunkSummarize (3), TestWebAgentTickerResolution (6). Total raised from 140 → 157."
+    }
+  ],
+
+  "architecture": {
+    "extraction_cascade": {
+      "step_1": "ContentExtractor.extract_batch(urls, top_n=5) — trafilatura async, 3000 char cap",
+      "step_2": "_enrich_with_browser(extracted, max_attempts=2) — headless Playwright on failed URLs",
+      "step_3_a": "synthesize_with_content(query, usable) — full-text deep synthesis if any text extracted",
+      "step_3_b": "synthesize_news() or synthesize_search() — snippet fallback if all extraction fails"
+    },
+    "ticker_resolution": {
+      "fast_path_1": "regex — all-caps 2-5 char token in query (e.g. 'NVDA earnings' → NVDA)",
+      "fast_path_2": "hardcoded name_map — nvidia/apple/meta etc. (13 entries)",
+      "slow_path_3": "_resolve_ticker_via_web() — web_search('{query} stock ticker symbol', count=3) → LLM extracts ticker (max_tokens=10, temperature=0.0). Returns None if LLM says 'NONE' or no bodega available.",
+      "example": "'doordash price today' → web_search('doordash price today stock ticker symbol') → LLM returns 'DASH'"
+    },
+    "chunk_summarization": {
+      "threshold": "3000 chars (_MAX_CHARS_DIRECT)",
+      "chunk_truncation": "6000 chars before chunk pass (_MAX_CHARS_CHUNK)",
+      "chunk_llm_budget": "max_tokens=350, temperature=0.1",
+      "final_synthesis_budget": "max_tokens=768, temperature=0.2"
+    },
+    "browser_agent": {
+      "interactive_false": "headless only — for automated paths (WebAgent, background workers)",
+      "interactive_true": "headless → headed + human-assist + cookie save — for octane ask",
+      "cookie_dir": "~/.octane/browser/cookies/<domain>.json"
+    },
+    "reasoning_content": {
+      "model_loaded_with_parser": "message['reasoning_content'] extracted at server level — content is clean",
+      "model_without_parser": "partition('<think>') fallback in decomposer/query_strategist/writer remains"
+    }
+  },
+
+  "packages_installed": [
+    "trafilatura==2.0.0",
+    "playwright==1.x",
+    "Chromium binary (~91 MB) at ~/.ms-playwright/chromium_headless_shell-1208"
+  ],
+
+  "test_summary": {
+    "original_session_baseline": 122,
+    "session_15_new_tests": 18,
+    "post_session_additions": 17,
+    "total": 157,
+    "all_passing": true,
+    "test_classes": {
+      "TestContentExtractor": 6,
+      "TestContentExtractorEdgeCases": 5,
+      "TestBrowserAgent": 3,
+      "TestBrowserAgentChain": 3,
+      "TestSynthesizerWithContent": 5,
+      "TestSynthesizerChunkSummarize": 3,
+      "TestWebAgentFullTextPath": 4,
+      "TestWebAgentTickerResolution": 6
+    }
+  },
+
+  "notes": [
+    "BrowserAgent.scrape() returns str | None (not dict) — callers in _enrich_with_browser handle this directly",
+    "ContentExtractor and BrowserAgent are injectable into WebAgent.__init__ for fast unit tests (no network)",
+    "Synthesizer.synthesize_with_content() uses TYPE_CHECKING for ExtractedContent import to avoid circular imports",
+    "main.py syntax error (agent_parts = []s) fixed as part of this session",
+    "trafilatura extract() requires >100 chars of text or it's treated as a cookie-wall redirect page",
+    "BrowserAgent.scrape() is always called with the BrowserAgent(interactive=False) instance in WebAgent",
+    "_extract_ticker is now async — _fetch_finance awaits it. _resolve_ticker_via_web returns None gracefully if no bodega or on any exception",
+    "Fixed typo in name_map: 'meta`qsevf g' was a corrupted key — now correctly 'meta'"
+  ]
+}

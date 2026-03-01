@@ -36,6 +36,17 @@ _ARTIFACT_EXTENSIONS = {".png", ".jpg", ".jpeg", ".svg", ".pdf", ".csv", ".json"
 class Executor:
     """Runs Python code in an isolated subprocess with optional pip deps."""
 
+    def get_output_dir(self, correlation_id: str | None = None) -> str:
+        """Return (and create) the permanent output directory for a given run.
+
+        Used by CatalystAgent to save chart PNGs to the same location as
+        sandbox-executed scripts, so the evaluator finds artifacts consistently.
+        """
+        run_id = correlation_id or f"run_{int(time.time() * 1000)}"
+        output_dir = OUTPUT_ROOT / run_id
+        output_dir.mkdir(parents=True, exist_ok=True)
+        return str(output_dir)
+
     async def run(
         self,
         code: str,

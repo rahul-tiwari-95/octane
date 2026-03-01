@@ -67,6 +67,19 @@ async def _run(shadows_name: str, redis_url: str) -> None:
     _write_pid()
     logger.info("Octane Worker starting (PID=%d)", os.getpid())
 
+    # ── Auto-migrate DB schema on startup ────────────────────────────────────
+    try:
+        from octane.tools.migrations import MigrationRunner
+        _mresult = await MigrationRunner().migrate()
+        if _mresult.error:
+            logger.warning("DB migration failed: %s", _mresult.error)
+        elif _mresult.applied:
+            logger.info("DB schema migrated to version %s (%d tables)", _mresult.version, len(_mresult.tables))
+        else:
+            logger.debug("DB schema already current (version %s)", _mresult.version)
+    except Exception as _exc:
+        logger.warning("DB migration skipped: %s", _exc)
+
     try:
         async with Shadow(name=shadows_name, url=redis_url) as shadow:
             shadow.register_collection("octane.tasks:octane_tasks")

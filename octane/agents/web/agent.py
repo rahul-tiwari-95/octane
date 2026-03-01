@@ -2,15 +2,22 @@
 
 Routes to the correct API based on the sub_agent hint in the task metadata:
     web_finance  → market_data() + optional timeseries()
-    web_news     → news_search() → LLM synthesis
-    web_search   → web_search() (Beru/Brave) → LLM synthesis
+    web_news     → news_search() + web_search() (parallel) → full-text extraction → LLM synthesis
+    web_search   → web_search() (Beru/Brave) → full-text extraction → LLM synthesis
+
+The primary search backbone is /api/v1/beru/search/web (Google/Brave/Bing).
+For news-flavoured queries the dedicated news API runs in parallel so both
+fresh articles AND broader web results feed the synthesiser.
 
 Session 10: QueryStrategist generates 2-3 search variations.
             Synthesizer uses LLM to turn raw results into structured intelligence.
+Session 15: ContentExtractor (trafilatura) + BrowserAgent (Playwright) wire in for
+            deep full-text synthesis; snippets remain as automatic fallback.
 """
 
 from __future__ import annotations
 
+import asyncio
 import re
 
 import structlog
@@ -20,6 +27,8 @@ from octane.models.schemas import AgentRequest, AgentResponse
 from octane.tools.bodega_intel import BodegaIntelClient
 from octane.agents.web.synthesizer import Synthesizer
 from octane.agents.web.query_strategist import QueryStrategist
+from octane.agents.web.content_extractor import ContentExtractor, ExtractedContent
+from octane.agents.web.browser import BrowserAgent
 from octane.utils.clock import month_year, today_str
 
 logger = structlog.get_logger().bind(component="web_agent")
@@ -30,11 +39,38 @@ class WebAgent(BaseAgent):
 
     name = "web"
 
-    def __init__(self, synapse, intel: BodegaIntelClient | None = None, bodega=None) -> None:
+    def __init__(
+        self,
+        synapse,
+        intel: BodegaIntelClient | None = None,
+        bodega=None,
+        extractor: ContentExtractor | None = None,
+        browser: BrowserAgent | None = None,
+        page_store=None,  # optional WebPageStore — injected by Orchestrator (18A)
+    ) -> None:
         super().__init__(synapse)
+        self._bodega = bodega
         self._intel = intel or BodegaIntelClient()
         self._synthesizer = Synthesizer(bodega=bodega)
         self._strategist = QueryStrategist(bodega=bodega)
+        self._extractor = extractor or ContentExtractor()
+        self._browser = browser or BrowserAgent(interactive=False)
+        self._page_store = page_store  # WebPageStore | None
+
+    async def _store_pages(self, extracted: list[ExtractedContent]) -> None:
+        """Persist successfully extracted pages to WebPageStore (fire-and-forget)."""
+        if self._page_store is None:
+            return
+        for item in extracted:
+            if item.text and item.method not in ("unavailable", "failed"):
+                try:
+                    await self._page_store.store(
+                        url=item.url,
+                        content=item.text,
+                        title=item.title if hasattr(item, "title") else "",
+                    )
+                except Exception as exc:
+                    logger.debug("web_page_store_failed", url=item.url, error=str(exc))
 
     async def execute(self, request: AgentRequest) -> AgentResponse:
         """Route to the correct Bodega Intelligence API based on sub_agent hint."""
@@ -70,7 +106,7 @@ class WebAgent(BaseAgent):
         30-day timeseries and includes it as a CSV-formatted block so that a
         downstream CodeAgent can plot it directly without re-fetching.
         """
-        ticker = self._extract_ticker(query)
+        ticker = await self._extract_ticker(query)
 
         if ticker:
             raw = await self._intel.market_data(ticker)
@@ -108,13 +144,21 @@ class WebAgent(BaseAgent):
             correlation_id=request.correlation_id,
         )
 
-    def _extract_ticker(self, query: str) -> str | None:
-        """Extract a ticker symbol from the query (e.g. NVDA, AAPL, TSLA)."""
-        # Explicit all-caps ticker: NVDA, AAPL, TSLA, MSFT etc.
+    async def _extract_ticker(self, query: str) -> str | None:
+        """Extract a ticker symbol from the query, with LLM+web as a smart fallback.
+
+        Resolution order:
+        1. Regex — explicit all-caps ticker already in the query (e.g. "NVDA earnings").
+        2. Known name→ticker map — fast lookup for common companies.
+        3. Web search + LLM — for unknown companies like DoorDash, Palantir, Carvana, etc.
+           Queries Brave for "{query} stock ticker symbol", asks the LLM to extract it.
+           This lets users write "DoorDash price" and still get DASH resolved correctly.
+        """
+        # Fast path 1: explicit all-caps ticker: NVDA, AAPL, TSLA, MSFT etc.
         match = re.search(r'\b([A-Z]{2,5})\b', query)
         if match:
             return match.group(1)
-        # Known name→ticker map for common queries
+        # Fast path 2: known name→ticker map for common queries
         name_map = {
             "nvidia": "NVDA", "apple": "AAPL", "microsoft": "MSFT",
             "google": "GOOGL", "alphabet": "GOOGL", "amazon": "AMZN",
@@ -125,7 +169,53 @@ class WebAgent(BaseAgent):
         for name, ticker in name_map.items():
             if name in query_lower:
                 return ticker
-        return None
+        # Slow path 3: web search + LLM resolution for unknown company names
+        return await self._resolve_ticker_via_web(query)
+
+    async def _resolve_ticker_via_web(self, query: str) -> str | None:
+        """Use a quick web search + LLM to resolve a company name to a stock ticker.
+
+        Example: "DoorDash price" → search "DoorDash stock ticker symbol"
+                 → LLM reads snippets → returns "DASH"
+
+        The LLM is kept deliberately constrained (max_tokens=10, temperature=0.0) so
+        this is a near-instant lookup rather than a full synthesis pass.
+        """
+        if self._bodega is None:
+            return None
+        try:
+            raw = await self._intel.web_search(
+                f"{query} stock ticker symbol", count=3
+            )
+            results = raw.get("web", {}).get("results", [])[:3]
+            if not results:
+                return None
+
+            snippets = "\n".join(
+                f"- {r.get('title', '')}: {r.get('description', '')[:150]}"
+                for r in results
+            )
+            prompt = (
+                f'Query: "{query}"\n\n'
+                f"Web search results:\n{snippets}\n\n"
+                f"What is the stock ticker symbol for the company in this query? "
+                f"Reply with ONLY the ticker (e.g. AAPL, TSLA, DASH). "
+                f'If no ticker can be determined, reply with "NONE".'
+            )
+            ticker_raw = await self._bodega.chat_simple(
+                prompt=prompt,
+                system="You are a financial assistant. Extract stock ticker symbols from text.",
+                temperature=0.0,
+                max_tokens=10,
+            )
+            ticker = ticker_raw.strip().upper().split()[0] if ticker_raw else ""
+            if re.match(r'^[A-Z]{1,5}$', ticker) and ticker != "NONE":
+                logger.info("ticker_resolved_via_web", query=query, ticker=ticker)
+                return ticker
+            return None
+        except Exception as exc:
+            logger.warning("ticker_web_resolve_failed", query=query, error=str(exc))
+            return None
 
     def _format_market_data(self, raw: dict, ticker: str) -> str:
         """Turn market_data API response into a clean summary string."""
@@ -190,36 +280,138 @@ class WebAgent(BaseAgent):
 
     # ── News ──────────────────────────────────────────────────────────────
 
+    async def _enrich_with_browser(
+        self,
+        extracted: list[ExtractedContent],
+        max_attempts: int = 2,
+    ) -> list[ExtractedContent]:
+        """Retry failed trafilatura extractions with a headless BrowserAgent.
+
+        At most ``max_attempts`` browser scrapes are performed to keep
+        latency bounded.  The BrowserAgent is always instantiated with
+        ``interactive=False`` — no headed window or terminal prompt is ever
+        shown in automated contexts.
+        """
+        attempts = 0
+        result = list(extracted)
+        for i, item in enumerate(result):
+            if attempts >= max_attempts:
+                break
+            if not item.text or item.method in ("unavailable", "failed"):
+                raw_text: str | None = await self._browser.scrape(item.url)
+                if raw_text:
+                    text = raw_text[:3_000]
+                    result[i] = ExtractedContent(
+                        url=item.url,
+                        text=text,
+                        word_count=len(text.split()),
+                        method="browser",
+                    )
+                    attempts += 1
+                    logger.debug(
+                        "browser_enrich_success",
+                        url=item.url,
+                        chars=len(text),
+                    )
+        return result
+
     async def _fetch_news(self, query: str, request: AgentRequest) -> AgentResponse:
-        """Fetch news articles for the query, then synthesize with LLM."""
-        # Use QueryStrategist to potentially refine the news query
+        """Fetch news for the query using two parallel sources, then synthesize.
+
+        Sources:
+        1. News API  (/api/v1/news/…/search)  — recent articles with structured metadata.
+        2. Beru web  (/api/v1/beru/search/web) — Google/Brave/Bing; catches analysis,
+           opinion pieces, and blog posts that the news feed misses.
+
+        Both calls run concurrently.  URLs from both are deduplicated and fed into
+        the same content-extraction + synthesis pipeline so the LLM always has the
+        richest available source material.
+        """
         strategies = await self._strategist.strategize(
             query, context={"sub_agent": "news"}
         )
-        # Use the first strategy's query for news lookup
         search_query = strategies[0].get("query", query)
 
-        raw = await self._intel.news_search(search_query, period="3d", max_results=7)
-        if "error" in raw:
-            return AgentResponse(
-                agent=self.name, success=False,
-                error=f"News API error: {raw['error']}",
-                correlation_id=request.correlation_id,
-            )
+        # ── Fan out to news API + beru web search in parallel ─────────────────
+        news_raw, web_raw = await asyncio.gather(
+            self._intel.news_search(search_query, period="3d", max_results=7),
+            self._intel.web_search(f"{search_query} {today_str()}", count=6),
+            return_exceptions=True,
+        )
 
-        articles = raw.get("articles", [])
-        summary = await self._synthesizer.synthesize_news(query, articles)
+        # Treat exceptions as empty results — never let one source kill the whole path
+        if isinstance(news_raw, Exception):
+            logger.warning("news_api_failed", error=str(news_raw))
+            news_raw = {}
+        if isinstance(web_raw, Exception):
+            logger.warning("web_search_for_news_failed", error=str(web_raw))
+            web_raw = {}
+
+        articles = news_raw.get("articles", [])
+        web_results = web_raw.get("web", {}).get("results", [])
+
+        # ── Collect and deduplicate URLs ──────────────────────────────────────
+        seen: set[str] = set()
+        combined_urls: list[str] = []
+
+        for a in articles:
+            u = a.get("url") or a.get("link") or a.get("href", "")
+            if u and u not in seen:
+                seen.add(u)
+                combined_urls.append(u)
+        for r in web_results:
+            u = r.get("url", "")
+            if u and u not in seen:
+                seen.add(u)
+                combined_urls.append(u)
+
+        if combined_urls:
+            extracted = await self._extractor.extract_batch(combined_urls, top_n=6)
+            extracted = await self._enrich_with_browser(extracted)
+            usable = [
+                a for a in extracted
+                if a.text and a.method not in ("unavailable", "failed")
+            ]
+            if usable:
+                await self._store_pages(usable)
+                summary = await self._synthesizer.synthesize_with_content(query, usable)
+                return AgentResponse(
+                    agent=self.name, success=True,
+                    output=summary, data={"news": news_raw, "web": web_raw},
+                    correlation_id=request.correlation_id,
+                )
+
+        # Fallback: snippet-based synthesis from whatever we got
+        logger.info(
+            "news_extraction_fallback_to_summaries",
+            query=query,
+            n_articles=len(articles),
+            n_web=len(web_results),
+        )
+        if articles:
+            summary = await self._synthesizer.synthesize_news(query, articles)
+        elif web_results:
+            summary = await self._synthesizer.synthesize_search(query, web_results)
+        else:
+            summary = f"No results found for '{query}'."
 
         return AgentResponse(
             agent=self.name, success=True,
-            output=summary, data=raw,
+            output=summary, data={"news": news_raw, "web": web_raw},
             correlation_id=request.correlation_id,
         )
 
     # ── Web Search ────────────────────────────────────────────────────────
 
     async def _fetch_search(self, query: str, request: AgentRequest) -> AgentResponse:
-        """General web search via Beru/Brave, with multi-variation strategy + LLM synthesis."""
+        """General web search via Beru/Brave, with multi-variation strategy + LLM synthesis.
+
+        Extraction cascade:
+        1. trafilatura (ContentExtractor) on result URLs — fast, quiet.
+        2. Headless BrowserAgent on any failed URLs (max 2 retries).
+        3. synthesize_with_content() if any usable text was extracted.
+        4. Fallback to synthesize_search() with snippets if all extraction fails.
+        """
         # Generate 2-3 search variations
         strategies = await self._strategist.strategize(query)
 
@@ -238,6 +430,27 @@ class WebAgent(BaseAgent):
         if not results:
             results = raw.get("discussions", {}).get("results", [])
 
+        # ── Deep content extraction ───────────────────────────────────────────
+        urls = [r.get("url", "") for r in results if r.get("url")]
+
+        if urls:
+            extracted = await self._extractor.extract_batch(urls, top_n=5)
+            extracted = await self._enrich_with_browser(extracted)
+            usable = [
+                a for a in extracted
+                if a.text and a.method not in ("unavailable", "failed")
+            ]
+            if usable:
+                await self._store_pages(usable)
+                summary = await self._synthesizer.synthesize_with_content(query, usable)
+                return AgentResponse(
+                    agent=self.name, success=True,
+                    output=summary, data=raw,
+                    correlation_id=request.correlation_id,
+                )
+
+        # Fallback: snippet-based synthesis (original behaviour)
+        logger.info("search_extraction_fallback_to_snippets", query=query, n_results=len(results))
         summary = await self._synthesizer.synthesize_search(query, results)
         return AgentResponse(
             agent=self.name, success=True,

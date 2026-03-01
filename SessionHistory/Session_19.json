@@ -1,0 +1,102 @@
+{
+  "session": 19,
+  "date": "2026-02-28",
+  "title": "Testing Overhaul + Domain Pipelines + ResearchSynthesizer",
+  "status": "complete",
+  "started_at": "2026-02-28T00:00:00Z",
+  "completed_at": "2026-02-28T23:59:00Z",
+
+  "goals": [
+    "Pillar 1 — Testing Overhaul: restructure test directory + add timeout/cancellation coverage",
+    "Pillar 2 — Rolling Synthesis: build ResearchSynthesizer + wire CLI report command",
+    "Pillar 3 — Domain Pipelines: keyword-based multi-node DAG templates (no LLM round-trip)"
+  ],
+
+  "deliverables": {
+    "test_count": "357 (was 285 — +72 new tests)",
+    "new_files": [
+      "tests/unit/test_osa/test_orchestrator_timeouts.py  — 11 timeout/cancellation tests",
+      "tests/unit/test_osa/test_domain_pipelines.py       — 36 domain pipeline tests",
+      "tests/unit/test_tools/test_bodega_inference.py     — 3 fresh-client/cancellation tests",
+      "tests/unit/test_research/test_synthesizer.py       — 27 ResearchSynthesizer tests",
+      "octane/osa/domain_pipelines.py                     — 4 domain pipeline templates",
+      "octane/research/synthesizer.py                     — ResearchSynthesizer class"
+    ],
+    "modified_files": [
+      "octane/osa/orchestrator.py       — extracted _EVAL_CHUNK_TIMEOUT / _EVAL_ACLOSE_TIMEOUT constants",
+      "octane/osa/dag_planner.py        — wired domain pipelines before LLM (Step 1)",
+      "octane/main.py                   — research report command upgraded (--cycles, --since, --export)",
+      "tests/unit/test_agents.py        — moved from tests/test_agents.py (285 tests preserved)"
+    ],
+    "directory_changes": [
+      "tests/unit/         — all existing + new unit tests",
+      "tests/integration/  — skeleton with skip guard (OCTANE_TEST_INTEGRATION=1)",
+      "tests/e2e/          — skeleton with skip guard (OCTANE_TEST_E2E=1)",
+      "tests/conftest.py   — root markers: requires_integration, requires_e2e, requires_bodega",
+      "tests/unit/conftest.py — MockBodega, MockBodegaSlowStream, MockBodegaHanging fixtures"
+    ]
+  },
+
+  "test_results": {
+    "passed": 357,
+    "failed": 0,
+    "warnings": 2,
+    "runtime_seconds": 220
+  },
+
+  "pillar_1_testing_overhaul": {
+    "status": "complete",
+    "changes": [
+      "Restructured tests/ into unit/ | integration/ | e2e/ hierarchy",
+      "Root + subdirectory conftest.py files with skip guards",
+      "MockBodega, MockBodegaSlowStream, MockBodegaHanging in unit/conftest.py",
+      "_EVAL_CHUNK_TIMEOUT and _EVAL_ACLOSE_TIMEOUT extracted from orchestrator.py for monkeypatching",
+      "11 orchestrator timeout/cancellation tests with 0.05s patched timeouts",
+      "3 bodega_inference fresh-client and cancellation tests"
+    ]
+  },
+
+  "pillar_2_rolling_synthesis": {
+    "status": "complete",
+    "changes": [
+      "octane/research/synthesizer.py: ResearchSynthesizer.generate(task_id, cycles, since)",
+      "LLM synthesis via bodega.chat_simple() with <think> block stripping",
+      "Plain text fallback when Bodega unavailable",
+      "Text compression pipeline for very large finding sets (>6000 chars)",
+      "cycles=0 handled correctly (returns empty filter message)",
+      "since= filter with naive/aware datetime normalization",
+      "CLI: research report command upgraded with --cycles, --since, --export flags",
+      "CLI: now uses ResearchSynthesizer instead of web.Synthesizer",
+      "27 unit tests covering all code paths"
+    ]
+  },
+
+  "pillar_3_domain_pipelines": {
+    "status": "complete",
+    "changes": [
+      "octane/osa/domain_pipelines.py: 4 pipeline templates",
+      "investment_analysis: 2 parallel (web_finance + web_news)",
+      "comparative_analysis: 3 nodes (fetch_A + fetch_B + code_compare with deps)",
+      "content_creation: 3 nodes (web_search + web_news parallel + code_write)",
+      "deep_research: 5 nodes (4 web angles + memory_recall, all parallel)",
+      "match_domain(): keyword scoring, priority tie-breaking, _MIN_SCORE guard",
+      "Fixed _COMPARE_RE and _COMPARE_RE2 patterns (was broken by {1,30?} syntax)",
+      "DAGPlanner.plan() now tries domain pipeline before LLM (lazy import)",
+      "36 unit tests covering all pipelines, variable extractors, and DAGPlanner integration"
+    ]
+  },
+
+  "bugs_fixed": [
+    "BUG-19-1: _COMPARE_RE / _COMPARE_RE2 used invalid Python regex quantifier syntax {1,30?} (inside char class instead of alternation) — rewrote with explicit group repetition",
+    "BUG-19-2: test_orchestrator_timeouts: router.get_agent('memory') returned MagicMock not AsyncMock — fixed by patching _get_memory_agent=None in all 10 affected tests",
+    "BUG-19-3: ResearchSynthesizer cycles=0 skipped slice (0 > 0 = False) — fixed to use conditional slice",
+    "BUG-19-4: SlowStreamContext missing __init__(**kwargs) — BodegaInferenceClient passes kwargs to httpx.AsyncClient constructor"
+  ],
+
+  "pending_for_session_20": [
+    "Fix '0 chunks embedded' — root cause analysis (pgvector extension, embeddings table creation)",
+    "tests/integration/test_research_pipeline.py — with OCTANE_TEST_INTEGRATION=1",
+    "Embedding source_id type consistency (int vs UUID in research_findings table)",
+    "Session_19.json creation (this file)"
+  ]
+}

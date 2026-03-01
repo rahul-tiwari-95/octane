@@ -8,14 +8,19 @@ Falls back to single-variation passthrough if LLM is unavailable.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 
 import structlog
 
+from octane.tools.topology import ModelTier
 from octane.utils.clock import month_year, today_str
 
 logger = structlog.get_logger().bind(component="web.query_strategist")
+
+# Sentinel: distinguish "use default BodegaRouter" from "explicitly no LLM"
+_UNSET = object()
 
 _STRATEGIST_SYSTEM_BASE = """\
 You are a search query optimizer. Given a user query, return a JSON array of \
@@ -52,7 +57,10 @@ class QueryStrategist:
     Without LLM: returns a single strategy using keyword-based API selection.
     """
 
-    def __init__(self, bodega=None) -> None:
+    def __init__(self, bodega=_UNSET) -> None:
+        if bodega is _UNSET:
+            from octane.tools.bodega_router import BodegaRouter
+            bodega = BodegaRouter()
         self._bodega = bodega
 
     async def strategize(
@@ -86,11 +94,15 @@ class QueryStrategist:
 
         prompt = f'Today is {today_str()} ({month_year()}).\nQuery: "{query}"{context_hint}\n\nGenerate 2-3 search variations.'
 
-        raw = await self._bodega.chat_simple(
-            prompt=prompt,
-            system=_STRATEGIST_SYSTEM_BASE,
-            temperature=0.3,
-            max_tokens=1024,  # reasoning models burn 300-800 tokens on <think> before emitting JSON
+        raw = await asyncio.wait_for(
+            self._bodega.chat_simple(
+                prompt=prompt,
+                system=_STRATEGIST_SYSTEM_BASE,
+                tier=ModelTier.FAST,
+                temperature=0.3,
+                max_tokens=1024,  # reasoning models burn 300-800 tokens on <think> before emitting JSON
+            ),
+            timeout=10.0,  # strategist runs before URL fetching; cap to 10 s
         )
 
         # Extract content after </think> block — preserve reasoning as debug log
