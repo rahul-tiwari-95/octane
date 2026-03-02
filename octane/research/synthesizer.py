@@ -26,6 +26,8 @@ if TYPE_CHECKING:
     from octane.research.models import ResearchFinding
     from octane.research.store import ResearchStore
 
+from octane.tools.topology import ModelTier
+
 logger = structlog.get_logger().bind(component="research.synthesizer")
 
 # Max characters of findings text sent to LLM in a single prompt.
@@ -137,6 +139,7 @@ class ResearchSynthesizer:
             result = await self._bodega.chat_simple(
                 prompt=prompt,
                 system=_SYNTHESIS_SYSTEM,
+                tier=ModelTier.REASON,   # final narrative synthesis → deep model
                 temperature=0.3,
                 max_tokens=max_tokens,
             )
@@ -161,6 +164,7 @@ class ResearchSynthesizer:
             compressed = await self._bodega.chat_simple(
                 prompt=compress_prompt,
                 system="You are a research editor. Compress information faithfully.",
+                tier=ModelTier.MID,   # compression: mid-tier sufficient
                 temperature=0.1,
                 max_tokens=800,
             )

@@ -204,14 +204,47 @@ class PgClient:
             self.vector_enabled = False
 
         # ── Session 18A: structured storage schema ─────────────────────────
+        # Execute in two passes so a missing pgVector extension never prevents
+        # the non-vector tables (projects, web_pages, artifacts, etc.) from
+        # being created.  The embeddings table (vector(384) type) is applied
+        # separately only when vector_enabled=True.
         try:
             import os
             schema_path = os.path.join(os.path.dirname(__file__), "schema.sql")
             with open(schema_path) as f:
-                ddl = f.read()
+                full_ddl = f.read()
+
+            # ── Pass 1: all tables except the vector-dependent embeddings block ──
+            _EMBED_MARKER = "-- ── embeddings"
+            if _EMBED_MARKER in full_ddl:
+                base_ddl, _, embeddings_tail = full_ddl.partition(_EMBED_MARKER)
+            else:
+                base_ddl, embeddings_tail = full_ddl, ""
+
+            # Strip the CREATE EXTENSION line — already handled above with
+            # its own error handling that sets self.vector_enabled correctly.
+            base_ddl_clean = "\n".join(
+                line for line in base_ddl.splitlines()
+                if "CREATE EXTENSION" not in line
+            )
+
             async with self._pool.acquire() as conn:
-                await conn.execute(ddl)
+                await conn.execute(base_ddl_clean)
             logger.info("pg_schema_ready", table="structured_storage_18a")
+
+            # ── Pass 2: embeddings table (pgVector required) ──────────────────
+            if self.vector_enabled and embeddings_tail:
+                try:
+                    embeddings_ddl = _EMBED_MARKER + embeddings_tail
+                    async with self._pool.acquire() as conn:
+                        await conn.execute(embeddings_ddl)
+                    logger.info("pg_schema_ready", table="embeddings")
+                except Exception as exc_vec:
+                    # If the embeddings table DDL fails (e.g. IVFFlat index
+                    # requires data), degrade gracefully — embeddings disabled.
+                    self.vector_enabled = False
+                    logger.warning("pg_embeddings_schema_error", error=str(exc_vec))
+
         except Exception as exc:
             logger.warning("pg_schema_18a_error", error=str(exc))
 

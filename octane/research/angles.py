@@ -34,6 +34,8 @@ import re
 
 import structlog
 
+from octane.tools.topology import ModelTier
+
 logger = structlog.get_logger().bind(component="research.angles")
 
 # Depth → number of angles
@@ -114,6 +116,7 @@ class AngleGenerator:
         raw = await self._bodega.chat_simple(
             prompt=prompt,
             system=_ANGLE_SYSTEM,
+            tier=ModelTier.MID,   # angle generation: richer than FAST, cheaper than REASON
             max_tokens=600,
             temperature=0.4,
         )

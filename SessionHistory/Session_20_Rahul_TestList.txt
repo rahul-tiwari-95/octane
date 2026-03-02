@@ -1,0 +1,304 @@
+================================================================================
+  OCTANE — SESSION 20 MANUAL TEST LIST
+  Tester: Rahul
+  Date:   March 2026
+  Build:  475 tests passing (Sprint 20 complete)
+================================================================================
+
+INSTRUCTIONS
+------------
+Work through each section top to bottom.
+Mark each item: [PASS] [FAIL] [SKIP] [NOTE: ...]
+If something fails, write the error below the line and we'll fix it in Session 21.
+Run everything from the /Users/rahul/octane directory using the oct_env Python.
+
+  Activate env:   source sandbox/oct_env/bin/activate
+  Python direct:  sandbox/oct_env/bin/python
+  CLI:            sandbox/oct_env/bin/octane  (or: python -m octane)
+
+================================================================================
+SECTION 1 — BASIC CLI SMOKE
+================================================================================
+
+[ ] 1.1  octane version
+         Expected: something like "Octane v0.x.x"
+
+[ ] 1.2  octane --help
+         Expected: all commands listed (health, ask, chat, agents, trace, research, workflow)
+
+[ ] 1.3  octane agents
+         Expected: lists web, code, memory, sysstat, pnl (5 agents, sub-agents visible)
+
+[ ] 1.4  octane health
+         Expected: RAM %, CPU %, Bodega status (ok or unreachable — both are fine),
+                   model loaded or "no model" note
+
+================================================================================
+SECTION 2 — SINGLE-TURN ASK (requires Bodega running on :44468)
+================================================================================
+
+[ ] 2.1  octane ask "what is the stock price of NVDA"
+         Expected: routes to web/finance, returns some output
+         Watch for: Decomposer source (llm or keyword_fallback), agent used
+
+[ ] 2.2  octane ask "latest news about Apple"
+         Expected: routes to web/news, synthesized news output
+
+[ ] 2.3  octane ask "what is a transformer model"
+         Expected: routes to web/search, synthesis of search results
+
+[ ] 2.4  octane ask "write a python function to reverse a string"
+         Expected: routes to code, returns working code
+
+[ ] 2.5  octane ask "check system health"
+         Expected: routes to sysstat, returns CPU/RAM/model info
+
+[ ] 2.6  octane ask "compare Tesla and Rivian stocks"
+         Expected: multi-node DAG (comparative_analysis domain pipeline),
+                   two parallel fetch nodes + code_compare node
+         Watch for: decomposition_complete event showing nodes > 1
+
+[ ] 2.7  octane ask "give me an investment analysis of Microsoft"
+         Expected: investment_analysis domain pipeline (web_finance + web_news parallel)
+
+[ ] 2.8  octane ask "deep research on quantum computing"
+         Expected: deep_research pipeline (4 web angles parallel + memory_recall)
+
+NOTES ON SECTION 2:
+- If Bodega is not running, Decomposer falls back to keyword heuristics (still works)
+- If Bodega IS running: check that the LLM chose a sensible template
+- Check the tier routing: fast/mid/reason should show in debug logs if --verbose is set
+
+================================================================================
+SECTION 3 — MULTI-TURN CHAT
+================================================================================
+
+[ ] 3.1  octane chat  (start interactive session)
+         Turn 1: "What is NVDA?"
+         Turn 2: "What about AMD?"
+         Turn 3: "Compare those two"
+         Expected: session_id maintained, Turn 3 shows awareness of prior context
+
+[ ] 3.2  In the same chat session:
+         Ask something that triggers memory recall, e.g. "what did we just talk about?"
+         Expected: memory agent is queried, prior context injected
+
+[ ] 3.3  Exit the chat session cleanly (Ctrl+C or "exit")
+         Expected: no crash, clean terminal return
+
+================================================================================
+SECTION 4 — BODEGA ROUTER (standalone Python, not CLI)
+================================================================================
+
+Run these in a Python REPL: sandbox/oct_env/bin/python
+
+[ ] 4.1  Test BodegaRouter creates correctly:
+         ----------------------------------------
+         from octane.tools.bodega_router import BodegaRouter
+         from octane.tools.topology import ModelTier
+         router = BodegaRouter()
+         print(router._topology)
+         ----------------------------------------
+         Expected: prints a Topology object (compact/balanced/power based on env)
+
+[ ] 4.2  Test tier resolution:
+         ----------------------------------------
+         config = router.resolve_config(ModelTier.FAST)
+         print(config.model_id, config.max_concurrency)
+         config = router.resolve_config(ModelTier.REASON)
+         print(config.model_id, config.context_length)
+         ----------------------------------------
+         Expected: FAST and REASON use different model_ids
+
+[ ] 4.3  Test QueryStrategist standalone (with Bodega running):
+         ----------------------------------------
+         from octane.agents.web.query_strategist import QueryStrategist
+         import asyncio
+         qs = QueryStrategist()   # should create BodegaRouter automatically
+         result = asyncio.run(qs.strategize("NVDA stock price"))
+         print(result)
+         ----------------------------------------
+         Expected: list of query dicts with api/query/rationale keys
+         If Bodega down: should either error gracefully or return fallback
+
+[ ] 4.4  Test Evaluator standalone with tier visible:
+         ----------------------------------------
+         from octane.osa.evaluator import Evaluator
+         from octane.models.schemas import AgentResponse
+         import asyncio
+         ev = Evaluator()   # BodegaRouter auto-created
+         results = [AgentResponse(agent="web", output="NVDA is up 5%", success=True)]
+         out = asyncio.run(ev.evaluate("What is NVDA doing?", results))
+         print(out)
+         ----------------------------------------
+         Expected: synthesized answer using REASON tier model
+
+[ ] 4.5  Test Decomposer standalone:
+         ----------------------------------------
+         from octane.osa.decomposer import Decomposer
+         import asyncio
+         dec = Decomposer()
+         dag = asyncio.run(dec.decompose("NVDA stock price"))
+         print(dag.nodes[0].metadata)
+         ----------------------------------------
+         Expected: metadata shows template=web_finance, source=llm (or keyword_fallback if no Bodega)
+
+================================================================================
+SECTION 5 — TOPOLOGY & MODEL LOADING
+================================================================================
+
+[ ] 5.1  Check topology names:
+         ----------------------------------------
+         from octane.tools.topology import compact, balanced, power
+         print("compact FAST:", compact.models["fast"].model_id)
+         print("balanced REASON context:", balanced.models["reason"].context_length)
+         print("power MID:", power.models["mid"].model_id)
+         ----------------------------------------
+         Expected: different model configs per topology, power has bodega-raptor-1b for MID
+
+[ ] 5.2  Check to_load_params():
+         ----------------------------------------
+         from octane.tools.topology import balanced, ModelTier
+         cfg = balanced.models[ModelTier.REASON]
+         print(cfg.to_load_params())
+         ----------------------------------------
+         Expected: dict with model_path, context_length=32768, max_concurrency, draft_model_path
+         Should NOT contain None or 0 values
+
+[ ] 5.3  If Bodega is running, test ensure_topology_loaded():
+         ----------------------------------------
+         from octane.agents.sysstat.model_manager import ModelManager
+         from octane.tools.topology import compact
+         import asyncio
+         mm = ModelManager()
+         result = asyncio.run(mm.ensure_topology_loaded(compact))
+         print(result)
+         ----------------------------------------
+         Expected: dict keyed by tier name, each with status/model_id/max_concurrency
+         If models are already loaded: status should reflect that
+
+================================================================================
+SECTION 6 — RESEARCH PIPELINE
+================================================================================
+
+[ ] 6.1  Start a research task:
+         octane research start --query "AI chip market trends" --cycles 2
+         Expected: task_id printed, research begins running
+
+[ ] 6.2  Check research status:
+         octane research status
+         Expected: shows running/complete tasks
+
+[ ] 6.3  Generate a report:
+         octane research report --cycles 2
+         Expected: synthesized multi-cycle report (checks ResearchSynthesizer)
+
+[ ] 6.4  Check "0 chunks embedded" issue (KNOWN-20-1):
+         After a research cycle completes, run:
+         octane research report
+         Expected: if findings exist, they should appear in the report
+         KNOWN BUG: Some setups show "0 chunks embedded" — note if this happens
+
+================================================================================
+SECTION 7 — TRACE & WORKFLOW
+================================================================================
+
+[ ] 7.1  After running octane ask in Section 2:
+         octane trace
+         Expected: shows the most recent Synapse trace with events:
+                   ingress → guard → decomposition_complete → dispatch → egress
+
+[ ] 7.2  octane workflow list
+         Expected: lists any saved DAGs / workflows
+
+[ ] 7.3  octane workflow export  (if any workflow exists)
+         Expected: exports DAG as JSON
+
+================================================================================
+SECTION 8 — EDGE CASES & STRESS
+================================================================================
+
+[ ] 8.1  octane ask ""  (empty query)
+         Expected: graceful error message, no crash
+
+[ ] 8.2  octane ask "aaaaaaaaaaaaa" (gibberish)
+         Expected: defaults to web_search, some response, no crash
+
+[ ] 8.3  Very long query:
+         octane ask "explain in extreme detail the entire history of semiconductor manufacturing from 1960 to present including all major companies and breakthroughs"
+         Expected: routes correctly, LLM handles it without crash
+
+[ ] 8.4  Rapid-fire: run octane ask 3 times back to back quickly
+         Expected: no state leakage, each query independent
+
+[ ] 8.5  Kill Bodega mid-request (if testing with live Bodega):
+         Start octane ask, then kill Bodega process
+         Expected: graceful fallback, no hanging indefinitely
+
+================================================================================
+SECTION 9 — TEST SUITE CONFIRMATION
+================================================================================
+
+[ ] 9.1  Run the full test suite:
+         sandbox/oct_env/bin/python -m pytest -q
+         Expected: 475 passed, 0 failed
+
+[ ] 9.2  Run just the new E2E tests:
+         sandbox/oct_env/bin/python -m pytest tests/e2e/ -v
+         Expected: 37 passed (24 tier wiring + 13 OSA pipeline)
+
+[ ] 9.3  Run with verbose output to see all test names:
+         sandbox/oct_env/bin/python -m pytest tests/e2e/ -v --tb=short
+
+================================================================================
+BUGS FOUND DURING TESTING (fill in as you go)
+================================================================================
+
+BUG-RAHUL-1:
+  Location:
+  Steps to reproduce:
+  Error message:
+  Severity: [critical / major / minor]
+
+BUG-RAHUL-2:
+  Location:
+  Steps to reproduce:
+  Error message:
+  Severity:
+
+BUG-RAHUL-3:
+  Location:
+  Steps to reproduce:
+  Error message:
+  Severity:
+
+(add more as needed)
+
+================================================================================
+THOUGHTS / OBSERVATIONS (things that work but feel off)
+================================================================================
+
+THOUGHT-1:
+
+THOUGHT-2:
+
+THOUGHT-3:
+
+================================================================================
+SIGN-OFF
+================================================================================
+
+Tester: Rahul
+Date tested:
+Octane build: 475 tests
+Bodega available during test: [YES / NO]
+Postgres available during test: [YES / NO]
+
+Overall status: [ ] GOOD TO GO FOR SESSION 21   [ ] NEEDS FIXES FIRST
+
+Session 21 priority bugs:
+1.
+2.
+3.
+
+================================================================================

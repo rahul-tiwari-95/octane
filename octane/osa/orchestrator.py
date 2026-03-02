@@ -42,6 +42,7 @@ from octane.osa.guard import Guard
 from octane.osa.hil_manager import HILManager
 from octane.osa.checkpoint_manager import CheckpointManager
 from octane.tools.bodega_inference import BodegaInferenceClient
+from octane.tools.bodega_router import BodegaRouter
 
 logger = structlog.get_logger().bind(component="osa")
 
@@ -58,7 +59,11 @@ class Orchestrator:
 
     def __init__(self, synapse: SynapseEventBus, hil_interactive: bool = False) -> None:
         self.synapse = synapse
-        self.bodega = BodegaInferenceClient()
+        # BodegaRouter wraps BodegaInferenceClient and adds tier-aware routing.
+        # It exposes health() / current_model() via delegation so pre_flight()
+        # works unchanged.  Sub-agents (Decomposer, Evaluator, Router agents)
+        # receive the router and will apply the correct ModelTier per call.
+        self.bodega = BodegaRouter()
         self.decomposer = Decomposer(bodega=self.bodega)
         self.router = Router(synapse, bodega=self.bodega)
         self.evaluator = Evaluator(bodega=self.bodega)
@@ -351,6 +356,7 @@ class Orchestrator:
         query: str,
         session_id: str = "cli",
         conversation_history: list[dict[str, str]] | None = None,
+        extra_metadata: dict | None = None,
     ) -> AsyncIterator[str]:
         """Like run(), but streams Evaluator tokens as they arrive.
 
@@ -454,12 +460,14 @@ class Orchestrator:
                     instruction, upstream_results = _inject_upstream_data(
                         node, accumulated, dag.original_query
                     )
+                    # Merge extra_metadata (e.g. {"deep": True}) into node metadata
+                    merged_metadata = {**node.metadata, **(extra_metadata or {})}
                     task_request = AgentRequest(
                         query=instruction,
                         correlation_id=correlation_id,
                         session_id=session_id,
                         source="osa",
-                        metadata=node.metadata,
+                        metadata=merged_metadata,
                         context={"upstream_results": upstream_results},
                     )
                     wave_requests.append((node, agent, task_request))

@@ -100,9 +100,9 @@ class QueryStrategist:
                 system=_STRATEGIST_SYSTEM_BASE,
                 tier=ModelTier.FAST,
                 temperature=0.3,
-                max_tokens=1024,  # reasoning models burn 300-800 tokens on <think> before emitting JSON
+                max_tokens=2048,  # reasoning models burn 300-1000 tokens on <think>; need headroom
             ),
-            timeout=10.0,  # strategist runs before URL fetching; cap to 10 s
+            timeout=45.0,  # 90M reasoning model can take 20-30s on first inference
         )
 
         # Extract content after </think> block — preserve reasoning as debug log

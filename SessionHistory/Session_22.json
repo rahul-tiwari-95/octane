@@ -1,0 +1,93 @@
+{
+  "session": 22,
+  "title": "Iterative Query Deepening, --deep Flag, QueryStrategist Fix",
+  "date": "2026-03-02",
+  "tests_start": 499,
+  "tests_end": 521,
+  "tests_added": 22,
+  "status": "complete",
+
+  "summary": "Three user-facing issues addressed: (1) llm_strategize_failed bug root-caused and fixed — max_tokens=1024 was too small for the 90M reasoning model's <think> blocks, causing truncated responses with no </think> tag; (2) DepthAnalyzer built — after Round-1 search findings, a FAST-tier LLM pass generates 3-5 targeted follow-up queries and executes them in parallel, giving iterative deepening; (3) --deep flag added to octane ask to trigger multi-round deepening. 22 new tests written, 521 total.",
+
+  "bugs_fixed": [
+    {
+      "id": "BUG-22-1",
+      "title": "llm_strategize_failed — max_tokens too small for reasoning model <think> blocks",
+      "file": "octane/agents/web/query_strategist.py",
+      "severity": "high",
+      "root_cause": "QueryStrategist._llm_strategize() set max_tokens=1024 and timeout=10.0. The bodega-raptor-90M model has reasoning_parser='qwen3' so it emits <think>...</think> blocks before JSON output. When the <think> phase consumed >1024 tokens, the response was truncated with no </think> tag. The subsequent re.search(r'\\[.*\\]', clean) found nothing → ValueError raised → caught as llm_strategize_failed → keyword fallback (single query, no multi-query).",
+      "fix": "Increased max_tokens from 1024 to 2048 to give the reasoning model enough headroom for thinking tokens + JSON output. Increased timeout from 10.0s to 45.0s for first-inference cold start.",
+      "tests": [
+        "TestQueryStrategistTimeoutFix::test_max_tokens_at_least_2048",
+        "TestQueryStrategistTimeoutFix::test_timeout_at_least_30s",
+        "TestQueryStrategistTimeoutFix::test_think_block_no_close_tag_raises_value_error",
+        "TestQueryStrategistTimeoutFix::test_think_block_with_close_tag_parses_json"
+      ]
+    }
+  ],
+
+  "features_added": [
+    {
+      "id": "FEAT-22-1",
+      "title": "DepthAnalyzer — iterative follow-up query generation",
+      "file": "octane/agents/web/depth_analyzer.py",
+      "description": "New component that reads Round-1 search findings (up to 8 × 150-char excerpts), sends them to ModelTier.FAST with a research analyst prompt, and returns 3-5 targeted follow-up queries as strategy dicts. Uses the same format as QueryStrategist so results can be fanned out identically. Handles <think> block stripping, invalid api normalisation, max_followups cap, and all error paths with graceful empty-list fallback.",
+      "tests": [
+        "TestDepthAnalyzer::test_returns_empty_when_no_bodega",
+        "TestDepthAnalyzer::test_returns_empty_when_no_findings",
+        "TestDepthAnalyzer::test_parses_valid_json_followups",
+        "TestDepthAnalyzer::test_respects_max_followups_cap",
+        "TestDepthAnalyzer::test_fallback_on_llm_error",
+        "TestDepthAnalyzer::test_strips_think_block",
+        "TestDepthAnalyzer::test_invalid_api_normalised_to_search",
+        "TestDepthAnalyzer::test_uses_fast_tier"
+      ]
+    },
+    {
+      "id": "FEAT-22-2",
+      "title": "WebAgent iterative deepening (_fetch_search + _fetch_news)",
+      "file": "octane/agents/web/agent.py",
+      "description": "_fetch_search: accepts deep=True/False. When deep=True and Round-1 extraction succeeded, runs DepthAnalyzer → fans out 5 follow-up web_search calls in parallel → deduplicates URLs → extracts → merges with Round-1 content → synthesises. _fetch_news: always runs one DepthAnalyzer pass (news deepening is always valuable); deep=True runs two DepthAnalyzer passes. DepthAnalyzer injected in __init__ alongside Synthesizer and QueryStrategist.",
+      "tests": [
+        "TestWebAgentDeepMode::test_fetch_search_deep_calls_depth_analyzer",
+        "TestWebAgentDeepMode::test_fetch_search_no_deep_skips_depth_analyzer",
+        "TestWebAgentDeepMode::test_fetch_news_always_calls_depth_analyzer",
+        "TestWebAgentDeepMode::test_fetch_news_deep_runs_two_rounds"
+      ]
+    },
+    {
+      "id": "FEAT-22-3",
+      "title": "--deep flag on octane ask + Orchestrator extra_metadata propagation",
+      "files": [
+        "octane/main.py",
+        "octane/osa/orchestrator.py"
+      ],
+      "description": "octane ask now accepts --deep boolean flag. _ask() passes extra_metadata={'deep': True} to Orchestrator.run_stream(). run_stream() now accepts extra_metadata: dict | None param and merges it into each wave's AgentRequest.metadata before dispatch. WebAgent.execute() reads metadata.get('deep') and passes it to _fetch_search/_fetch_news. Console header shows '⬇ deep mode' tag when --deep is active.",
+      "tests": [
+        "TestOrchestratorExtraMetadata::test_extra_metadata_merged_into_agent_requests",
+        "TestDeepFlagWiring::test_ask_command_has_deep_option",
+        "TestDeepFlagWiring::test_ask_async_accepts_deep_param",
+        "TestDeepFlagWiring::test_run_stream_accepts_extra_metadata",
+        "TestDeepFlagWiring::test_fetch_search_accepts_deep_param",
+        "TestDeepFlagWiring::test_fetch_news_accepts_deep_param"
+      ]
+    }
+  ],
+
+  "architecture_notes": [
+    "DepthAnalyzer uses ModelTier.FAST (bodega-raptor-90M) for follow-up generation — keeps latency bounded while the REASON model (8b) is reserved for final synthesis.",
+    "News search: always does 1 deepening round; --deep adds a 2nd round (r2_rounds = 2 if deep else 1).",
+    "Web search: deepening only on --deep (not automatic) — prevents latency blowup on simple factual queries.",
+    "extra_metadata merge is additive: node.metadata always wins if both set the same key, except extra_metadata values are merged last (extra_metadata values WIN on collision — this enables --deep to override any decomposer metadata).",
+    "DepthAnalyzer findings input is capped at 8 items × 150 chars each = 1200 chars max context for the follow-up prompt — keeps inference fast on the 90M model."
+  ],
+
+  "search_behaviour_after_this_session": {
+    "normal_mode": "octane ask 'query' → QueryStrategist generates 2-3 variations → parallel web_search → URL dedup → trafilatura extraction → browser fallback → _fetch_news runs 1 DepthAnalyzer round → 3 follow-up searches → merge → REASON synthesis",
+    "deep_mode": "octane ask 'query' --deep → same as normal + 2 DepthAnalyzer rounds for news / 1 extra round for search, up to 5 follow-up queries per round → more breadth before synthesis",
+    "model_assignment": {
+      "bodega-raptor-90M (FAST)": "QueryStrategist variation generation, DepthAnalyzer follow-up generation, ticker extraction",
+      "bodega-raptor-8b (REASON)": "Final synthesis (synthesize_with_content), OSA decomposition, evaluation/streaming answer"
+    }
+  }
+}

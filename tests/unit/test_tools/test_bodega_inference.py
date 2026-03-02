@@ -194,3 +194,91 @@ async def test_chat_stream_cancellation_does_not_hang():
     # Should have received at least the first chunk before cancellation
     assert len(chunks_received) >= 1
     assert chunks_received[0] == "first chunk"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 4. current_model() uses /v1/admin/loaded-models (BUG-21-8)
+# ─────────────────────────────────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_current_model_uses_loaded_models_endpoint():
+    """current_model() must call /v1/admin/loaded-models, not /v1/admin/current-model."""
+    from octane.tools.bodega_inference import BodegaInferenceClient
+
+    mock_response = MagicMock()
+    mock_response.raise_for_status = MagicMock()
+    mock_response.json = MagicMock(return_value={
+        "object": "list",
+        "data": [
+            {"id": "bodega-raptor-8b", "status": "initialized"}
+        ],
+        "total": 1,
+    })
+
+    mock_client = AsyncMock()
+    mock_client.get = AsyncMock(return_value=mock_response)
+
+    client = BodegaInferenceClient.__new__(BodegaInferenceClient)
+    client._get_client = AsyncMock(return_value=mock_client)
+
+    result = await client.current_model()
+
+    # Verify correct endpoint called
+    mock_client.get.assert_called_once_with("/v1/admin/loaded-models")
+    # Verify normalized response
+    assert result["loaded"] is True
+    assert result["model_path"] == "bodega-raptor-8b"
+    assert result["model_info"]["model_path"] == "bodega-raptor-8b"
+    assert result["total_loaded"] == 1
+
+
+@pytest.mark.asyncio
+async def test_current_model_no_models_loaded():
+    """current_model() returns loaded=False when loaded-models data is empty."""
+    from octane.tools.bodega_inference import BodegaInferenceClient
+
+    mock_response = MagicMock()
+    mock_response.raise_for_status = MagicMock()
+    mock_response.json = MagicMock(return_value={"object": "list", "data": [], "total": 0})
+
+    mock_client = AsyncMock()
+    mock_client.get = AsyncMock(return_value=mock_response)
+
+    client = BodegaInferenceClient.__new__(BodegaInferenceClient)
+    client._get_client = AsyncMock(return_value=mock_client)
+
+    result = await client.current_model()
+
+    assert result["loaded"] is False
+    assert result["model_info"] == {}
+
+
+@pytest.mark.asyncio
+async def test_current_model_multi_model_registry():
+    """current_model() exposes all_models list and total_loaded for multi-model Bodega."""
+    from octane.tools.bodega_inference import BodegaInferenceClient
+
+    mock_response = MagicMock()
+    mock_response.raise_for_status = MagicMock()
+    mock_response.json = MagicMock(return_value={
+        "object": "list",
+        "data": [
+            {"id": "bodega-raptor-8b", "status": "initialized"},
+            {"id": "bodega-solomon-9b", "status": "initialized"},
+        ],
+        "total": 2,
+    })
+
+    mock_client = AsyncMock()
+    mock_client.get = AsyncMock(return_value=mock_response)
+
+    client = BodegaInferenceClient.__new__(BodegaInferenceClient)
+    client._get_client = AsyncMock(return_value=mock_client)
+
+    result = await client.current_model()
+
+    assert result["loaded"] is True
+    assert result["total_loaded"] == 2
+    assert result["all_models"] == ["bodega-raptor-8b", "bodega-solomon-9b"]
+    # Primary model is first entry
+    assert result["model_path"] == "bodega-raptor-8b"

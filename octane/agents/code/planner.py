@@ -19,6 +19,7 @@ import re
 import structlog
 
 from octane.tools.bodega_inference import BodegaInferenceClient
+from octane.tools.topology import ModelTier
 
 logger = structlog.get_logger().bind(component="code.planner")
 
@@ -36,8 +37,11 @@ Respond with ONLY valid JSON. No markdown fences, no prose."""
 class Planner:
     """Converts a natural language coding task into a structured spec."""
 
-    def __init__(self, bodega: BodegaInferenceClient | None = None) -> None:
-        self._bodega = bodega or BodegaInferenceClient()
+    def __init__(self, bodega=None) -> None:
+        if bodega is None:
+            from octane.tools.bodega_router import BodegaRouter
+            bodega = BodegaRouter()
+        self._bodega = bodega
 
     async def plan(self, task: str) -> dict:
         """Return a spec dict for the given task."""
@@ -54,6 +58,7 @@ class Planner:
             raw = await self._bodega.chat_simple(
                 prompt=f"Task: {task}",
                 system=_SYSTEM_PROMPT,
+                tier=ModelTier.REASON,
                 temperature=0.2,
             )
             # Strip any accidental markdown fences

@@ -101,9 +101,13 @@ async def _health():
 
             if "error" in model:
                 bodega_table.add_row("Model", f"[red]⚠ {model['error']}[/]")
+            elif not model.get("loaded"):
+                bodega_table.add_row("Model", "[yellow]no model loaded[/]")
             else:
-                model_name = model.get("model", model.get("model_path", "unknown"))
-                bodega_table.add_row("Model", f"[green]{model_name}[/]")
+                model_name = model.get("model_path", model.get("model", "unknown"))
+                total = model.get("total_loaded", 1)
+                suffix = f" [dim]({total} loaded)[/]" if total and total > 1 else ""
+                bodega_table.add_row("Model", f"[green]{model_name}[/]{suffix}")
 
             console.print(Panel(bodega_table, title="[bold magenta]🧠 Bodega Inference Engine[/]", border_style="magenta"))
 
@@ -245,12 +249,13 @@ def _print_dag_trace(trace, events, dag_nodes, dag_reason: str) -> None:
 def ask(
     query: str = typer.Argument(..., help="Your question or instruction"),
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Show DAG trace after response"),
+    deep: bool = typer.Option(False, "--deep", help="Deep mode: multi-round search with iterative query expansion"),
 ):
     """🧠 Ask Octane anything — routed through OSA."""
-    asyncio.run(_ask(query, verbose=verbose))
+    asyncio.run(_ask(query, verbose=verbose, deep=deep))
 
 
-async def _ask(query: str, verbose: bool = False):
+async def _ask(query: str, verbose: bool = False, deep: bool = False):
     from octane.osa.orchestrator import Orchestrator
 
     synapse = _get_synapse()
@@ -265,7 +270,8 @@ async def _ask(query: str, verbose: bool = False):
         # Trim long model paths for display
         if model_display and "/" in model_display:
             model_display = model_display.split("/")[-1]
-        console.print(f"[dim]🧠 {model_display} | LLM decomposition + synthesis active[/]")
+        deep_tag = " | [bold cyan]⬇ deep mode[/]" if deep else ""
+        console.print(f"[dim]🧠 {model_display} | LLM decomposition + synthesis active{deep_tag}[/]")
     elif status["bodega_reachable"]:
         console.print(f"[yellow]⚠ Bodega reachable but no model loaded — using keyword fallback[/]")
     else:
@@ -279,7 +285,8 @@ async def _ask(query: str, verbose: bool = False):
     status.start()
     full_output_parts = []
     first_token = True
-    async for chunk in osa.run_stream(query):
+    extra_meta = {"deep": True} if deep else {}
+    async for chunk in osa.run_stream(query, extra_metadata=extra_meta):
         if first_token:
             status.stop()
             console.print("[bold green]🔥 Octane:[/] ", end="")

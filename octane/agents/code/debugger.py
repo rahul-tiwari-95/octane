@@ -11,6 +11,7 @@ import re
 import structlog
 
 from octane.tools.bodega_inference import BodegaInferenceClient
+from octane.tools.topology import ModelTier
 
 logger = structlog.get_logger().bind(component="code.debugger")
 
@@ -26,8 +27,11 @@ Rules:
 class Debugger:
     """Analyzes a failed execution and rewrites the code to fix the error."""
 
-    def __init__(self, bodega: BodegaInferenceClient | None = None) -> None:
-        self._bodega = bodega or BodegaInferenceClient()
+    def __init__(self, bodega=None) -> None:
+        if bodega is None:
+            from octane.tools.bodega_router import BodegaRouter
+            bodega = BodegaRouter()
+        self._bodega = bodega
 
     async def debug(self, code: str, error_summary: str) -> str:
         """Return fixed code. Falls back to original code if LLM is unavailable."""
@@ -47,6 +51,7 @@ class Debugger:
             raw = await self._bodega.chat_simple(
                 prompt=user_msg,
                 system=_SYSTEM_PROMPT,
+                tier=ModelTier.REASON,
                 temperature=0.1,
             )
             fixed = re.sub(r"^```[a-z]*\n?", "", raw.strip(), flags=re.MULTILINE)

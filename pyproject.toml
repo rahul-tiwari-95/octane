@@ -26,6 +26,7 @@ dev = [
 ]
 full = [
     "trafilatura>=1.8",
+    "playwright>=1.40",
     "shadow-task>=0.3",
 ]
 

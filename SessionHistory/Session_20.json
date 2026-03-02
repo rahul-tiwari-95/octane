@@ -1,0 +1,152 @@
+{
+  "session": "20",
+  "sub_sessions": ["20A", "20B", "20C", "20D"],
+  "date": "2026-03-01",
+  "title": "Sprint 20 — BodegaRouter + Tier Wiring + ModelConfig + E2E Tests",
+  "status": "complete",
+  "started_at": "2026-03-01T00:00:00Z",
+  "completed_at": "2026-03-01T23:59:00Z",
+
+  "sprint_goal": "Wire every LLM call site in Octane to a model tier (FAST / MID / REASON) via BodegaRouter, rebuild the topology layer with a rich ModelConfig dataclass, and close the sprint with a complete E2E + tier-wiring test suite.",
+
+  "test_progression": {
+    "session_19_baseline": 357,
+    "session_20A_end": 373,
+    "session_20B_end": 403,
+    "session_20C_end": 438,
+    "session_20D_end": 475,
+    "net_new_tests": 118,
+    "final_passed": 475,
+    "failed": 0,
+    "warnings": 2
+  },
+
+  "session_20A": {
+    "title": "Infrastructure Hardening — DB Migration, Zombie Fix, Quality Gate, DAG Fix",
+    "status": "complete",
+    "tests_added": 16,
+    "deliverables": [
+      "DB schema migration to version '20A' (14 tables verified)",
+      "Zombie task killer in Orchestrator pre_flight (stale tasks → 'abandoned')",
+      "Quality gate on research_findings (min_quality_score filter)",
+      "Cross-angle deduplication in deep_research domain pipeline",
+      "DAG execution_order() fix for single-node graphs",
+      "Pre-cycle Bodega health check before research cycle execution",
+      "16 new unit tests covering all of the above"
+    ],
+    "bugs_fixed": [
+      "BUG-20A-1: Single-node DAG execution_order() returned empty list — fixed topological sort edge case",
+      "BUG-20A-2: Stale 'running' tasks from crashed sessions blocked new cycles — zombie killer added to pre_flight",
+      "BUG-20A-3: Research findings with quality_score=0.0 were being embedded — quality gate added"
+    ]
+  },
+
+  "session_20B": {
+    "title": "BodegaRouter Creation + Per-Agent Tier Wiring",
+    "status": "complete",
+    "tests_added": 30,
+    "deliverables": [
+      "octane/tools/bodega_router.py — BodegaRouter class with topology-aware routing",
+      "BodegaRouter.resolve_model_id(tier) → str — resolves tier to concrete model ID",
+      "BodegaRouter.chat_simple(prompt, system, tier, **kwargs) — tier-routed LLM call",
+      "BodegaRouter.chat_stream(prompt, system, tier, **kwargs) — tier-routed streaming",
+      "_UNSET sentinel pattern applied to all 4 agents (QueryStrategist, Synthesizer, Decomposer, Evaluator)",
+      "QueryStrategist._llm_strategize() → tier=ModelTier.FAST",
+      "Synthesizer.synthesize_news/search/_summarize_chunk/synthesize_full_text() → tier=ModelTier.MID",
+      "Decomposer._classify_with_llm() → tier=ModelTier.FAST",
+      "Evaluator._synthesize_with_llm() → tier=ModelTier.REASON",
+      "Evaluator.evaluate_stream() → tier=ModelTier.REASON",
+      "30 new unit tests for BodegaRouter routing logic"
+    ],
+    "architecture_decision": "Orchestrator passes raw BodegaInferenceClient to sub-agents (not BodegaRouter). The _UNSET → BodegaRouter() path is for standalone agent instantiation only. This is intentional — the Orchestrator owns the Bodega connection and injects it directly."
+  },
+
+  "session_20C": {
+    "title": "ModelConfig Dataclass + Topology Rebuild",
+    "status": "complete",
+    "tests_added": 35,
+    "deliverables": [
+      "octane/tools/topology.py — full rebuild with ModelConfig dataclass",
+      "ModelConfig fields: model_id, model_path, model_type, context_length, max_concurrency, prompt_cache_size, reasoning_parser, tool_call_parser, draft_model_path, num_draft_tokens",
+      "ModelConfig.to_load_params() → dict — serialises only non-None/non-zero fields for Bodega /admin/load",
+      "Three genuinely differentiated topologies:",
+      "  compact  — max_concurrency=1, no speculative decoding, REASON context_length=8192",
+      "  balanced — FAST/MID max_concurrency=2, REASON context_length=32768, speculative draft Qwen3-0.6B, num_draft_tokens=3",
+      "  power    — FAST max_concurrency=4, REASON max_concurrency=2, bodega-raptor-1b for MID, num_draft_tokens=5",
+      "BodegaRouter.resolve_config(tier) → ModelConfig — new method (resolve_model_id still works)",
+      "ModelManager.ensure_topology_loaded(topology) — deduplicates by model_id, passes full config.to_load_params()",
+      "tests/unit/test_tools/test_bodega_router.py rebuilt: 30 → 65 tests"
+    ]
+  },
+
+  "session_20D": {
+    "title": "E2E Tier Wiring Tests + OSA Pipeline Smoke Tests",
+    "status": "complete",
+    "tests_added": 37,
+    "deliverables": [
+      "tests/e2e/test_e2e_tier_wiring.py — 24 tests",
+      "tests/e2e/test_e2e_osa_pipeline.py — 13 tests"
+    ],
+    "tier_wiring_tests": {
+      "QueryStrategist": ["routes to FAST", "never routes to REASON"],
+      "Synthesizer": ["all 4 call sites use MID", "never routes to FAST", "multi-call site aggregate check"],
+      "Decomposer": ["routes to FAST via decompose()", "source=llm confirmed in DAG metadata", "keyword fallback when bodega=None"],
+      "Evaluator": ["evaluate() uses REASON", "evaluate_stream() uses REASON", "fallback concatenation when bodega=None"],
+      "Cross-agent": ["tier sets are non-overlapping", "tier string values documented and immutable"],
+      "_UNSET sentinel": ["all 4 agents create BodegaRouter() by default", "explicit None disables LLM on all 4 agents"]
+    },
+    "osa_pipeline_tests": {
+      "smoke": ["run() returns non-empty string", "run_stream() yields chunks and closes cleanly"],
+      "synapse_events": ["ingress + egress emitted", "decomposition_complete emitted"],
+      "guard": ["toxic input blocked in run()", "toxic input blocked in run_stream()"],
+      "fault_tolerance": ["agent exception handled gracefully", "full pipeline works with bodega=None"],
+      "preflight": ["pre_flight() tolerates ConnectionRefusedError from Bodega"],
+      "integration_wiring": ["Evaluator receives AgentResponse objects", "Decomposer called exactly once per query", "conversation_history accepted without crash"]
+    },
+    "key_fix": "Decomposer test used non-existent classify() method — corrected to use public decompose() and inspect DAG node metadata for source=llm. BodegaRouter patch corrected from call-site module to source module (octane.tools.bodega_router) due to lazy local import pattern."
+  },
+
+  "files_created": [
+    "octane/tools/bodega_router.py",
+    "octane/tools/topology.py (full rebuild)",
+    "tests/e2e/test_e2e_tier_wiring.py",
+    "tests/e2e/test_e2e_osa_pipeline.py",
+    "SessionHistory/Session_20.json (this file)"
+  ],
+
+  "files_modified": [
+    "octane/agents/web/query_strategist.py  — _UNSET sentinel, BodegaRouter default, tier=FAST",
+    "octane/agents/web/synthesizer.py       — _UNSET sentinel, BodegaRouter default, tier=MID x4",
+    "octane/osa/decomposer.py               — _UNSET sentinel, BodegaRouter default, tier=FAST",
+    "octane/osa/evaluator.py                — _UNSET sentinel, BodegaRouter default, tier=REASON x2",
+    "octane/agents/sysstat/model_manager.py — ensure_topology_loaded() with full ModelConfig params",
+    "tests/unit/test_tools/test_bodega_router.py — rebuilt 30 → 65 tests"
+  ],
+
+  "architecture_notes": [
+    "Tier routing: FAST (cheap/fast classification) → MID (content synthesis) → REASON (final evaluation/deep thinking)",
+    "BodegaRouter is the public routing interface for standalone agents; Orchestrator injects BodegaInferenceClient directly",
+    "_UNSET sentinel cleanly separates 'use default' from 'explicitly disabled' — None means no LLM, _UNSET means auto-create BodegaRouter",
+    "ModelConfig.to_load_params() only serialises non-None/non-zero fields — safe to pass directly to Bodega /admin/load",
+    "ensure_topology_loaded() deduplicates models by model_id — if two tiers share the same model, it is only loaded once",
+    "E2E tests in tests/e2e/ do NOT require OCTANE_TEST_E2E=1 — they use mocked infrastructure and run in normal CI"
+  ],
+
+  "pending_known_issues": [
+    "KNOWN-20-1: '0 chunks embedded' in research pipeline — pgvector extension / embeddings table root cause not yet resolved (carried over from Session 19)",
+    "KNOWN-20-2: tests/integration/ skeleton still empty — integration tests with OCTANE_TEST_INTEGRATION=1 not yet written",
+    "KNOWN-20-3: Orchestrator passes BodegaInferenceClient (not BodegaRouter) to sub-agents — tier routing bypassed in orchestrated mode. Future sprint: upgrade Orchestrator to inject BodegaRouter"
+  ],
+
+  "next_steps": [
+    "PAUSE — Rahul will manually test the full Octane project end-to-end",
+    "Test: octane health, octane ask, octane chat, octane research, octane workflow, octane trace",
+    "Test: BodegaRouter in standalone agent mode (direct Python, not CLI)",
+    "Test: topology compact/balanced/power — does ensure_topology_loaded() actually load models correctly?",
+    "Test: multi-turn conversation history injection in Evaluator",
+    "Test: domain pipeline selection (investment_analysis, comparative_analysis, deep_research)",
+    "Test: research cycle with real Bodega running — does the quality gate filter findings?",
+    "Document any bugs found → Session 21 bug-fix sprint",
+    "Session 21 candidates: Orchestrator BodegaRouter upgrade, pgvector fix, integration tests"
+  ]
+}

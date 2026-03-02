@@ -1,0 +1,148 @@
+{
+  "session": 21,
+  "title": "Bug-Fix Sprint — Tier Routing, Schema Resilience, Router Correctness",
+  "date": "2026-03-01",
+  "tests_start": 475,
+  "tests_end": 496,
+  "tests_added": 21,
+  "status": "complete",
+
+  "summary": "Full codebase audit identified 7 bugs (4 carried from Sprint 20 known-issues list, 3 discovered fresh). All 7 fixed. 21 regression tests written. No existing tests broken.",
+
+  "bugs_fixed": [
+    {
+      "id": "BUG-21-1",
+      "title": "pg_client schema.sql single-block execution fails all tables when pgVector absent",
+      "file": "octane/tools/pg_client.py",
+      "severity": "critical",
+      "root_cause": "_ensure_schema() executed schema.sql as one block. When pgVector extension is not installed, the CREATE EXTENSION statement fails and the entire block is rolled back — projects, web_pages, generated_artifacts, research_findings_v2 and all other non-vector tables silently never got created.",
+      "fix": "Two-pass schema execution: (1) strip CREATE EXTENSION lines from base_ddl, always execute all non-vector tables; (2) execute embeddings table DDL only when vector_enabled=True. Split point is the '-- ── embeddings' comment already present in schema.sql.",
+      "tests": [
+        "TestPgClientTwoPassSchema::test_base_tables_created_without_vector",
+        "TestPgClientTwoPassSchema::test_schema_split_marker_present_in_schema_sql",
+        "TestPgClientTwoPassSchema::test_extension_line_stripped_from_base_ddl"
+      ]
+    },
+    {
+      "id": "BUG-21-2",
+      "title": "Orchestrator passes raw BodegaInferenceClient instead of BodegaRouter",
+      "file": "octane/osa/orchestrator.py",
+      "severity": "high",
+      "root_cause": "Orchestrator.__init__ created BodegaInferenceClient() and injected it into Router, Decomposer, Evaluator. All agents downstream received the raw client — tier routing was completely bypassed in orchestrated mode.",
+      "fix": "Changed self.bodega = BodegaInferenceClient() to self.bodega = BodegaRouter(). BodegaRouter is a drop-in replacement (delegates health()/current_model() to inner client) so pre_flight() and all orchestration logic unchanged.",
+      "tests": [
+        "TestOrchestratorUsesBodegaRouter::test_orchestrator_init_creates_bodega_router_not_inference_client"
+      ]
+    },
+    {
+      "id": "BUG-21-3",
+      "title": "AngleGenerator._llm_angles() defaults to REASON tier (wasteful)",
+      "file": "octane/research/angles.py",
+      "severity": "medium",
+      "root_cause": "_llm_angles() called chat_simple() with no tier= kwarg. BodegaRouter defaults to ModelTier.REASON, so every angle generation call consumed the heavy reasoning model unnecessarily.",
+      "fix": "Added tier=ModelTier.MID — angle generation is structured JSON output, MID is appropriate.",
+      "tests": [
+        "TestAngleGeneratorTier::test_llm_angles_uses_mid_tier",
+        "TestAngleGeneratorTier::test_llm_angles_passes_tier_mid_to_chat_simple"
+      ]
+    },
+    {
+      "id": "BUG-21-4",
+      "title": "ResearchSynthesizer._synthesize_with_llm() and _compress() missing tier kwarg",
+      "file": "octane/research/synthesizer.py",
+      "severity": "medium",
+      "root_cause": "Both methods called chat_simple() without tier=. _compress() (a summarization task) was routed to the heavy reasoning model — the same as final synthesis.",
+      "fix": "_synthesize_with_llm() → tier=ModelTier.REASON (final narrative synthesis requires deep reasoning). _compress() → tier=ModelTier.MID (text summarization/compression does not).",
+      "tests": [
+        "TestResearchSynthesizerTiers::test_synthesizer_source_has_both_tiers",
+        "TestResearchSynthesizerTiers::test_synthesize_uses_reason_tier",
+        "TestResearchSynthesizerTiers::test_compress_uses_mid_tier"
+      ]
+    },
+    {
+      "id": "BUG-21-5",
+      "title": "Code agents (Planner, Writer, Debugger) use raw BodegaInferenceClient, no tier wiring",
+      "files": [
+        "octane/agents/code/planner.py",
+        "octane/agents/code/writer.py",
+        "octane/agents/code/debugger.py"
+      ],
+      "severity": "high",
+      "root_cause": "All three code sub-agents had bodega: BodegaInferenceClient | None = None with fallback BodegaInferenceClient(). When CodeAgent passed an injected BodegaRouter, the agents used it, but when constructed standalone they fell back to raw client, bypassing tier routing. Additionally, chat_simple() calls had no tier= so all calls silently routed to REASON regardless.",
+      "fix": "Replaced constructor with lazy BodegaRouter import pattern (bodega=None, if bodega is None: from ..bodega_router import BodegaRouter; bodega = BodegaRouter()). Added tier=ModelTier.REASON to all chat_simple() calls — planning, code generation, and debugging all legitimately require the reasoning model.",
+      "tests": [
+        "TestPlannerTierWiring::test_planner_default_uses_bodega_router",
+        "TestPlannerTierWiring::test_planner_source_has_reason_tier",
+        "TestPlannerTierWiring::test_planner_plan_with_llm_passes_reason_tier",
+        "TestWriterTierWiring::test_writer_source_has_reason_tier",
+        "TestWriterTierWiring::test_writer_write_with_llm_passes_reason_tier",
+        "TestDebuggerTierWiring::test_debugger_source_has_reason_tier",
+        "TestDebuggerTierWiring::test_debugger_fix_with_llm_passes_reason_tier"
+      ]
+    },
+    {
+      "id": "BUG-21-6",
+      "title": "WebAgent._resolve_ticker_via_web() uses REASON tier for a 10-token extraction",
+      "file": "octane/agents/web/agent.py",
+      "severity": "medium",
+      "root_cause": "_resolve_ticker_via_web() called chat_simple() with max_tokens=10, temperature=0.0 and no tier=. Defaulted to REASON — the heaviest model — for a single-token classification task.",
+      "fix": "Added tier=ModelTier.FAST. Ticker extraction is a near-deterministic single-token lookup; FAST tier is correct.",
+      "tests": [
+        "TestWebAgentTickerFast::test_web_agent_source_has_fast_tier",
+        "TestWebAgentTickerFast::test_resolve_ticker_passes_fast_tier"
+      ]
+    },
+    {
+      "id": "BUG-21-7",
+      "title": "OSA Router type hint and fallback still reference raw BodegaInferenceClient",
+      "file": "octane/osa/router.py",
+      "severity": "low",
+      "root_cause": "Router.__init__ had bodega: BodegaInferenceClient | None = None with fallback bodega or BodegaInferenceClient(). After Orchestrator was upgraded to pass BodegaRouter (BUG-21-2 fix), the type hint was wrong. When Router was constructed standalone (e.g. tests), it still created a raw inference client bypassing tier routing.",
+      "fix": "Added BodegaRouter import. Updated type hint to BodegaRouter | BodegaInferenceClient | None. Changed fallback to: self.bodega = bodega if bodega is not None else BodegaRouter().",
+      "tests": [
+        "TestOsaRouterBodegaRouterFallback::test_router_source_imports_bodega_router",
+        "TestOsaRouterBodegaRouterFallback::test_router_default_creates_bodega_router_not_inference_client",
+        "TestOsaRouterBodegaRouterFallback::test_router_accepts_bodega_router_instance"
+      ]
+    }
+  ],
+
+  "files_modified": [
+    "octane/tools/pg_client.py",
+    "octane/osa/orchestrator.py",
+    "octane/research/angles.py",
+    "octane/research/synthesizer.py",
+    "octane/agents/code/planner.py",
+    "octane/agents/code/writer.py",
+    "octane/agents/code/debugger.py",
+    "octane/agents/web/agent.py",
+    "octane/osa/router.py"
+  ],
+
+  "files_created": [
+    "tests/unit/test_session21_bugfixes.py"
+  ],
+
+  "tier_routing_summary": {
+    "FAST": ["WebAgent._resolve_ticker_via_web (10-token extraction)"],
+    "MID": [
+      "AngleGenerator._llm_angles (structured JSON angle generation)",
+      "ResearchSynthesizer._compress (text summarization)"
+    ],
+    "REASON": [
+      "ResearchSynthesizer._synthesize_with_llm (final narrative synthesis)",
+      "Planner._plan_with_llm (structured code planning)",
+      "Writer._write_with_llm (code generation)",
+      "Debugger._fix_with_llm (error analysis + code repair)"
+    ]
+  },
+
+  "known_issues_closed": ["KNOWN-20-1", "KNOWN-20-3"],
+
+  "pytest_result": {
+    "total": 496,
+    "passed": 496,
+    "failed": 0,
+    "warnings": 2
+  }
+}

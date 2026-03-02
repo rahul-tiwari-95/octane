@@ -11,6 +11,7 @@ import re
 import structlog
 
 from octane.tools.bodega_inference import BodegaInferenceClient
+from octane.tools.topology import ModelTier
 
 logger = structlog.get_logger().bind(component="code.writer")
 
@@ -67,8 +68,11 @@ Rules:
 class Writer:
     """Generates runnable Python code from a planning spec."""
 
-    def __init__(self, bodega: BodegaInferenceClient | None = None) -> None:
-        self._bodega = bodega or BodegaInferenceClient()
+    def __init__(self, bodega=None) -> None:
+        if bodega is None:
+            from octane.tools.bodega_router import BodegaRouter
+            bodega = BodegaRouter()
+        self._bodega = bodega
 
     async def write(self, spec: dict, previous_error: str | None = None) -> str:
         """Generate code from spec. If previous_error is set, this is a retry/debug pass."""
@@ -96,6 +100,7 @@ class Writer:
             raw = await self._bodega.chat_simple(
                 prompt="\n".join(user_parts),
                 system=_SYSTEM_PROMPT,
+                tier=ModelTier.REASON,
                 temperature=0.2,
             )
             # Preserve <think> reasoning as a debug trace; extract code from after </think>

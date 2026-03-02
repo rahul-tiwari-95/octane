@@ -27,9 +27,11 @@ from octane.models.schemas import AgentRequest, AgentResponse
 from octane.tools.bodega_intel import BodegaIntelClient
 from octane.agents.web.synthesizer import Synthesizer
 from octane.agents.web.query_strategist import QueryStrategist
+from octane.agents.web.depth_analyzer import DepthAnalyzer
 from octane.agents.web.content_extractor import ContentExtractor, ExtractedContent
 from octane.agents.web.browser import BrowserAgent
 from octane.utils.clock import month_year, today_str
+from octane.tools.topology import ModelTier
 
 logger = structlog.get_logger().bind(component="web_agent")
 
@@ -53,6 +55,7 @@ class WebAgent(BaseAgent):
         self._intel = intel or BodegaIntelClient()
         self._synthesizer = Synthesizer(bodega=bodega)
         self._strategist = QueryStrategist(bodega=bodega)
+        self._depth_analyzer = DepthAnalyzer(bodega=bodega)
         self._extractor = extractor or ContentExtractor()
         self._browser = browser or BrowserAgent(interactive=False)
         self._page_store = page_store  # WebPageStore | None
@@ -76,15 +79,16 @@ class WebAgent(BaseAgent):
         """Route to the correct Bodega Intelligence API based on sub_agent hint."""
         sub_agent = request.metadata.get("sub_agent", "search")
         query = request.query
+        deep: bool = bool(request.metadata.get("deep", False))
 
         # Accept both short forms ("finance") and template-prefixed forms ("web_finance")
         if sub_agent in ("finance", "web_finance"):
             return await self._fetch_finance(query, request)
         elif sub_agent in ("news", "web_news"):
-            return await self._fetch_news(query, request)
+            return await self._fetch_news(query, request, deep=deep)
         else:
             # "search", "web_search", or any unknown → general Brave search
-            return await self._fetch_search(query, request)
+            return await self._fetch_search(query, request, deep=deep)
 
     # ── Finance ───────────────────────────────────────────────────────────
 
@@ -205,6 +209,7 @@ class WebAgent(BaseAgent):
             ticker_raw = await self._bodega.chat_simple(
                 prompt=prompt,
                 system="You are a financial assistant. Extract stock ticker symbols from text.",
+                tier=ModelTier.FAST,
                 temperature=0.0,
                 max_tokens=10,
             )
@@ -315,7 +320,7 @@ class WebAgent(BaseAgent):
                     )
         return result
 
-    async def _fetch_news(self, query: str, request: AgentRequest) -> AgentResponse:
+    async def _fetch_news(self, query: str, request: AgentRequest, deep: bool = False) -> AgentResponse:
         """Fetch news for the query using two parallel sources, then synthesize.
 
         Sources:
@@ -326,20 +331,23 @@ class WebAgent(BaseAgent):
         Both calls run concurrently.  URLs from both are deduplicated and fed into
         the same content-extraction + synthesis pipeline so the LLM always has the
         richest available source material.
+
+        When ``deep=True`` (or ``--deep`` flag), a second round of targeted follow-up
+        queries is generated from Round-1 findings and executed in parallel, giving
+        much broader topic coverage before final synthesis.
         """
         strategies = await self._strategist.strategize(
             query, context={"sub_agent": "news"}
         )
         search_query = strategies[0].get("query", query)
 
-        # ── Fan out to news API + beru web search in parallel ─────────────────
+        # ── Round 1: news API + beru web search in parallel ──────────────────
         news_raw, web_raw = await asyncio.gather(
             self._intel.news_search(search_query, period="3d", max_results=7),
             self._intel.web_search(f"{search_query} {today_str()}", count=6),
             return_exceptions=True,
         )
 
-        # Treat exceptions as empty results — never let one source kill the whole path
         if isinstance(news_raw, Exception):
             logger.warning("news_api_failed", error=str(news_raw))
             news_raw = {}
@@ -350,7 +358,6 @@ class WebAgent(BaseAgent):
         articles = news_raw.get("articles", [])
         web_results = web_raw.get("web", {}).get("results", [])
 
-        # ── Collect and deduplicate URLs ──────────────────────────────────────
         seen: set[str] = set()
         combined_urls: list[str] = []
 
@@ -365,21 +372,99 @@ class WebAgent(BaseAgent):
                 seen.add(u)
                 combined_urls.append(u)
 
+        # ── Round-1 extraction ────────────────────────────────────────────────
+        r1_usable: list[ExtractedContent] = []
         if combined_urls:
             extracted = await self._extractor.extract_batch(combined_urls, top_n=6)
             extracted = await self._enrich_with_browser(extracted)
-            usable = [
+            r1_usable = [
                 a for a in extracted
                 if a.text and a.method not in ("unavailable", "failed")
             ]
-            if usable:
-                await self._store_pages(usable)
-                summary = await self._synthesizer.synthesize_with_content(query, usable)
-                return AgentResponse(
-                    agent=self.name, success=True,
-                    output=summary, data={"news": news_raw, "web": web_raw},
-                    correlation_id=request.correlation_id,
-                )
+            if r1_usable:
+                await self._store_pages(r1_usable)
+
+        logger.info(
+            "news_round1_complete",
+            query=query[:60],
+            n_urls=len(combined_urls),
+            n_extracted=len(r1_usable),
+        )
+
+        # ── Round 2: iterative deepening (always on for news; more on --deep) ─
+        all_usable = list(r1_usable)
+        r2_rounds = 2 if deep else 1
+        for round_num in range(r2_rounds):
+            if not all_usable:
+                break  # nothing to analyse — skip deepening
+            findings = [a.text[:200] for a in all_usable[:6] if a.text]
+            max_fups = 5 if deep else 3
+            followups = await self._depth_analyzer.generate_followups(
+                original_query=query,
+                findings=findings,
+                max_followups=max_fups,
+            )
+            if not followups:
+                break
+
+            logger.info(
+                "news_deepening_round",
+                round=round_num + 2,
+                n_followups=len(followups),
+                queries=[f["query"][:60] for f in followups],
+            )
+
+            # Fan out follow-up searches (mix of news and web based on api hint)
+            deep_tasks = []
+            for f in followups:
+                api = f.get("api", "search")
+                q = f["query"]
+                if api == "news":
+                    deep_tasks.append(self._intel.news_search(q, period="3d", max_results=5))
+                else:
+                    deep_tasks.append(self._intel.web_search(q, count=5))
+
+            deep_raws = await asyncio.gather(*deep_tasks, return_exceptions=True)
+            new_urls: list[str] = []
+            for raw_resp in deep_raws:
+                if isinstance(raw_resp, Exception):
+                    continue
+                for a in raw_resp.get("articles", []):
+                    u = a.get("url") or a.get("link") or a.get("href", "")
+                    if u and u not in seen:
+                        seen.add(u)
+                        new_urls.append(u)
+                for r in raw_resp.get("web", {}).get("results", []):
+                    u = r.get("url", "")
+                    if u and u not in seen:
+                        seen.add(u)
+                        new_urls.append(u)
+
+            if new_urls:
+                r2_extracted = await self._extractor.extract_batch(new_urls, top_n=6)
+                r2_extracted = await self._enrich_with_browser(r2_extracted)
+                r2_usable = [
+                    a for a in r2_extracted
+                    if a.text and a.method not in ("unavailable", "failed")
+                ]
+                if r2_usable:
+                    await self._store_pages(r2_usable)
+                    all_usable.extend(r2_usable)
+                    logger.info(
+                        "news_deepening_extracted",
+                        round=round_num + 2,
+                        new_pages=len(r2_usable),
+                        total=len(all_usable),
+                    )
+
+        # ── Synthesis ─────────────────────────────────────────────────────────
+        if all_usable:
+            summary = await self._synthesizer.synthesize_with_content(query, all_usable)
+            return AgentResponse(
+                agent=self.name, success=True,
+                output=summary, data={"news": news_raw, "web": web_raw},
+                correlation_id=request.correlation_id,
+            )
 
         # Fallback: snippet-based synthesis from whatever we got
         logger.info(
@@ -403,7 +488,7 @@ class WebAgent(BaseAgent):
 
     # ── Web Search ────────────────────────────────────────────────────────
 
-    async def _fetch_search(self, query: str, request: AgentRequest) -> AgentResponse:
+    async def _fetch_search(self, query: str, request: AgentRequest, deep: bool = False) -> AgentResponse:
         """General web search via Beru/Brave, with multi-variation strategy + LLM synthesis.
 
         Extraction cascade:
@@ -411,43 +496,130 @@ class WebAgent(BaseAgent):
         2. Headless BrowserAgent on any failed URLs (max 2 retries).
         3. synthesize_with_content() if any usable text was extracted.
         4. Fallback to synthesize_search() with snippets if all extraction fails.
+
+        When ``deep=True``, a DepthAnalyzer pass generates 3-5 follow-up queries
+        from Round-1 findings and runs them in parallel before final synthesis —
+        dramatically broadening topic coverage.
         """
         # Generate 2-3 search variations
         strategies = await self._strategist.strategize(query)
 
-        # Execute the first strategy (primary) — future: fan-out + dedup across all
-        primary = strategies[0]
-        raw = await self._intel.web_search(primary["query"], count=6)
-        if "error" in raw:
+        # Fan out all strategies in parallel, then deduplicate results by URL
+        search_tasks = [
+            self._intel.web_search(s["query"], count=6)
+            for s in strategies
+        ]
+        raw_results = await asyncio.gather(*search_tasks, return_exceptions=True)
+
+        # Merge results from all strategies, deduplicating by URL
+        seen_urls: set[str] = set()
+        results: list[dict] = []
+        raw = {}
+        for i, raw_resp in enumerate(raw_results):
+            if isinstance(raw_resp, Exception):
+                logger.warning("strategy_search_failed", query=strategies[i]["query"], error=str(raw_resp))
+                continue
+            if "error" in raw_resp:
+                continue
+            if not raw:
+                raw = raw_resp  # keep first successful raw for data passthrough
+            for r in raw_resp.get("web", {}).get("results", []):
+                url = r.get("url", "")
+                if url and url not in seen_urls:
+                    seen_urls.add(url)
+                    results.append(r)
+            for r in raw_resp.get("discussions", {}).get("results", []):
+                url = r.get("url", "")
+                if url and url not in seen_urls:
+                    seen_urls.add(url)
+                    results.append(r)
+
+        if not results:
             return AgentResponse(
                 agent=self.name, success=False,
-                error=f"Search API error: {raw['error']}",
+                error="Search API returned no results",
                 correlation_id=request.correlation_id,
             )
 
-        web = raw.get("web", {})
-        results = web.get("results", [])
-        if not results:
-            results = raw.get("discussions", {}).get("results", [])
-
-        # ── Deep content extraction ───────────────────────────────────────────
+        # ── Round-1 extraction ────────────────────────────────────────────────
         urls = [r.get("url", "") for r in results if r.get("url")]
-
+        r1_usable: list[ExtractedContent] = []
         if urls:
             extracted = await self._extractor.extract_batch(urls, top_n=5)
             extracted = await self._enrich_with_browser(extracted)
-            usable = [
+            r1_usable = [
                 a for a in extracted
                 if a.text and a.method not in ("unavailable", "failed")
             ]
-            if usable:
-                await self._store_pages(usable)
-                summary = await self._synthesizer.synthesize_with_content(query, usable)
-                return AgentResponse(
-                    agent=self.name, success=True,
-                    output=summary, data=raw,
-                    correlation_id=request.correlation_id,
+            if r1_usable:
+                await self._store_pages(r1_usable)
+
+        logger.info(
+            "search_round1_complete",
+            query=query[:60],
+            n_strategies=len(strategies),
+            n_results=len(results),
+            n_extracted=len(r1_usable),
+        )
+
+        # ── Round 2: iterative deepening (--deep flag) ───────────────────────
+        all_usable = list(r1_usable)
+        if deep and all_usable:
+            findings = [a.text[:200] for a in all_usable[:6] if a.text]
+            followups = await self._depth_analyzer.generate_followups(
+                original_query=query,
+                findings=findings,
+                max_followups=5,
+            )
+            if followups:
+                logger.info(
+                    "search_deepening_round2",
+                    n_followups=len(followups),
+                    queries=[f["query"][:60] for f in followups],
                 )
+                deep_tasks = [
+                    self._intel.web_search(f["query"], count=5) for f in followups
+                ]
+                deep_raws = await asyncio.gather(*deep_tasks, return_exceptions=True)
+                new_urls: list[str] = []
+                for raw_resp in deep_raws:
+                    if isinstance(raw_resp, Exception):
+                        continue
+                    for r in raw_resp.get("web", {}).get("results", []):
+                        u = r.get("url", "")
+                        if u and u not in seen_urls:
+                            seen_urls.add(u)
+                            new_urls.append(u)
+                    for r in raw_resp.get("discussions", {}).get("results", []):
+                        u = r.get("url", "")
+                        if u and u not in seen_urls:
+                            seen_urls.add(u)
+                            new_urls.append(u)
+
+                if new_urls:
+                    r2_extracted = await self._extractor.extract_batch(new_urls, top_n=6)
+                    r2_extracted = await self._enrich_with_browser(r2_extracted)
+                    r2_usable = [
+                        a for a in r2_extracted
+                        if a.text and a.method not in ("unavailable", "failed")
+                    ]
+                    if r2_usable:
+                        await self._store_pages(r2_usable)
+                        all_usable.extend(r2_usable)
+                        logger.info(
+                            "search_deepening_extracted",
+                            new_pages=len(r2_usable),
+                            total=len(all_usable),
+                        )
+
+        # ── Synthesis ─────────────────────────────────────────────────────────
+        if all_usable:
+            summary = await self._synthesizer.synthesize_with_content(query, all_usable)
+            return AgentResponse(
+                agent=self.name, success=True,
+                output=summary, data=raw,
+                correlation_id=request.correlation_id,
+            )
 
         # Fallback: snippet-based synthesis (original behaviour)
         logger.info("search_extraction_fallback_to_snippets", query=query, n_results=len(results))

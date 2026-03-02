@@ -198,12 +198,45 @@ class BodegaInferenceClient:
             return {"status": "error", "error": str(e)}
 
     async def current_model(self) -> dict[str, Any]:
-        """Get the currently loaded model info."""
+        """Get info about the currently loaded model(s).
+
+        Uses /v1/admin/loaded-models (the multi-model registry endpoint).
+        Normalizes to a stable shape so all callers work unchanged:
+
+            {"loaded": True,  "model_path": "SRSWTI/...", "context_length": 32768,
+             "total_loaded": 1, "all_models": ["id"], "model_info": {...}}
+
+            {"loaded": False, "model_info": {}}           # no models
+            {"error": "..."}                              # HTTP / network error
+        """
         client = await self._get_client()
         try:
-            response = await client.get("/v1/admin/current-model")
+            response = await client.get("/v1/admin/loaded-models")
             response.raise_for_status()
-            return response.json()
+            data = response.json()
+            models = data.get("data", [])
+            if not models:
+                return {"loaded": False, "model_info": {}}
+            # Use the first entry as the "primary" model
+            first = models[0]
+            model_id = first.get("id", "unknown")
+            ctx = first.get("context_length")
+            model_info = {
+                "model_path": model_id,
+                "model_id": model_id,
+                "model_type": first.get("model_type", "lm"),
+                "context_length": ctx,
+                "reasoning_parser": first.get("reasoning_parser"),
+                "status": first.get("status", "unknown"),
+            }
+            return {
+                "loaded": True,
+                "model_path": model_id,        # top-level for display
+                "context_length": ctx,         # top-level for display
+                "total_loaded": len(models),
+                "all_models": [m.get("id") for m in models],
+                "model_info": model_info,      # nested for ModelManager compat
+            }
         except httpx.HTTPError as e:
             return {"error": str(e)}
 

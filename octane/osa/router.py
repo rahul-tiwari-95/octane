@@ -15,6 +15,7 @@ from octane.agents.sysstat.agent import SysStatAgent
 from octane.agents.pnl.agent import PnLAgent
 from octane.models.synapse import SynapseEventBus
 from octane.tools.bodega_inference import BodegaInferenceClient
+from octane.tools.bodega_router import BodegaRouter
 from octane.tools.bodega_intel import BodegaIntelClient
 from octane.tools.redis_client import RedisClient
 from octane.tools.pg_client import PgClient
@@ -26,9 +27,9 @@ logger = structlog.get_logger().bind(component="osa.router")
 class Router:
     """Maps agent names to agent instances."""
 
-    def __init__(self, synapse: SynapseEventBus, bodega: BodegaInferenceClient | None = None) -> None:
+    def __init__(self, synapse: SynapseEventBus, bodega: BodegaRouter | BodegaInferenceClient | None = None) -> None:
         self.synapse = synapse
-        self.bodega = bodega or BodegaInferenceClient()
+        self.bodega = bodega if bodega is not None else BodegaRouter()
         self.intel = BodegaIntelClient()
         self.redis = RedisClient()
         self.pg = PgClient()
