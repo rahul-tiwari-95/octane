@@ -357,6 +357,7 @@ class Orchestrator:
         session_id: str = "cli",
         conversation_history: list[dict[str, str]] | None = None,
         extra_metadata: dict | None = None,
+        clarification_hook=None,
     ) -> AsyncIterator[str]:
         """Like run(), but streams Evaluator tokens as they arrive.
 
@@ -368,6 +369,13 @@ class Orchestrator:
             session_id: Session identifier for memory recall/write.
             conversation_history: Optional rolling buffer of prior turns for
                 direct multi-turn context injection into the Evaluator.
+            extra_metadata: Optional dict merged into every AgentRequest.metadata
+                (e.g. {"deep": True}).
+            clarification_hook: Optional async callable injected into
+                AgentRequest.context["clarification_hook"].  Called by WebAgent
+                after Round-1 in deep mode if the query is ambiguous — allows
+                the CLI to present MCQ questions to the user.
+                Signature: async (questions: list[MSRQuestion]) -> str | None
 
         Yields:
             Text fragments from the LLM as they are generated.
@@ -462,13 +470,17 @@ class Orchestrator:
                     )
                     # Merge extra_metadata (e.g. {"deep": True}) into node metadata
                     merged_metadata = {**node.metadata, **(extra_metadata or {})}
+                    # Build per-request context: inject non-serializable hooks here
+                    task_context: dict = {"upstream_results": upstream_results}
+                    if clarification_hook is not None:
+                        task_context["clarification_hook"] = clarification_hook
                     task_request = AgentRequest(
                         query=instruction,
                         correlation_id=correlation_id,
                         session_id=session_id,
                         source="osa",
                         metadata=merged_metadata,
-                        context={"upstream_results": upstream_results},
+                        context=task_context,
                     )
                     wave_requests.append((node, agent, task_request))
                 else:
@@ -479,27 +491,43 @@ class Orchestrator:
                     )
 
             if wave_requests:
-                try:
-                    wave_responses = await asyncio.wait_for(
-                        asyncio.gather(
-                            *[agent.run(req) for _, agent, req in wave_requests],
-                        ),
-                        timeout=90.0,
+                # Deep mode (REASON-tier synthesis) needs extra headroom.
+                # When a clarification_hook is active the user is answering MCQ
+                # questions inside the agent — wall-clock time is dominated by
+                # human think-time, NOT compute.  Skip the ceiling entirely so
+                # the user interaction + subsequent synthesis can finish.
+                is_deep = bool((extra_metadata or {}).get("deep"))
+                has_hook = clarification_hook is not None
+                if has_hook:
+                    # No ceiling — user interaction time is unbounded
+                    gather_coro = asyncio.gather(
+                        *[agent.run(req) for _, agent, req in wave_requests],
                     )
-                except asyncio.TimeoutError:
-                    logger.warning(
-                        "wave_dispatch_timeout",
-                        wave_agents=[n.agent for n, _, _ in wave_requests],
-                    )
-                    wave_responses = [
-                        AgentResponse(
-                            agent=n.agent,
-                            success=False,
-                            error="Agent timed out (90 s ceiling)",
-                            correlation_id=correlation_id,
+                    wave_responses = await gather_coro
+                else:
+                    wave_ceiling = 180.0 if is_deep else 90.0
+                    try:
+                        wave_responses = await asyncio.wait_for(
+                            asyncio.gather(
+                                *[agent.run(req) for _, agent, req in wave_requests],
+                            ),
+                            timeout=wave_ceiling,
                         )
-                        for n, _, _ in wave_requests
-                    ]
+                    except asyncio.TimeoutError:
+                        logger.warning(
+                            "wave_dispatch_timeout",
+                            wave_agents=[n.agent for n, _, _ in wave_requests],
+                            ceiling=wave_ceiling,
+                        )
+                        wave_responses = [
+                            AgentResponse(
+                                agent=n.agent,
+                                success=False,
+                                error=f"Agent timed out ({wave_ceiling:.0f} s ceiling)",
+                                correlation_id=correlation_id,
+                            )
+                            for n, _, _ in wave_requests
+                        ]
                 for (node, _, _), response in zip(wave_requests, wave_responses):
                     accumulated[node.task_id] = response
                     results.append(response)

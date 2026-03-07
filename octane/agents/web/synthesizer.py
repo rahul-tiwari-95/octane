@@ -78,6 +78,45 @@ Rules:
 - If sources conflict on a fact, note the conflict explicitly.
 - If the articles don't answer the query, say so clearly and state what they do cover."""
 
+_DEEP_SYNTHESIS_SYSTEM_BASE = """\
+You are a senior research analyst producing a comprehensive intelligence briefing.
+You have full article text from multiple authoritative sources. Your job is \
+thorough analysis — Octane users rely on you for depth, not brevity.
+
+Produce a STRUCTURED report covering ALL of the following sections:
+
+## Summary
+2-3 sentences answering the query directly with the single most important finding.
+
+## Key Developments
+5-8 specific factual bullet points. Each must include: date (if known), actor, \
+and a concrete detail (number, name, direct quote, or specific action taken). \
+No vague generalities.
+
+## Background & Context
+2-3 paragraphs explaining the history, causes, and key actors that make \
+these developments significant. Connect the dots between events explicitly.
+
+## International Reactions & Implications
+What key parties (governments, organisations, analysts) have said or done \
+in response. Include direct quotes from sources where available.
+
+## What's Next
+2-4 bullet points on the most likely near-term developments based on the \
+evidence. Label each as [likely], [possible], or [uncertain].
+
+## Sources
+Comma-separated list of domain names used.
+
+Rules:
+- Every claim must be grounded directly in the provided article texts.
+- Preserve specific dates, numbers, names, and statistics exactly as written.
+- If sources conflict on a fact, note the conflict explicitly: "Sources differ: ...".
+- Do NOT add analysis unsupported by the sources.
+- Do not mention "agent", "tool", or "API".
+- Target 700-1200 words total. Be thorough, not brief. Missing a section is \
+  only acceptable if the sources genuinely provide no information for it."""
+
 
 def _news_system() -> str:
     """Return the news system prompt with today's date injected."""
@@ -99,6 +138,11 @@ def _full_text_system() -> str:
     return f"Today's date: {today_human()}.\n\n{_FULL_TEXT_SYSTEM_BASE}"
 
 
+def _deep_synthesis_system() -> str:
+    """Return the deep-mode synthesis system prompt (REASON tier, structured report)."""
+    return f"Today's date: {today_human()}.\n\n{_DEEP_SYNTHESIS_SYSTEM_BASE}"
+
+
 class Synthesizer:
     """Turns raw Bodega Intelligence API results into structured intelligence.
 
@@ -109,9 +153,13 @@ class Synthesizer:
     - Falls back to plain text formatting if LLM is unavailable.
     """
 
-    # Full-text synthesis thresholds
+    # Full-text synthesis thresholds — standard mode
     _MAX_CHARS_DIRECT: int = 3_000   # Use text directly if at or below this
     _MAX_CHARS_CHUNK: int = 6_000    # Truncate to this before chunk-summarizing
+
+    # Full-text synthesis thresholds — deep mode (allow much larger direct window)
+    _MAX_CHARS_DIRECT_DEEP: int = 8_000   # Direct synthesis up to 8 K chars in deep mode
+    _MAX_CHARS_CHUNK_DEEP: int = 14_000   # Truncate before chunk-summarizing in deep mode
 
     def __init__(self, bodega=_UNSET) -> None:
         if bodega is _UNSET:
@@ -214,14 +262,16 @@ class Synthesizer:
 
     # ── Full-text synthesis ────────────────────────────────────────────────
 
-    async def _summarize_chunk(self, text: str, query: str) -> str:
-        """Pre-summarize a long article chunk to ~250 words.
+    async def _summarize_chunk(self, text: str, query: str, deep: bool = False) -> str:
+        """Pre-summarize a long article chunk to ~250-500 words.
 
-        Takes the first _MAX_CHARS_CHUNK chars of ``text`` and asks the LLM
-        to compress it into a dense, query-focused summary.  Falls back to a
-        plain truncation if the LLM is unavailable.
+        Takes the first _MAX_CHARS_CHUNK (or _MAX_CHARS_CHUNK_DEEP) chars of
+        ``text`` and asks the LLM to compress it into a dense, query-focused
+        summary.  Falls back to a plain truncation if the LLM is unavailable.
         """
-        truncated = text[: self._MAX_CHARS_CHUNK]
+        char_limit = self._MAX_CHARS_CHUNK_DEEP if deep else self._MAX_CHARS_CHUNK
+        chunk_tokens = 600 if deep else 350
+        truncated = text[:char_limit]
         prompt = f'Query context: "{query}"\n\nArticle excerpt:\n{truncated}'
         if self._bodega is not None:
             try:
@@ -231,9 +281,9 @@ class Synthesizer:
                         system=_chunk_system(),
                         tier=ModelTier.MID,
                         temperature=0.1,
-                        max_tokens=350,
+                        max_tokens=chunk_tokens,
                     ),
-                    timeout=20.0,  # chunk summarization: 20 s cap
+                    timeout=25.0,  # chunk summarization: 25 s cap
                 )
                 return _strip_think(result.strip())
             except Exception as exc:
@@ -245,19 +295,27 @@ class Synthesizer:
         self,
         query: str,
         extracted_articles: list[ExtractedContent],
+        deep: bool = False,
     ) -> str:
         """Synthesize full article text into deep, grounded intelligence.
 
         Pipeline:
         1. Skip articles with no usable text (method="unavailable"/"failed").
-        2. For each article whose text exceeds _MAX_CHARS_DIRECT, run a
+        2. For each article whose text exceeds the direct-use threshold, run a
            chunk-summarize pass first (_summarize_chunk) to compress it.
         3. Assemble the (possibly compressed) texts and call the LLM with
            a deeper full-text synthesis prompt.
         4. Falls back to a plain formatted listing if LLM is unavailable.
 
-        At most 5 articles are used in the final synthesis to keep prompt
-        size predictable.
+        Args:
+            query:               The user's original query.
+            extracted_articles:  List of ExtractedContent from ContentExtractor.
+            deep:                When True, uses REASON tier, 3 000-token output,
+                                 up to 10 articles, and a structured multi-section
+                                 report prompt. Default False = legacy brief mode.
+
+        At most 10 articles (deep) or 5 articles (standard) are used in the
+        final synthesis to keep prompt size predictable.
         """
         # 1. Filter: keep only articles that have actual extracted text
         usable = [
@@ -268,18 +326,35 @@ class Synthesizer:
             logger.info("synthesize_with_content_no_usable_text", query=query)
             return f"No article text could be extracted for: {query}"
 
+        # Choose thresholds and LLM params based on mode
+        article_limit = 10 if deep else 5
+        max_chars_direct = self._MAX_CHARS_DIRECT_DEEP if deep else self._MAX_CHARS_DIRECT
+        synthesis_tokens = 3000 if deep else 768
+        synthesis_tier = ModelTier.REASON if deep else ModelTier.MID
+        synthesis_system = _deep_synthesis_system() if deep else _full_text_system()
+        synthesis_timeout = 120.0 if deep else 40.0  # REASON model is slower
+
+        logger.info(
+            "synthesize_with_content_start",
+            query=query[:60],
+            n_articles=len(usable),
+            using=min(len(usable), article_limit),
+            deep=deep,
+        )
+
         # 2. Pre-process: chunk-summarize articles that exceed the direct limit
         article_blocks: list[str] = []
-        for i, article in enumerate(usable[:5], 1):
+        for i, article in enumerate(usable[:article_limit], 1):
             text = article.text
-            if len(text) > self._MAX_CHARS_DIRECT:
+            if len(text) > max_chars_direct:
                 logger.debug(
                     "chunk_summarizing_article",
                     index=i,
                     url=article.url,
                     chars=len(text),
+                    deep=deep,
                 )
-                text = await self._summarize_chunk(text, query)
+                text = await self._summarize_chunk(text, query, deep=deep)
             # Use domain as the source label (e.g. "reuters.com")
             parts = article.url.split("/")
             source_label = parts[2] if len(parts) > 2 else article.url
@@ -294,12 +369,12 @@ class Synthesizer:
                 result = await asyncio.wait_for(
                     self._bodega.chat_simple(
                         prompt=prompt,
-                        system=_full_text_system(),
-                        tier=ModelTier.MID,
+                        system=synthesis_system,
+                        tier=synthesis_tier,
                         temperature=0.2,
-                        max_tokens=768,
+                        max_tokens=synthesis_tokens,
                     ),
-                    timeout=40.0,  # full-text synthesis: 40 s cap (larger prompt)
+                    timeout=synthesis_timeout,
                 )
                 return _strip_think(result.strip())
             except Exception as exc:
@@ -307,11 +382,12 @@ class Synthesizer:
                     "full_text_synthesis_failed",
                     error=str(exc),
                     fallback="plain",
+                    deep=deep,
                 )
 
         # 4. Plain fallback: numbered list with short snippets
         lines = [f"Full-text results for '{query}':"]
-        for i, article in enumerate(usable[:5], 1):
+        for i, article in enumerate(usable[:article_limit], 1):
             parts = article.url.split("/")
             domain = parts[2] if len(parts) > 2 else article.url
             snippet = article.text[:200].replace("\n", " ")

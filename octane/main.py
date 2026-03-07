@@ -250,13 +250,15 @@ def ask(
     query: str = typer.Argument(..., help="Your question or instruction"),
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Show DAG trace after response"),
     deep: bool = typer.Option(False, "--deep", help="Deep mode: multi-round search with iterative query expansion"),
+    monitor: bool = typer.Option(False, "--monitor", help="Show live RAM/CPU/model metrics during query"),
 ):
     """🧠 Ask Octane anything — routed through OSA."""
-    asyncio.run(_ask(query, verbose=verbose, deep=deep))
+    asyncio.run(_ask(query, verbose=verbose, deep=deep, monitor=monitor))
 
 
-async def _ask(query: str, verbose: bool = False, deep: bool = False):
+async def _ask(query: str, verbose: bool = False, deep: bool = False, monitor: bool = False):
     from octane.osa.orchestrator import Orchestrator
+    from octane.tools.topology import ModelTier, detect_topology, get_topology
 
     synapse = _get_synapse()
     osa = Orchestrator(synapse)
@@ -265,13 +267,27 @@ async def _ask(query: str, verbose: bool = False, deep: bool = False):
     with console.status("[dim]Checking inference engine...[/]", spinner="dots"):
         status = await osa.pre_flight()
 
+    # Resolve topology and model tiers for the startup banner
+    try:
+        topo_name = detect_topology()
+        topo = get_topology(topo_name)
+        fast_model = topo.resolve(ModelTier.FAST)
+        mid_model  = topo.resolve(ModelTier.MID)
+        reason_model = topo.resolve(ModelTier.REASON)
+    except Exception:
+        topo_name = "?"
+        fast_model = mid_model = reason_model = "?"
+
     if status["bodega_reachable"] and status["model_loaded"]:
-        model_display = status.get("model") or "unknown"
-        # Trim long model paths for display
-        if model_display and "/" in model_display:
-            model_display = model_display.split("/")[-1]
         deep_tag = " | [bold cyan]⬇ deep mode[/]" if deep else ""
-        console.print(f"[dim]🧠 {model_display} | LLM decomposition + synthesis active{deep_tag}[/]")
+        monitor_tag = " | [bold yellow]📊 monitor[/]" if monitor else ""
+        console.print(
+            f"[dim]🧠 topology:[bold]{topo_name}[/bold] "
+            f"FAST=[cyan]{fast_model}[/cyan] "
+            f"MID=[cyan]{mid_model}[/cyan] "
+            f"REASON=[cyan]{reason_model}[/cyan]"
+            f"{deep_tag}{monitor_tag}[/]"
+        )
     elif status["bodega_reachable"]:
         console.print(f"[yellow]⚠ Bodega reachable but no model loaded — using keyword fallback[/]")
     else:
@@ -279,22 +295,121 @@ async def _ask(query: str, verbose: bool = False, deep: bool = False):
 
     console.print(f"\n[dim]Query: {query}[/]\n")
 
+    # ── MSR clarification hook ─────────────────────────────────────────────
+    # Async callable injected into the pipeline when --deep.
+    # WebAgent calls it after Round-1 if the query seems ambiguous.
+    # The hook presents Rich MCQ prompts one at a time; Enter = skip question.
+    async def clarification_hook(questions) -> str | None:
+        """Interactive MCQ prompt for Multi-Shot Refinement."""
+        n_total = len(questions)
+        answers: list[str] = []
+        console.print()
+        console.print(Panel(
+            f"[bold cyan]🎯 Octane wants to focus your deep search[/]\n"
+            f"[dim]Answer {n_total} quick question{'s' if n_total != 1 else ''} to steer the research "
+            f"(press Enter to skip any)[/]",
+            border_style="cyan",
+            padding=(0, 2),
+        ))
+        loop = asyncio.get_event_loop()
+        for i, q in enumerate(questions, 1):
+            console.print(f"\n[bold]({i}/{n_total})[/] [cyan]{q.text}[/]")
+            option_letters = "ABCDEFGH"
+            for j, opt in enumerate(q.options):
+                console.print(f"  [bold]{option_letters[j]}[/]  {opt}")
+            console.print("  [dim]↵  Skip[/]")
+            raw_answer = await loop.run_in_executor(
+                None, lambda: input("  Your choice: ").strip().upper()
+            )
+            if raw_answer:
+                idx = ord(raw_answer[0]) - ord('A')
+                if 0 <= idx < len(q.options):
+                    answers.append(f"{q.text}: {q.options[idx]}")
+                    console.print(f"  [green]✓[/] [dim]{q.options[idx]}[/]")
+                else:
+                    console.print("  [dim](skipped — unrecognised choice)[/]")
+            else:
+                console.print("  [dim](skipped)[/]")
+        if answers:
+            ctx = "; ".join(answers)
+            console.print(f"\n[dim]🔍 Deep search steering: {ctx}[/]\n")
+            return ctx
+        console.print("\n[dim]No steering applied — running full-breadth deep search[/]\n")
+        return None
+
     # Spinner runs while guard → decompose → dispatch → first Evaluator token
     # Stops automatically the moment the first streamed chunk arrives.
-    status = console.status("[dim]⚙  Routing and dispatching...[/]", spinner="dots")
-    status.start()
+    spin = console.status("[dim]⚙  Routing and dispatching...[/]", spinner="dots")
+    spin.start()
     full_output_parts = []
     first_token = True
     extra_meta = {"deep": True} if deep else {}
-    async for chunk in osa.run_stream(query, extra_metadata=extra_meta):
+    hook = clarification_hook if deep else None
+
+    # ── --monitor: live metrics task ──────────────────────────────────────────
+    _monitor_stop = asyncio.Event()
+
+    async def _monitor_loop() -> None:
+        """Poll system metrics every 2 s and print a live one-liner."""
+        import psutil  # type: ignore[import]
+        import time
+
+        _CLEAR = "\r\033[K"   # carriage-return + clear-to-eol
+        t0 = time.monotonic()
+        try:
+            while not _monitor_stop.is_set():
+                try:
+                    vm = psutil.virtual_memory()
+                    cpu = psutil.cpu_percent(interval=None)
+                    ram_used = vm.used / (1024 ** 3)
+                    ram_total = vm.total / (1024 ** 3)
+                    ram_pct = vm.percent
+                    elapsed = time.monotonic() - t0
+                    # Pressure colour
+                    ram_col = "red" if ram_pct > 85 else "yellow" if ram_pct > 70 else "green"
+                    cpu_col = "red" if cpu > 85 else "yellow" if cpu > 60 else "green"
+                    line = (
+                        f"[dim]📊 {elapsed:5.1f}s[/]  "
+                        f"RAM [{ram_col}]{ram_used:.1f}/{ram_total:.0f} GB ({ram_pct:.0f}%)[/{ram_col}]  "
+                        f"CPU [{cpu_col}]{cpu:.0f}%[/{cpu_col}]"
+                    )
+                    console.print(line)
+                except Exception:
+                    pass
+                await asyncio.sleep(2.0)
+        except asyncio.CancelledError:
+            pass
+
+    if monitor:
+        monitor_task: asyncio.Task | None = asyncio.ensure_future(_monitor_loop())
+        # prime cpu_percent (first call always returns 0.0)
+        try:
+            import psutil as _psutil  # type: ignore[import]
+            _psutil.cpu_percent(interval=None)
+        except Exception:
+            pass
+    else:
+        monitor_task = None
+
+    async for chunk in osa.run_stream(query, extra_metadata=extra_meta, clarification_hook=hook):
         if first_token:
-            status.stop()
+            spin.stop()
+            if monitor_task:
+                _monitor_stop.set()
+                await asyncio.sleep(0)  # let monitor print last line before output
             console.print("[bold green]🔥 Octane:[/] ", end="")
             first_token = False
         console.print(chunk, end="")
         full_output_parts.append(chunk)
     if first_token:
-        status.stop()  # pipeline ran but no tokens yielded (guard block, etc.)
+        spin.stop()
+    if monitor_task:
+        _monitor_stop.set()
+        monitor_task.cancel()
+        try:
+            await monitor_task
+        except asyncio.CancelledError:
+            pass
     console.print("\n")
 
     # Show trace summary with the correlation ID for octane trace
@@ -387,6 +502,12 @@ _EVENT_COLOURS: dict[str, str] = {
     "memory_write":         "blue",
     "egress":               "bold magenta",
     "preflight":            "dim",
+    # Web-agent events
+    "web_search_round":     "bold cyan",
+    "web_depth_analysis":   "bold blue",
+    "msr_decision":         "bold yellow",
+    "msr_answers":          "yellow",
+    "web_synthesis":        "bold magenta",
 }
 
 _EVENT_ICONS: dict[str, str] = {
@@ -400,6 +521,12 @@ _EVENT_ICONS: dict[str, str] = {
     "memory_write":         "💾",
     "egress":               "←",
     "preflight":            "·",
+    # Web-agent events
+    "web_search_round":     "🌐",
+    "web_depth_analysis":   "🔍",
+    "msr_decision":         "❓",
+    "msr_answers":          "✏",
+    "web_synthesis":        "📝",
 }
 
 
@@ -410,12 +537,16 @@ def trace(
         help="Correlation ID to trace. Partial IDs are accepted. "
              "Omit to list recent traces.",
     ),
+    verbose: bool = typer.Option(
+        False, "--verbose", "-v",
+        help="Verbose mode: show every URL, every chunk, every reasoning step.",
+    ),
 ):
     """🔍 Visual timeline of a query lifecycle — events, agents, DAG, duration."""
-    asyncio.run(_trace(correlation_id))
+    asyncio.run(_trace(correlation_id, verbose=verbose))
 
 
-async def _trace(correlation_id: str | None):
+async def _trace(correlation_id: str | None, verbose: bool = False):
     synapse = _get_synapse()
 
     if correlation_id:
@@ -511,30 +642,66 @@ async def _trace(correlation_id: str | None):
             if event.error:
                 detail = f"[red]✗ {event.error[:80]}[/]"
             elif event.payload:
-                for key in ("template", "reasoning", "output_preview", "query",
-                            "approach", "agents_used", "tasks_succeeded", "agent"):
-                    if key in event.payload:
-                        val = str(event.payload[key])
-                        label = {
-                            "template": "→",
-                            "reasoning": "reason:",
-                            "output_preview": "output:",
-                            "query": "q:",
-                            "approach": "plan:",
-                            "agents_used": "agents:",
-                            "tasks_succeeded": "ok:",
-                            "agent": "agent:",
-                        }.get(key, f"{key}:")
-                        detail = f"[dim]{label}[/] {val[:90]}"
-                        break
+                p = event.payload
+                if event.event_type == "web_search_round":
+                    rnd = p.get("round", "?")
+                    n_urls = p.get("urls_found", 0)
+                    n_ext = p.get("pages_extracted", 0)
+                    detail = f"[dim]round {rnd}:[/] {n_urls} URLs found, {n_ext} extracted"
+                elif event.event_type == "web_depth_analysis":
+                    n_fups = p.get("n_followups", 0)
+                    rnd = p.get("round", "?")
+                    detail = f"[dim]round {rnd}:[/] {n_fups} follow-up queries generated"
+                elif event.event_type == "msr_decision":
+                    should_ask = p.get("should_ask", False)
+                    n_q = p.get("n_questions", 0)
+                    detail = f"[cyan]ask={should_ask}[/] {n_q} questions"
+                elif event.event_type == "msr_answers":
+                    ctx = str(p.get("user_context", ""))[:90]
+                    detail = f"[dim]steering:[/] {ctx}"
+                elif event.event_type == "web_synthesis":
+                    n_art = p.get("n_articles", 0)
+                    mode = p.get("mode", "")
+                    detail = f"{n_art} articles · [dim]{mode}[/]"
+                else:
+                    for key in ("template", "reasoning", "output_preview", "query",
+                                "approach", "agents_used", "tasks_succeeded", "agent"):
+                        if key in p:
+                            val = str(p[key])
+                            label = {
+                                "template": "→",
+                                "reasoning": "reason:",
+                                "output_preview": "output:",
+                                "query": "q:",
+                                "approach": "plan:",
+                                "agents_used": "agents:",
+                                "tasks_succeeded": "ok:",
+                                "agent": "agent:",
+                            }.get(key, f"{key}:")
+                            detail = f"[dim]{label}[/] {val[:90]}"
+                            break
 
             tl_table.add_row(icon, offset, type_str, src_tgt, detail)
 
         console.print(tl_table)
+
+        # ── Verbose web-search sections ───────────────────────
+        if verbose:
+            _print_verbose_web_trace(real_events, t0)
+
         console.print(
             f"[dim]  {len(real_events)} events · "
             f"Run [bold]octane dag \"<query>\"[/bold] to preview routing before executing[/]"
         )
+        if not verbose:
+            web_evts = [e for e in real_events if e.event_type in (
+                "web_search_round", "web_depth_analysis", "msr_decision",
+                "msr_answers", "web_synthesis",
+            )]
+            if web_evts:
+                console.print(
+                    f"[dim]  {len(web_evts)} web events hidden — use [bold]-v[/bold] / [bold]--verbose[/bold] to see every URL and chunk[/]"
+                )
 
     else:
         # ── Recent traces list ────────────────────────────────
@@ -567,8 +734,169 @@ async def _trace(correlation_id: str | None):
             )
 
         console.print(table)
-        console.print("[dim]  octane trace <id>   — full event timeline[/]")
-        console.print("[dim]  octane trace <id>   — partial IDs accepted (first 8 chars)[/]")
+        console.print("[dim]  octane trace <id>         — full event timeline[/]")
+        console.print("[dim]  octane trace <id> -v      — verbose: every URL, chunk, reasoning[/]")
+        console.print("[dim]  octane trace <id>         — partial IDs accepted (first 8 chars)[/]")
+
+
+def _print_verbose_web_trace(events, t0) -> None:
+    """Render a rich verbose breakdown of all web-agent events.
+
+    Called from _trace() when --verbose is set.  Shows:
+    - Each search round: queries run, all URLs discovered, per-URL extraction details
+    - Each depth-analysis round: follow-up queries + rationales
+    - MSR decision and user answers
+    - Synthesis parameters
+    """
+    from rich.rule import Rule as RichRule
+
+    web_rounds = [e for e in events if e.event_type == "web_search_round"]
+    depth_events = [e for e in events if e.event_type == "web_depth_analysis"]
+    msr_dec = next((e for e in events if e.event_type == "msr_decision"), None)
+    msr_ans = next((e for e in events if e.event_type == "msr_answers"), None)
+    synth_evt = next((e for e in events if e.event_type == "web_synthesis"), None)
+
+    if not any([web_rounds, depth_events, msr_dec, synth_evt]):
+        return
+
+    console.print()
+    console.print(RichRule("[bold cyan]🔬 Verbose Web Trace[/]", style="cyan"))
+
+    # ── Search rounds ──────────────────────────────────────────
+    for evt in web_rounds:
+        p = evt.payload
+        rnd = p.get("round", "?")
+        sub = p.get("sub_agent", "")
+        queries_list = p.get("queries", [])
+        urls = p.get("urls", [])
+        extracted_detail = p.get("extracted_detail", [])
+        n_found = p.get("urls_found", len(urls))
+        n_ext = p.get("pages_extracted", len(extracted_detail))
+
+        offset_str = (
+            f"+{(evt.timestamp - t0).total_seconds() * 1000:.0f}ms"
+            if t0 else ""
+        )
+
+        console.print()
+        console.print(
+            f"[bold cyan]🌐 Round {rnd} Search[/]  [dim]{sub} · {offset_str}[/]  "
+            f"[green]{n_found} URLs found[/] · [yellow]{n_ext} extracted[/]"
+        )
+
+        # Queries used
+        if queries_list:
+            console.print(f"  [dim]Queries:[/]")
+            for q in queries_list:
+                console.print(f"    [dim]·[/] {q}")
+
+        # All discovered URLs (capped for readability)
+        if urls:
+            url_table = Table(show_header=True, show_lines=False, box=None, padding=(0, 2))
+            url_table.add_column("#", style="dim", width=3, justify="right")
+            url_table.add_column("URL", style="cyan")
+            url_table.add_column("Status", style="dim", width=10)
+            # Build a set of extracted URLs for quick lookup
+            extracted_urls = {d.get("url", "") for d in extracted_detail}
+            for i, url in enumerate(urls[:30], 1):
+                status_str = "[green]extracted[/]" if url in extracted_urls else "[dim]skipped[/]"
+                url_table.add_row(str(i), url[:100], status_str)
+            if len(urls) > 30:
+                url_table.add_row("…", f"[dim]+{len(urls) - 30} more[/]", "")
+            console.print(url_table)
+
+        # Per-extracted-page detail
+        if extracted_detail:
+            ext_table = Table(
+                title=f"Extracted Pages — Round {rnd}",
+                show_lines=False, box=None, padding=(0, 2),
+            )
+            ext_table.add_column("#", style="dim", width=3, justify="right")
+            ext_table.add_column("URL", style="cyan")
+            ext_table.add_column("Method", style="yellow", width=12)
+            ext_table.add_column("Chars", style="green", width=8, justify="right")
+            ext_table.add_column("Words", style="dim", width=8, justify="right")
+            for i, d in enumerate(extracted_detail, 1):
+                ext_table.add_row(
+                    str(i),
+                    d.get("url", "?")[:90],
+                    d.get("method", "?"),
+                    str(d.get("chars", 0)),
+                    str(d.get("words", 0)),
+                )
+            console.print(ext_table)
+
+    # ── Depth analysis rounds ──────────────────────────────────
+    for evt in depth_events:
+        p = evt.payload
+        rnd = p.get("round", "?")
+        followups = p.get("followup_queries", [])
+        uctx = p.get("user_context") or ""
+        offset_str = (
+            f"+{(evt.timestamp - t0).total_seconds() * 1000:.0f}ms"
+            if t0 else ""
+        )
+
+        console.print()
+        console.print(
+            f"[bold blue]🔍 Depth Analysis — Round {rnd}[/]  [dim]{offset_str}[/]  "
+            f"[cyan]{len(followups)} follow-up queries[/]"
+        )
+        if uctx:
+            console.print(f"  [dim]Steering:[/] {uctx}")
+
+        if followups:
+            fup_table = Table(show_header=True, show_lines=False, box=None, padding=(0, 2))
+            fup_table.add_column("#", style="dim", width=3, justify="right")
+            fup_table.add_column("Query", style="cyan")
+            fup_table.add_column("API", style="yellow", width=8)
+            fup_table.add_column("Rationale", style="dim")
+            for i, fup in enumerate(followups, 1):
+                fup_table.add_row(
+                    str(i),
+                    fup.get("query", "?")[:90],
+                    fup.get("api", "search"),
+                    fup.get("rationale", "")[:60],
+                )
+            console.print(fup_table)
+
+    # ── MSR decision ───────────────────────────────────────────
+    if msr_dec:
+        p = msr_dec.payload
+        should_ask = p.get("should_ask", False)
+        questions = p.get("questions", [])
+        offset_str = (
+            f"+{(msr_dec.timestamp - t0).total_seconds() * 1000:.0f}ms"
+            if t0 else ""
+        )
+        console.print()
+        decision_str = "[green]asked clarification[/]" if should_ask else "[dim]skipped (query clear)[/]"
+        console.print(f"[bold yellow]❓ MSR Decision  [dim]{offset_str}[/][/]  {decision_str}")
+        if questions:
+            for q_text in questions:
+                console.print(f"  [dim]·[/] {q_text}")
+        if msr_ans:
+            ctx = msr_ans.payload.get("user_context", "")
+            console.print(f"  [dim]User answered:[/] [cyan]{ctx}[/]")
+
+    # ── Synthesis params ───────────────────────────────────────
+    if synth_evt:
+        p = synth_evt.payload
+        n_art = p.get("n_articles", 0)
+        deep = p.get("deep", False)
+        mode = p.get("mode", "")
+        offset_str = (
+            f"+{(synth_evt.timestamp - t0).total_seconds() * 1000:.0f}ms"
+            if t0 else ""
+        )
+        console.print()
+        tier_str = "[bold magenta]REASON tier[/] (8B)" if deep else "[dim]MID tier[/] (Qwen)"
+        console.print(
+            f"[bold magenta]📝 Synthesis  [dim]{offset_str}[/][/]  "
+            f"{n_art} articles → {tier_str}  [dim]{mode}[/]"
+        )
+
+    console.print()
 
 
 def _resolve_trace_id(synapse, partial_id: str) -> str | None:

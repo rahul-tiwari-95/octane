@@ -72,6 +72,7 @@ class DepthAnalyzer:
         original_query: str,
         findings: list[str],
         max_followups: int = 4,
+        user_context: str | None = None,
     ) -> list[dict[str, str]]:
         """Analyse findings from Round 1 and generate deeper follow-up queries.
 
@@ -80,6 +81,9 @@ class DepthAnalyzer:
             findings:       List of text snippets / extracted content from Round 1.
                             Can be article titles, descriptions, or full paragraphs.
             max_followups:  Maximum number of follow-up queries to return (default 4).
+            user_context:   Optional MSR-provided user context (e.g. "User wants:
+                            Military operations & timeline; Diplomatic negotiations").
+                            Injected into the prompt to steer follow-up angles.
 
         Returns:
             List of strategy dicts (same format as QueryStrategist):
@@ -90,7 +94,7 @@ class DepthAnalyzer:
             return []
 
         try:
-            return await self._llm_followups(original_query, findings, max_followups)
+            return await self._llm_followups(original_query, findings, max_followups, user_context)
         except Exception as exc:
             logger.warning("depth_analysis_failed", error=str(exc))
             return []
@@ -100,6 +104,7 @@ class DepthAnalyzer:
         original_query: str,
         findings: list[str],
         max_followups: int,
+        user_context: str | None = None,
     ) -> list[dict[str, str]]:
         """Use FAST-tier LLM to generate targeted follow-up queries."""
         # Truncate findings to avoid context overflow — 150 chars each, max 8 items
@@ -109,10 +114,16 @@ class DepthAnalyzer:
         if not condensed:
             return []
 
+        # Inject user_context (from MSR) to steer follow-up angles
+        context_line = ""
+        if user_context and user_context.strip():
+            context_line = f"\nUser specifically wants to focus on: {user_context.strip()}\n"
+
         prompt = (
             f'Today is {today_str()} ({month_year()}).\n'
-            f'Original query: "{original_query}"\n\n'
-            f"Round-1 findings (excerpts):\n{condensed}\n\n"
+            f'Original query: "{original_query}"\n'
+            f"{context_line}"
+            f"\nRound-1 findings (excerpts):\n{condensed}\n\n"
             f"Generate {max_followups} targeted follow-up queries to deepen this research."
         )
 
@@ -136,6 +147,9 @@ class DepthAnalyzer:
             )
         else:
             clean = raw
+
+        # Strip markdown code fences (```json ... ``` or ``` ... ```)
+        clean = re.sub(r"```(?:json)?\s*", "", clean).strip()
 
         # Extract JSON array
         json_match = re.search(r"\[.*\]", clean, flags=re.DOTALL)

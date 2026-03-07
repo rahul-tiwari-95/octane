@@ -24,10 +24,12 @@ import structlog
 
 from octane.agents.base import BaseAgent
 from octane.models.schemas import AgentRequest, AgentResponse
+from octane.models.synapse import SynapseEvent
 from octane.tools.bodega_intel import BodegaIntelClient
 from octane.agents.web.synthesizer import Synthesizer
 from octane.agents.web.query_strategist import QueryStrategist
 from octane.agents.web.depth_analyzer import DepthAnalyzer
+from octane.agents.web.msr_decider import MSRDecider
 from octane.agents.web.content_extractor import ContentExtractor, ExtractedContent
 from octane.agents.web.browser import BrowserAgent
 from octane.utils.clock import month_year, today_str
@@ -56,6 +58,7 @@ class WebAgent(BaseAgent):
         self._synthesizer = Synthesizer(bodega=bodega)
         self._strategist = QueryStrategist(bodega=bodega)
         self._depth_analyzer = DepthAnalyzer(bodega=bodega)
+        self._msr_decider = MSRDecider(bodega=bodega)
         self._extractor = extractor or ContentExtractor()
         self._browser = browser or BrowserAgent(interactive=False)
         self._page_store = page_store  # WebPageStore | None
@@ -74,6 +77,21 @@ class WebAgent(BaseAgent):
                     )
                 except Exception as exc:
                     logger.debug("web_page_store_failed", url=item.url, error=str(exc))
+
+    def _emit(self, correlation_id: str, event_type: str, payload: dict) -> None:
+        """Emit a Synapse observability event from the WebAgent.
+
+        Safe to call at any time — never raises.
+        """
+        try:
+            self.synapse.emit(SynapseEvent(
+                correlation_id=correlation_id,
+                event_type=event_type,
+                source="web",
+                payload=payload,
+            ))
+        except Exception:
+            pass  # never crash the pipeline because of tracing
 
     async def execute(self, request: AgentRequest) -> AgentResponse:
         """Route to the correct Bodega Intelligence API based on sub_agent hint."""
@@ -335,7 +353,12 @@ class WebAgent(BaseAgent):
         When ``deep=True`` (or ``--deep`` flag), a second round of targeted follow-up
         queries is generated from Round-1 findings and executed in parallel, giving
         much broader topic coverage before final synthesis.
+
+        MSR (Multi-Shot Refinement): after Round-1, if deep=True and a
+        clarification_hook is provided in request.context, the MSRDecider evaluates
+        ambiguity and may ask the user 1-3 multiple-choice questions before deepening.
         """
+        cid = request.correlation_id
         strategies = await self._strategist.strategize(
             query, context={"sub_agent": "news"}
         )
@@ -384,6 +407,25 @@ class WebAgent(BaseAgent):
             if r1_usable:
                 await self._store_pages(r1_usable)
 
+        # ── Emit Round-1 Synapse event ────────────────────────────────────────
+        self._emit(cid, "web_search_round", {
+            "round": 1,
+            "sub_agent": "news",
+            "queries": [search_query],
+            "urls_found": len(combined_urls),
+            "pages_extracted": len(r1_usable),
+            "urls": combined_urls[:20],  # cap to keep event size sane
+            "extracted_detail": [
+                {
+                    "url": a.url,
+                    "method": a.method,
+                    "chars": len(a.text) if a.text else 0,
+                    "words": a.word_count,
+                }
+                for a in r1_usable
+            ],
+        })
+
         logger.info(
             "news_round1_complete",
             query=query[:60],
@@ -391,7 +433,36 @@ class WebAgent(BaseAgent):
             n_extracted=len(r1_usable),
         )
 
-        # ── Round 2: iterative deepening (always on for news; more on --deep) ─
+        # ── MSR: Multi-Shot Refinement (deep mode only) ───────────────────────
+        user_context: str | None = None
+        if deep and r1_usable:
+            clarification_hook = request.context.get("clarification_hook")
+            if clarification_hook is not None:
+                findings_for_msr = [a.text[:200] for a in r1_usable[:6] if a.text]
+                msr_result = await self._msr_decider.decide(query, findings_for_msr)
+
+                self._emit(cid, "msr_decision", {
+                    "should_ask": msr_result.should_ask,
+                    "n_questions": len(msr_result.questions),
+                    "questions": [q.text for q in msr_result.questions],
+                })
+
+                if msr_result.should_ask and msr_result.questions:
+                    try:
+                        user_context = await clarification_hook(msr_result.questions)
+                        if user_context:
+                            self._emit(cid, "msr_answers", {
+                                "user_context": user_context,
+                            })
+                            logger.info(
+                                "msr_clarification_received",
+                                query=query[:60],
+                                context_preview=user_context[:120],
+                            )
+                    except Exception as exc:
+                        logger.warning("msr_hook_failed", error=str(exc))
+
+        # ── Round 2+: iterative deepening (always on for news; more on --deep) ─
         all_usable = list(r1_usable)
         r2_rounds = 2 if deep else 1
         for round_num in range(r2_rounds):
@@ -403,9 +474,22 @@ class WebAgent(BaseAgent):
                 original_query=query,
                 findings=findings,
                 max_followups=max_fups,
+                user_context=user_context,
             )
             if not followups:
                 break
+
+            # ── Emit depth-analysis event ─────────────────────────────────────
+            self._emit(cid, "web_depth_analysis", {
+                "round": round_num + 2,
+                "sub_agent": "news",
+                "n_followups": len(followups),
+                "followup_queries": [
+                    {"query": f["query"][:120], "api": f.get("api", "search"), "rationale": f.get("rationale", "")}
+                    for f in followups
+                ],
+                "user_context": user_context,
+            })
 
             logger.info(
                 "news_deepening_round",
@@ -450,6 +534,26 @@ class WebAgent(BaseAgent):
                 if r2_usable:
                     await self._store_pages(r2_usable)
                     all_usable.extend(r2_usable)
+
+                    # Emit per-round extraction event
+                    self._emit(cid, "web_search_round", {
+                        "round": round_num + 2,
+                        "sub_agent": "news",
+                        "queries": [f["query"] for f in followups],
+                        "urls_found": len(new_urls),
+                        "pages_extracted": len(r2_usable),
+                        "urls": new_urls[:20],
+                        "extracted_detail": [
+                            {
+                                "url": a.url,
+                                "method": a.method,
+                                "chars": len(a.text) if a.text else 0,
+                                "words": a.word_count,
+                            }
+                            for a in r2_usable
+                        ],
+                    })
+
                     logger.info(
                         "news_deepening_extracted",
                         round=round_num + 2,
@@ -459,7 +563,12 @@ class WebAgent(BaseAgent):
 
         # ── Synthesis ─────────────────────────────────────────────────────────
         if all_usable:
-            summary = await self._synthesizer.synthesize_with_content(query, all_usable)
+            self._emit(cid, "web_synthesis", {
+                "n_articles": len(all_usable),
+                "deep": deep,
+                "mode": "REASON+3000tok" if deep else "MID+768tok",
+            })
+            summary = await self._synthesizer.synthesize_with_content(query, all_usable, deep=deep)
             return AgentResponse(
                 agent=self.name, success=True,
                 output=summary, data={"news": news_raw, "web": web_raw},
@@ -500,7 +609,12 @@ class WebAgent(BaseAgent):
         When ``deep=True``, a DepthAnalyzer pass generates 3-5 follow-up queries
         from Round-1 findings and runs them in parallel before final synthesis —
         dramatically broadening topic coverage.
+
+        MSR fires after Round-1 when deep=True and a clarification_hook is in
+        request.context — asks the user 1-3 MCQ questions to steer deepening.
         """
+        cid = request.correlation_id
+
         # Generate 2-3 search variations
         strategies = await self._strategist.strategize(query)
 
@@ -554,6 +668,25 @@ class WebAgent(BaseAgent):
             if r1_usable:
                 await self._store_pages(r1_usable)
 
+        # ── Emit Round-1 Synapse event ────────────────────────────────────────
+        self._emit(cid, "web_search_round", {
+            "round": 1,
+            "sub_agent": "search",
+            "queries": [s["query"] for s in strategies],
+            "urls_found": len(urls),
+            "pages_extracted": len(r1_usable),
+            "urls": urls[:20],
+            "extracted_detail": [
+                {
+                    "url": a.url,
+                    "method": a.method,
+                    "chars": len(a.text) if a.text else 0,
+                    "words": a.word_count,
+                }
+                for a in r1_usable
+            ],
+        })
+
         logger.info(
             "search_round1_complete",
             query=query[:60],
@@ -561,6 +694,35 @@ class WebAgent(BaseAgent):
             n_results=len(results),
             n_extracted=len(r1_usable),
         )
+
+        # ── MSR: Multi-Shot Refinement (deep mode only) ───────────────────────
+        user_context: str | None = None
+        if deep and r1_usable:
+            clarification_hook = request.context.get("clarification_hook")
+            if clarification_hook is not None:
+                findings_for_msr = [a.text[:200] for a in r1_usable[:6] if a.text]
+                msr_result = await self._msr_decider.decide(query, findings_for_msr)
+
+                self._emit(cid, "msr_decision", {
+                    "should_ask": msr_result.should_ask,
+                    "n_questions": len(msr_result.questions),
+                    "questions": [q.text for q in msr_result.questions],
+                })
+
+                if msr_result.should_ask and msr_result.questions:
+                    try:
+                        user_context = await clarification_hook(msr_result.questions)
+                        if user_context:
+                            self._emit(cid, "msr_answers", {
+                                "user_context": user_context,
+                            })
+                            logger.info(
+                                "msr_clarification_received",
+                                query=query[:60],
+                                context_preview=user_context[:120],
+                            )
+                    except Exception as exc:
+                        logger.warning("msr_hook_failed", error=str(exc))
 
         # ── Round 2: iterative deepening (--deep flag) ───────────────────────
         all_usable = list(r1_usable)
@@ -570,8 +732,21 @@ class WebAgent(BaseAgent):
                 original_query=query,
                 findings=findings,
                 max_followups=5,
+                user_context=user_context,
             )
             if followups:
+                # ── Emit depth-analysis event ─────────────────────────────────
+                self._emit(cid, "web_depth_analysis", {
+                    "round": 2,
+                    "sub_agent": "search",
+                    "n_followups": len(followups),
+                    "followup_queries": [
+                        {"query": f["query"][:120], "api": f.get("api", "search"), "rationale": f.get("rationale", "")}
+                        for f in followups
+                    ],
+                    "user_context": user_context,
+                })
+
                 logger.info(
                     "search_deepening_round2",
                     n_followups=len(followups),
@@ -606,6 +781,25 @@ class WebAgent(BaseAgent):
                     if r2_usable:
                         await self._store_pages(r2_usable)
                         all_usable.extend(r2_usable)
+
+                        self._emit(cid, "web_search_round", {
+                            "round": 2,
+                            "sub_agent": "search",
+                            "queries": [f["query"] for f in followups],
+                            "urls_found": len(new_urls),
+                            "pages_extracted": len(r2_usable),
+                            "urls": new_urls[:20],
+                            "extracted_detail": [
+                                {
+                                    "url": a.url,
+                                    "method": a.method,
+                                    "chars": len(a.text) if a.text else 0,
+                                    "words": a.word_count,
+                                }
+                                for a in r2_usable
+                            ],
+                        })
+
                         logger.info(
                             "search_deepening_extracted",
                             new_pages=len(r2_usable),
@@ -614,7 +808,12 @@ class WebAgent(BaseAgent):
 
         # ── Synthesis ─────────────────────────────────────────────────────────
         if all_usable:
-            summary = await self._synthesizer.synthesize_with_content(query, all_usable)
+            self._emit(cid, "web_synthesis", {
+                "n_articles": len(all_usable),
+                "deep": deep,
+                "mode": "REASON+3000tok" if deep else "MID+768tok",
+            })
+            summary = await self._synthesizer.synthesize_with_content(query, all_usable, deep=deep)
             return AgentResponse(
                 agent=self.name, success=True,
                 output=summary, data=raw,
