@@ -21,10 +21,8 @@ Tier semantics (matched to live Bodega models):
     REASON — bodega-raptor-8b   — deep analysis, synthesis, evaluation
     EMBED  — handled in-process; not routed through Bodega
 
-The router is API-compatible with BodegaInferenceClient for all inference
-methods, with an extra optional ``tier=`` parameter on each.  Admin methods
-(load_model / unload_model) are intentionally omitted — those stay on the
-raw BodegaInferenceClient used exclusively by SysStat.ModelManager.
+The router dynamically queries Bodega for loaded models and falls back
+gracefully if the preferred tier model isn't available.
 """
 
 from __future__ import annotations
@@ -45,6 +43,9 @@ logger = structlog.get_logger().bind(component="bodega_router")
 class BodegaRouter:
     """Tier-aware routing wrapper around :class:`BodegaInferenceClient`.
 
+    Dynamically queries Bodega for loaded models and falls back gracefully
+    if the preferred tier model isn't available.
+
     Args:
         topology: Topology name (``'auto'``, ``'compact'``, ``'balanced'``,
                   ``'power'``) **or** a pre-built :class:`Topology` object.
@@ -64,17 +65,70 @@ class BodegaRouter:
         self._topology: Topology = (
             topology if isinstance(topology, Topology) else get_topology(topology)
         )
+        # Cache of loaded models: {model_id: model_type}
+        self._loaded_models: dict[str, str] | None = None
         logger.debug("bodega_router_init", topology=self._topology.name)
+
+    # ── Dynamic model discovery ───────────────────────────────────────────────
+
+    async def _fetch_loaded_models(self) -> dict[str, str]:
+        """Fetch currently loaded models from Bodega. Cached per instance."""
+        if self._loaded_models is not None:
+            return self._loaded_models
+
+        try:
+            # Use /health endpoint which returns models_detail
+            resp = await self._client.health()
+            models_detail = resp.get("models_detail", [])
+            self._loaded_models = {
+                m["id"]: m.get("type", "lm")
+                for m in models_detail
+                if m.get("status") == "running"
+            }
+            logger.debug("bodega_models_discovered", models=list(self._loaded_models.keys()))
+            return self._loaded_models
+        except Exception as exc:
+            logger.warning("bodega_model_discovery_failed", error=str(exc))
+            return {}
+
+    def invalidate_model_cache(self) -> None:
+        """Clear cached model list — call after load/unload operations."""
+        self._loaded_models = None
+
+    async def _resolve_available_model(self, tier: ModelTier) -> str | None:
+        """Resolve a tier to an actually-loaded model ID, or None.
+        
+        Falls back to any available LM model if the preferred one isn't loaded.
+        """
+        loaded = await self._fetch_loaded_models()
+
+        if not loaded:
+            return None
+
+        # Get preferred model for this tier from topology
+        preferred = self._topology.resolve(tier)
+
+        # If preferred model is loaded, use it
+        if preferred in loaded:
+            return preferred
+
+        # Otherwise, find any loaded LM model as fallback
+        for model_id, model_type in loaded.items():
+            if model_type == "lm":
+                logger.info(
+                    "bodega_tier_fallback",
+                    tier=tier.value,
+                    preferred=preferred,
+                    using=model_id,
+                )
+                return model_id
+
+        return None
 
     # ── Topology helpers ──────────────────────────────────────────────────────
 
     def resolve_config(self, tier: ModelTier) -> ModelConfig:
-        """Return the full :class:`ModelConfig` for *tier* under the active topology.
-
-        Use this when you need more than just the model_id — e.g. to inspect
-        ``max_concurrency``, ``prompt_cache_size``, or ``draft_model_path``
-        that were used when loading the model.
-        """
+        """Return the full :class:`ModelConfig` for *tier* under the active topology."""
         return self._topology.resolve_config(tier)
 
     def resolve_model_id(self, tier: ModelTier) -> str:
@@ -97,8 +151,8 @@ class BodegaRouter:
     ) -> dict[str, Any]:
         """Routed chat completion.
 
-        Resolves the tier to a model_id and passes it in the Bodega request
-        so the engine routes to the correct queued model.
+        Dynamically resolves the tier to an actually-loaded model.
+        Falls back to any available LM model if the preferred one isn't loaded.
 
         Args:
             messages:    OpenAI-format message list.
@@ -108,8 +162,18 @@ class BodegaRouter:
 
         Returns:
             Full Bodega API response dict (OpenAI-compatible).
+            
+        Raises:
+            RuntimeError: If no LM models are loaded in Bodega.
         """
-        model_id = self.resolve_model_id(tier)
+        model_id = await self._resolve_available_model(tier)
+        
+        if model_id is None:
+            raise RuntimeError(
+                "No LM models loaded in Bodega. "
+                "Check Bodega status: curl http://localhost:44468/health"
+            )
+        
         logger.debug("router_chat", tier=tier.value, model_id=model_id)
         return await self._client.chat(
             messages=messages,
@@ -161,11 +225,8 @@ class BodegaRouter:
     ) -> AsyncIterator[str]:
         """Routed streaming chat — yields text chunks as they arrive.
 
-        Uses SSE (OpenAI-compatible).  Each yielded value is a raw text
-        fragment — callers print / accumulate immediately.
-
-        Uses a no-keepalive httpx client per stream to avoid drain blocking
-        on cancellation (same pattern as BodegaInferenceClient.chat_stream).
+        Dynamically resolves the tier to an actually-loaded model.
+        Falls back to any available LM model if the preferred one isn't loaded.
 
         Args:
             prompt:        User prompt.
@@ -174,13 +235,23 @@ class BodegaRouter:
             temperature:   Sampling temperature.
             max_tokens:    Max tokens to generate.
             total_timeout: Read timeout between SSE chunks.
+            
+        Raises:
+            RuntimeError: If no LM models are loaded in Bodega.
         """
+        model_id = await self._resolve_available_model(tier)
+        
+        if model_id is None:
+            raise RuntimeError(
+                "No LM models loaded in Bodega. "
+                "Check Bodega status: curl http://localhost:44468/health"
+            )
+
         messages: list[dict[str, str]] = []
         if system:
             messages.append({"role": "system", "content": system})
         messages.append({"role": "user", "content": prompt})
 
-        model_id = self.resolve_model_id(tier)
         logger.debug("router_chat_stream", tier=tier.value, model_id=model_id)
 
         payload = {

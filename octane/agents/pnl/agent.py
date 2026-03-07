@@ -33,7 +33,7 @@ class PnLAgent(BaseAgent):
         self.feedback = FeedbackLearner(redis=redis, prefs=self.prefs)
 
     async def get_profile(self, user_id: str = "default") -> dict[str, str]:
-        """Return the full preference profile for a user."""
+        """Return the gfull preference profile for a user."""
         return await self.prefs.get_all(user_id)
 
     async def set_preference(self, user_id: str, key: str, value: str) -> None:

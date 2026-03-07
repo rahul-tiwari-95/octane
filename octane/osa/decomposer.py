@@ -41,7 +41,8 @@ PIPELINE_TEMPLATES: dict[str, dict] = {
         "agent": "web",
         "sub_agent": "search",
         "description": "General web search or research question",
-        "keywords": ["search", "find", "look up", "what is", "who is", "where is", "how does"],
+        "keywords": ["search", "find", "look up", "what is", "who is", "where is", "how does",
+                     "pros", "cons", "review", "compare", "macbook", "iphone", "laptop", "product"],
     },
     "code_generation": {
         "agent": "code",
@@ -60,7 +61,7 @@ PIPELINE_TEMPLATES: dict[str, dict] = {
         "agent": "sysstat",
         "sub_agent": "monitor",
         "description": "Check system health, RAM, CPU, or loaded model status",
-        "keywords": ["health", "status", "system", "ram", "cpu", "model", "loaded", "memory usage"],
+        "keywords": ["health check", "system status", "cpu usage", "memory usage", "loaded models", "octane status"],
     },
 }
 
@@ -184,16 +185,19 @@ class Decomposer:
         )
 
         # Extract content after </think> block (reasoning models like bodega-raptor emit <think>…</think>)
-        # Using partition instead of regex so a truncated (unclosed) <think> is handled gracefully.
         import re
         if "</think>" in raw:
             _, _, after = raw.partition("</think>")
             cleaned = after.strip()
             logger.debug("model_reasoning_trace", trace=raw.partition("</think>")[0].replace("<think>", "").strip()[:300])
         else:
-            cleaned = raw.strip()
+            # No closing </think> — might be truncated. Strip any opening <think> and everything after it.
+            cleaned = re.sub(r"<think>.*", "", raw, flags=re.DOTALL).strip()
+        
         if not cleaned:
-            cleaned = raw.strip()
+            # If we stripped everything, the model only produced <think> content — return None to fall back
+            logger.warning("llm_returned_only_think_block", raw=raw[:100])
+            return None
 
         template_name = cleaned.strip().lower().strip('"\'.,;:\n ')
 

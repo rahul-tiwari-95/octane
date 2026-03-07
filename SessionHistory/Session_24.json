@@ -1,0 +1,166 @@
+{
+  "session": 24,
+  "date": "2025-07-25",
+  "title": "Octane Daemon — Persistent Background Service with IPC, Priority Queue, Cache Policy, and Model Lifecycle",
+  "status": "complete",
+  "started_at": "2025-07-25T00:00:00Z",
+  "completed_at": "2025-07-25T23:59:00Z",
+
+  "goals": [
+    "Build the Octane Daemon — persistent background service that transforms Octane from a tool you run to a system that runs for you",
+    "Implement pure algorithmic cache policy engine (LRU, TTL tiers, sliding window, pinning, promotion) — no LLM involvement",
+    "Implement algorithmic data router for Redis vs Postgres placement using OS-scheduling-inspired rules",
+    "Implement OS-level priority queue with anti-starvation aging for daemon task scheduling",
+    "Implement daemon shared state management with observable callbacks",
+    "Implement aggressive model lifecycle manager with topology-aware idle timeouts",
+    "Implement connection pool manager for Redis, Postgres, and Bodega HTTP",
+    "Implement Unix socket IPC server with NDJSON protocol for daemon communication",
+    "Implement Unix socket IPC client for CLI-side daemon interaction",
+    "Implement daemon lifecycle management (start/stop/status/drain) with PID tracking",
+    "Wire daemon CLI subcommands into octane main CLI",
+    "Write comprehensive true functional tests — no placeholder mocks, real algorithms tested"
+  ],
+
+  "deliverables": {
+    "working_commands": [
+      "octane daemon start — Fork daemon process, write PID, init pools/server",
+      "octane daemon stop — Send SIGTERM to daemon, wait for graceful shutdown",
+      "octane daemon status — Show daemon PID, uptime, connection health (Rich table)",
+      "octane daemon drain — Gracefully drain queue, reject new items, finish existing"
+    ],
+    "files_created": {
+      "octane/daemon/": [
+        "__init__.py — Package docstring",
+        "cache_policy.py — Pure algorithmic LRU cache engine with TTL tiers, sliding window, pinning, promotion (534 lines)",
+        "data_router.py — Algorithmic Redis vs Postgres placement with DataCategory → StorageBackend routing",
+        "queue.py — OS-level priority queue (P0-P3) with anti-starvation aging",
+        "state.py — Shared daemon state: model registry, connection health, session tracking, observable callbacks",
+        "model_manager.py — Aggressive model lifecycle with topology-aware idle timeouts (compact=120s, balanced=300s, power=600s)",
+        "pool.py — Connection pool manager for Redis, Postgres, Bodega HTTP with health checks",
+        "server.py — Unix socket NDJSON server at ~/.octane/octane.sock with streaming response support",
+        "client.py — Unix socket IPC client with daemon auto-detection",
+        "lifecycle.py — Daemon process management: fork, PID file, signal handling, stale cleanup"
+      ],
+      "tests/unit/": [
+        "test_session24_daemon.py — 64 true functional tests across 15 test classes"
+      ]
+    },
+    "files_modified": {
+      "octane/": [
+        "main.py — Added daemon_app Typer subgroup with start/stop/status/drain commands"
+      ],
+      "octane/daemon/": [
+        "cache_policy.py — Fixed PromotionPolicy.should_promote() to accept now parameter for testable age calculation"
+      ]
+    }
+  },
+
+  "architecture": {
+    "daemon_components": {
+      "cache_policy": {
+        "description": "Pure algorithmic cache engine — no I/O, no network. Decides what to keep, evict, and promote.",
+        "algorithms": [
+          "LRU eviction via OrderedDict — O(1) move_to_end/popitem",
+          "TTL tiers: EPHEMERAL(5m/15m), SESSION(2h/6h), WARM(24h/72h), PERSISTENT(∞)",
+          "Sliding window TTL: each access extends expire_at by base_ttl, capped at created_at + max_ttl",
+          "Pinning: critical data immune to LRU eviction",
+          "Promotion: data surviving thresholds (access count OR age) graduates Redis → Postgres"
+        ]
+      },
+      "data_router": {
+        "description": "Algorithmic placement engine mapping 11 data categories to storage backends.",
+        "categories": "QUERY_CACHE, SESSION_STATE, SEARCH_RESULTS, MSR_CONTEXT, RATE_LIMIT, RESEARCH_REPORT, USER_PREFERENCE, MEMORY_CHUNK, MODEL_STATE, MONITOR_CONFIG, CHAIN_CHECKPOINT",
+        "backends": "REDIS (ephemeral/session), POSTGRES (persistent/reports), REDIS_WITH_PROMOTION (hot data that may graduate)"
+      },
+      "queue": {
+        "description": "Priority queue for daemon task scheduling with anti-starvation.",
+        "priorities": "P0_INTERACTIVE, P1_SHADOW, P2_SCHEDULED, P3_BATCH",
+        "anti_starvation": "Items waiting >60s get priority bumped by 1 level"
+      },
+      "model_manager": {
+        "description": "Aggressive model lifecycle — idle sweep every 30s, topology-aware timeouts.",
+        "timeouts": {
+          "compact": "120s — tight memory, unload fast",
+          "balanced": "300s — default 5 min idle",
+          "power": "600s — 64GB can afford longer"
+        },
+        "protected_tiers": "FAST tier models never unloaded (tiny, always useful)"
+      },
+      "ipc": {
+        "protocol": "NDJSON over Unix socket at ~/.octane/octane.sock",
+        "commands": "ask, health, status, drain",
+        "streaming": "Handlers can yield multiple response dicts for streaming"
+      }
+    },
+    "design_philosophy": [
+      "OS scheduling theory applied to cache — LRU like page replacement, TTL like process scheduling quanta",
+      "Pure algorithmic routing — no LLM calls for data placement decisions",
+      "Custom hash functions for Redis key namespacing",
+      "Daemon is OPTIONAL — octane ask works without it, daemon just makes it faster",
+      "Observable state — callbacks fire on state changes for monitoring"
+    ]
+  },
+
+  "tests": {
+    "new_tests": 64,
+    "previous_total": 528,
+    "current_total": 592,
+    "known_failures": "8 matplotlib-dependent chart catalyst tests (pre-existing, no matplotlib installed)",
+    "test_classes": [
+      "TestCachePolicyLRU — 5 tests: real LRU eviction order, capacity enforcement, memory budget",
+      "TestCachePolicyTTL — 4 tests: real TTL with time.monotonic, tier-specific lifetimes, expired sweep",
+      "TestCachePolicySlidingWindow — 2 tests: sliding window extension, ceiling cap with intermediate accesses",
+      "TestCachePolicyPinning — 2 tests: pinned items survive LRU eviction, all-pinned-no-eviction",
+      "TestCachePolicyPromotion — 5 tests: access threshold, age threshold, ephemeral never promoted, no re-promotion, stats accuracy",
+      "TestDataRouterPolicies — 8 tests: all categories have policies, Redis/Postgres/promotion routing, key hashing, overflow, cache tracking",
+      "TestPriorityQueueOrdering — 4 tests: P0 before P3, FIFO within priority, mixed ordering, timeout returns None",
+      "TestPriorityQueueAging — 3 tests: P3→P2 aging, P0 never ages, aging reorders queue",
+      "TestPriorityQueueDrain — 4 tests: drain rejects new, allows existing, max size, depth by priority",
+      "TestDaemonState — 7 tests: model register/unregister, idle detection, callbacks, connection health, sessions, snapshot",
+      "TestModelManager — 5 tests: topology thresholds, idle unload, active spared, FAST protected, usage reset",
+      "TestUnixSocketIPC — 7 tests: real ping/pong over socket, invalid JSON, multiple requests, connection tracking, daemon detection, connect failure, socket permissions",
+      "TestLifecycle — 3 tests: subsystem init, topology resolution, stale socket cleanup",
+      "TestPoolManager — 2 tests: pool sizing per topology, snapshot structure",
+      "TestCLIIntegration — 2 tests: subcommand registration, status when not running",
+      "TestEndToEndDataFlow — 2 tests: full data lifecycle, mixed category routing"
+    ],
+    "test_philosophy": "True functional tests — real algorithms with real data structures, real asyncio event loops, real Unix sockets. External dependencies (Bodega HTTP, Redis, Postgres) mocked at the boundary. No placeholder tests."
+  },
+
+  "bugs_found_and_fixed": [
+    {
+      "bug": "PromotionPolicy.should_promote() used entry.age property which calls time.monotonic() live, ignoring the simulated 'now' parameter passed through the call chain",
+      "impact": "Age-based promotion could never be tested with simulated time; in production, promotion decisions would use wall time instead of consistent monotonic timestamps",
+      "fix": "Added 'now' parameter to should_promote(), compute age as now - entry.created_at. Updated get_promotion_candidates() to pass now through.",
+      "file": "octane/daemon/cache_policy.py"
+    },
+    {
+      "bug": "test_sliding_window_respects_ceiling jumped directly from t+0 to t+800, but EPHEMERAL entries expire at t+300 — entry was dead before the ceiling test could run",
+      "impact": "Test was asserting on a None entry instead of testing the ceiling cap",
+      "fix": "Added intermediate accesses at t+200, t+400, t+600 to keep the entry alive through sliding window extension before testing the ceiling at t+800",
+      "file": "tests/unit/test_session24_daemon.py"
+    },
+    {
+      "bug": "server.py used AsyncResponseIterator type alias before it was defined (forward reference without quotes)",
+      "impact": "NameError on import",
+      "fix": "Changed Callable signature to use AsyncIterator[dict[str, Any]] directly instead of the forward-referenced alias",
+      "file": "octane/daemon/server.py"
+    }
+  ],
+
+  "key_decisions": [
+    "Unix socket over TCP — daemon is local-only, no network overhead, natural OS permission model",
+    "NDJSON protocol — simple, streamable, debuggable with cat/jq",
+    "PID file at ~/.octane/daemon.pid — standard Unix daemon pattern",
+    "Anti-starvation aging at 60s — prevents batch tasks from starving under interactive load",
+    "FAST tier models protected from unload — 90M model is tiny, always useful for quick completions",
+    "Sliding window TTL ceiling = created_at + max_ttl — hot data stays alive but nothing lives forever",
+    "Promotion is OR-based (access_count OR age) not AND-based — either signal alone justifies persistence"
+  ],
+
+  "session_total_lines": {
+    "source": "~2000 lines across 10 daemon modules",
+    "tests": "~1385 lines, 64 tests",
+    "total": "~3385 lines"
+  }
+}

@@ -702,6 +702,19 @@ else:
 
 Discover, download, and manage models from HuggingFace.
 
+Very important to understand eepely why the scheduling is not in sync with what we are epecting -
+seseically on a loop 
+
+shadow pipeline was not enough 
+for creating truly synchronous pipeline 
+without being at fault.
+this makes this more resilient and performing 
+running async loops on a timed based circuits is very dangerous 
+and can lead to leaks.
+
+but in the end, when the simulation is not happening as per the requirmeents
+this starts making it difficualt 
+
 ### List Available Models
 
 List all models available in your local HuggingFace cache.

@@ -173,17 +173,33 @@ class Evaluator:
             f"Synthesize a direct response to the user's query."
         )
 
-        response = await asyncio.wait_for(
-            self._bodega.chat_simple(
-                prompt=prompt,
-                system=system,
-                tier=ModelTier.REASON,
-                temperature=0.3,
-                max_tokens=512,  # research synthesis needs key facts, not long essays
-            ),
-            timeout=30.0,  # evaluator synthesis: 30 s cap
-        )
-        return response.strip()
+        # Try REASON tier first, fall back to MID if model not available
+        for tier in (ModelTier.REASON, ModelTier.MID, ModelTier.FAST):
+            try:
+                response = await asyncio.wait_for(
+                    self._bodega.chat_simple(
+                        prompt=prompt,
+                        system=system,
+                        tier=tier,
+                        temperature=0.3,
+                        max_tokens=1500,
+                    ),
+                    timeout=30.0,
+                )
+                # Strip <think> blocks (complete or truncated)
+                clean = re.sub(r"<think>.*?</think>", "", response, flags=re.DOTALL)
+                clean = re.sub(r"<think>.*$", "", clean, flags=re.DOTALL)
+                return clean.strip()
+            except Exception as exc:
+                logger.warning(
+                    "evaluator_tier_failed",
+                    tier=tier.value,
+                    error=str(exc),
+                )
+                continue
+        
+        # All tiers failed - raise to trigger concatenation fallback
+        raise RuntimeError("All model tiers failed")
 
     def _build_prompt(
         self,
@@ -259,70 +275,87 @@ class Evaluator:
             f"Synthesize a direct response to the user's query."
         )
 
-        try:
-            # Stream tokens, stripping <think>...</think> blocks inline.
-            # Strategy: buffer everything until we've seen </think> (or confirmed
-            # no think block exists), then flush the clean remainder.
-            raw_buffer = ""
-            think_done = False
-
-            async for chunk in self._bodega.chat_stream(
-                prompt=prompt,
-                system=system,
-                tier=ModelTier.REASON,
-                temperature=0.3,
-                max_tokens=512,  # research synthesis: key facts only, not essays
-            ):
-                raw_buffer += chunk
-
-                if not think_done:
-                    # Still waiting to determine if there's a think block
-                    if "</think>" in raw_buffer:
-                        # Strip the entire think block and start streaming
-                        clean = re.sub(r"<think>.*?</think>", "", raw_buffer, flags=re.DOTALL).lstrip()
-                        think_done = True
-                        if clean:
-                            yield clean
-                            raw_buffer = ""
-                    elif "<think>" not in raw_buffer and len(raw_buffer) > 20:
-                        # No think block started after 20 chars — safe to stream
-                        think_done = True
-                        yield raw_buffer
-                        raw_buffer = ""
-                    # else: still accumulating — keep buffering
-                else:
-                    # think block is done — stream chunks directly
-                    yield chunk
-                    raw_buffer = ""
-
-            # Flush any remaining buffered content
-            if raw_buffer:
-                clean = re.sub(r"<think>.*?</think>", "", raw_buffer, flags=re.DOTALL).strip()
-                if clean:
-                    yield clean
-
-        except Exception as exc:
-            logger.warning("stream_failed", error=str(exc), fallback="evaluate()")
-            # Graceful fallback to non-streaming
+        # Try tiers in order - REASON first, then MID, then FAST
+        for tier in (ModelTier.REASON, ModelTier.MID, ModelTier.FAST):
             try:
-                result = await self.evaluate(
-                    original_query, results,
-                    prior_context=prior_context,
-                    user_profile=user_profile,
-                    conversation_history=conversation_history,
-                )
-            except Exception as eval_exc:
+                # Stream tokens, stripping <think>...</think> blocks inline.
+                raw_buffer = ""
+                think_done = False
+                streamed_any = False
+
+                async for chunk in self._bodega.chat_stream(
+                    prompt=prompt,
+                    system=system,
+                    tier=tier,
+                    temperature=0.3,
+                    max_tokens=1500,  # enough for reasoning + response
+                ):
+                    streamed_any = True
+                    raw_buffer += chunk
+
+                    if not think_done:
+                        # Still waiting to determine if there's a think block
+                        if "</think>" in raw_buffer:
+                            # Strip the entire think block and start streaming
+                            clean = re.sub(r"<think>.*?</think>", "", raw_buffer, flags=re.DOTALL).lstrip()
+                            think_done = True
+                            if clean:
+                                yield clean
+                                raw_buffer = ""
+                        elif "<think>" not in raw_buffer and len(raw_buffer) > 20:
+                            # No think block started after 20 chars — safe to stream
+                            think_done = True
+                            yield raw_buffer
+                            raw_buffer = ""
+                        # else: still accumulating — keep buffering
+                    else:
+                        # think block is done — stream chunks directly
+                        yield chunk
+                        raw_buffer = ""
+
+                # Flush any remaining buffered content
+                if raw_buffer:
+                    # Strip complete <think>...</think> blocks
+                    clean = re.sub(r"<think>.*?</think>", "", raw_buffer, flags=re.DOTALL)
+                    # Also strip incomplete <think> blocks that never closed (truncated output)
+                    clean = re.sub(r"<think>.*$", "", clean, flags=re.DOTALL)
+                    clean = clean.strip()
+                    if clean:
+                        yield clean
+
+                # If we streamed successfully, we're done
+                if streamed_any:
+                    return
+
+            except Exception as exc:
                 logger.warning(
-                    "evaluate_fallback_failed",
-                    error=str(eval_exc),
-                    fallback="concatenation",
+                    "stream_tier_failed",
+                    tier=tier.value,
+                    error=str(exc),
                 )
-                # Last resort: plain concatenation so we always yield something
-                successful_outputs = [r.output for r in results if r.success and r.output]
-                result = "\n\n---\n\n".join(successful_outputs) if successful_outputs else (
-                    "\n\n---\n\n".join(r.output for r in results if r.output)
-                )
-            yield result
+                continue  # Try next tier
+
+        # All tiers failed - fallback to non-streaming evaluate()
+        logger.warning("stream_all_tiers_failed", fallback="evaluate()")
+        try:
+            result = await self.evaluate(
+                original_query, results,
+                prior_context=prior_context,
+                user_profile=user_profile,
+                conversation_history=conversation_history,
+            )
+        except Exception as eval_exc:
+            logger.warning(
+                "evaluate_fallback_failed",
+                error=str(eval_exc),
+                fallback="concatenation",
+            )
+            # Last resort: plain concatenation so we always yield something
+            successful_outputs = [r.output for r in results if r.success and r.output]
+            result = "\n\n---\n\n".join(successful_outputs) if successful_outputs else (
+                "\n\n---\n\n".join(r.output for r in results if r.output)
+            )
+        yield result
 
 
 # ── Module-level helpers ──────────────────────────────────────────────────────

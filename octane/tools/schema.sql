@@ -1,4 +1,4 @@
--- ════════════════════════════════════════════════════════════════════════════
+    -- ════════════════════════════════════════════════════════════════════════════
 -- Octane Structured Storage Schema  (Session 18A)
 -- Applied by PgClient._ensure_schema() on first connect.
 -- ════════════════════════════════════════════════════════════════════════════
@@ -72,7 +72,7 @@ CREATE INDEX IF NOT EXISTS idx_artifacts_type       ON generated_artifacts (arti
 -- Replaces the single-table research_findings from Session 17 with richer schema.
 CREATE TABLE IF NOT EXISTS research_findings_v2 (
     id              SERIAL      PRIMARY KEY,
-    project_id      INTEGER     REFERENCES projects(id) ON DELETE CASCADE,
+    project_id     x INTEGER     REFERENCES projects(id) ON DELETE CASCADE,
     task_id         TEXT        NOT NULL,
     cycle_num       INTEGER     NOT NULL DEFAULT 0,
     topic           TEXT        NOT NULL,
@@ -88,7 +88,7 @@ CREATE INDEX IF NOT EXISTS idx_rfv2_task_id   ON research_findings_v2 (task_id);
 CREATE INDEX IF NOT EXISTS idx_rfv2_project   ON research_findings_v2 (project_id);
 CREATE INDEX IF NOT EXISTS idx_rfv2_created   ON research_findings_v2 (task_id, created_at DESC);
 
--- ── portfolio_positions ───────────────────────────────────────────────────────
+-- ── portfolio_po
 CREATE TABLE IF NOT EXISTS portfolio_positions (
     id              SERIAL      PRIMARY KEY,
     project_id      INTEGER     REFERENCES projects(id) ON DELETE CASCADE,

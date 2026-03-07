@@ -45,6 +45,37 @@ def _get_synapse():
     return _get_synapse._bus
 
 
+async def _try_daemon_route(command: str, payload: dict):
+    """Try to route a command through the daemon if it's running.
+    
+    Yields string chunks if daemon handles the request.
+    Returns without yielding if daemon is not running (caller should fallback).
+    """
+    from octane.daemon.client import is_daemon_running, DaemonClient
+
+    if not is_daemon_running():
+        return
+
+    client = DaemonClient()
+    if not await client.connect(timeout=2.0):
+        return
+
+    try:
+        # Stream the response and yield chunks
+        async for resp in client.stream(command, payload, timeout=600.0):
+            status = resp.get("status")
+            if status == "stream":
+                chunk = resp.get("chunk")
+                if chunk:
+                    yield chunk
+            elif status == "done":
+                return
+            elif status == "error":
+                raise RuntimeError(resp.get("error", "Unknown daemon error"))
+    finally:
+        await client.close()
+
+
 # ── octane health ─────────────────────────────────────────────
 
 
@@ -257,6 +288,26 @@ def ask(
 
 
 async def _ask(query: str, verbose: bool = False, deep: bool = False, monitor: bool = False):
+    from octane.daemon.client import is_daemon_running
+
+    # ── Try daemon routing first ──────────────────────────────────────────────
+    if is_daemon_running() and not deep and not monitor:
+        # Route through daemon for simple queries (daemon handles pool sharing)
+        console.print("[dim]📡 Routing through daemon...[/]")
+        chunks_received = False
+        try:
+            async for chunk in _try_daemon_route("ask", {"query": query}):
+                if not chunks_received:
+                    console.print("[bold green]🔥 Octane:[/] ", end="")
+                    chunks_received = True
+                console.print(chunk, end="")
+            if chunks_received:
+                console.print("\n")
+                return  # Daemon handled the request
+        except Exception as exc:
+            console.print(f"[yellow]⚠ Daemon error, falling back to direct: {exc}[/]")
+        # If we got here without chunks, fall through to direct execution
+
     from octane.osa.orchestrator import Orchestrator
     from octane.tools.topology import ModelTier, detect_topology, get_topology
 
@@ -339,8 +390,31 @@ async def _ask(query: str, verbose: bool = False, deep: bool = False, monitor: b
 
     # Spinner runs while guard → decompose → dispatch → first Evaluator token
     # Stops automatically the moment the first streamed chunk arrives.
-    spin = console.status("[dim]⚙  Routing and dispatching...[/]", spinner="dots")
-    spin.start()
+    from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TimeElapsedColumn
+
+    _STAGES = [
+        "🔀  Routing query…",
+        "🌐  Fetching data…",
+        "🧠  Synthesizing…",
+    ]
+
+    progress = Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(bar_width=20, complete_style="bold magenta", pulse_style="magenta"),
+        TimeElapsedColumn(),
+        console=console,
+        transient=True,
+    )
+    stage_task = progress.add_task(_STAGES[0], total=len(_STAGES), completed=0)
+    progress.start()
+    _stage_idx = 0
+
+    def _advance_stage(label: str) -> None:
+        nonlocal _stage_idx
+        _stage_idx += 1
+        progress.update(stage_task, description=label, completed=_stage_idx)
+
     full_output_parts = []
     first_token = True
     extra_meta = {"deep": True} if deep else {}
@@ -391,9 +465,11 @@ async def _ask(query: str, verbose: bool = False, deep: bool = False, monitor: b
     else:
         monitor_task = None
 
+    _advance_stage(_STAGES[1])  # Routing done → Fetching
     async for chunk in osa.run_stream(query, extra_metadata=extra_meta, clarification_hook=hook):
         if first_token:
-            spin.stop()
+            _advance_stage(_STAGES[2])  # Fetching done → Synthesizing
+            progress.stop()
             if monitor_task:
                 _monitor_stop.set()
                 await asyncio.sleep(0)  # let monitor print last line before output
@@ -402,7 +478,7 @@ async def _ask(query: str, verbose: bool = False, deep: bool = False, monitor: b
         console.print(chunk, end="")
         full_output_parts.append(chunk)
     if first_token:
-        spin.stop()
+        progress.stop()
     if monitor_task:
         _monitor_stop.set()
         monitor_task.cancel()
@@ -3162,6 +3238,817 @@ async def _project_archive(name: str):
     else:
         console.print(f"[yellow]Project not found: {name}[/]")
     await pg.close()
+
+
+# ── octane daemon ─────────────────────────────────────────────
+
+daemon_app = typer.Typer(
+    name="daemon",
+    help="🔧 Manage the Octane daemon — persistent background service.",
+    no_args_is_help=True,
+)
+app.add_typer(daemon_app, name="daemon")
+
+
+@daemon_app.command("start")
+def daemon_start(
+    foreground: bool = typer.Option(
+        False, "--foreground", "-f",
+        help="Run in foreground (don't fork to background). Useful for debugging.",
+    ),
+    topology: str = typer.Option(
+        "auto", "--topology", "-t",
+        help="Topology: auto|compact|balanced|power",
+    ),
+):
+    """🚀 Start the Octane daemon."""
+    from octane.daemon.client import is_daemon_running
+
+    if is_daemon_running():
+        console.print("[yellow]⚠ Daemon is already running.[/]")
+        return  # exit 0 — so && chains continue
+
+    if foreground:
+        console.print("[dim]Starting daemon in foreground... (Ctrl+C to stop)[/]")
+        asyncio.run(_daemon_start_foreground(topology))
+    else:
+        console.print("[dim]Starting daemon in background...[/]")
+        asyncio.run(_daemon_start_background(topology))
+
+
+async def _daemon_start_foreground(topology: str):
+    from octane.daemon.lifecycle import DaemonLifecycle
+
+    lifecycle = DaemonLifecycle(topology_name=topology, foreground=True)
+    try:
+        await lifecycle.run()
+    except KeyboardInterrupt:
+        console.print("\n[dim]Daemon stopped.[/]")
+
+
+async def _daemon_start_background(topology: str):
+    from octane.daemon.lifecycle import start_daemon
+
+    success = await start_daemon(topology=topology, foreground=False)
+    if success:
+        from octane.daemon.client import get_pid_path
+        pid = get_pid_path().read_text().strip() if get_pid_path().exists() else "?"
+        console.print(f"[green]✅ Daemon started[/] (PID: {pid})")
+    else:
+        console.print("[red]❌ Failed to start daemon.[/]")
+        raise typer.Exit(1)
+
+
+@daemon_app.command("stop")
+def daemon_stop():
+    """🛑 Stop the Octane daemon."""
+    asyncio.run(_daemon_stop())
+
+
+async def _daemon_stop():
+    from octane.daemon.lifecycle import stop_daemon
+
+    console.print("[dim]Stopping daemon...[/]")
+    success = await stop_daemon()
+    if success:
+        console.print("[green]✅ Daemon stopped.[/]")
+    else:
+        console.print("[yellow]Daemon was not running.[/]")
+
+
+@daemon_app.command("status")
+def daemon_status_cmd():
+    """📊 Show daemon status — PID, uptime, queue, connections."""
+    asyncio.run(_daemon_status())
+
+
+async def _daemon_status():
+    from octane.daemon.lifecycle import daemon_status
+
+    result = await daemon_status()
+
+    if not result.get("running"):
+        console.print("[dim]Daemon is not running.[/]")
+        console.print("[dim]Start with: octane daemon start[/]")
+        return
+
+    if result.get("status") == "error":
+        console.print(f"[red]Error: {result.get('error')}[/]")
+        return
+
+    data = result.get("data", {})
+    daemon_info = data.get("daemon", {})
+    queue_info = data.get("queue", {})
+    pool_info = data.get("pools", {})
+
+    # Daemon info
+    tbl = Table(show_header=False, box=None, padding=(0, 2))
+    tbl.add_column("Key", style="cyan")
+    tbl.add_column("Value", style="white")
+
+    tbl.add_row("Status", f"[green]{daemon_info.get('status', '?')}[/]")
+    tbl.add_row("PID", str(daemon_info.get('pid', '?')))
+    tbl.add_row("Uptime", f"{daemon_info.get('uptime_seconds', 0):.0f}s")
+    tbl.add_row("Topology", daemon_info.get('topology', '?'))
+
+    # Queue depth
+    tbl.add_row("Queue Depth", str(queue_info.get('size', 0)))
+    depth = queue_info.get('depth_by_priority', {})
+    if any(v > 0 for v in depth.values()):
+        depth_str = "  ".join(f"{k}={v}" for k, v in depth.items() if v > 0)
+        tbl.add_row("Queue Detail", depth_str)
+
+    # Connections
+    conns = daemon_info.get('connections', {})
+    for svc in ('redis', 'postgres', 'bodega'):
+        info = conns.get(svc, {})
+        status = info.get('status', 'unknown')
+        emoji = "✅" if status == "connected" else "⚠️" if status == "degraded" else "❌"
+        latency = info.get('latency_ms', 0)
+        lat_str = f" ({latency:.0f}ms)" if latency > 0 else ""
+        tbl.add_row(svc.capitalize(), f"{emoji} {status}{lat_str}")
+
+    # Models
+    models = daemon_info.get('models', {})
+    if models:
+        for mid, minfo in models.items():
+            idle = minfo.get('idle_seconds', 0)
+            reqs = minfo.get('request_count', 0)
+            tbl.add_row(f"Model: {mid}", f"idle {idle:.0f}s, {reqs} reqs")
+
+    console.print(Panel(tbl, title="[bold cyan]🔧 Octane Daemon[/]", border_style="cyan"))
+
+
+@daemon_app.command("drain")
+def daemon_drain():
+    """💧 Drain the daemon — stop accepting new tasks, finish running ones."""
+    asyncio.run(_daemon_drain())
+
+
+async def _daemon_drain():
+    from octane.daemon.client import DaemonClient, is_daemon_running
+
+    if not is_daemon_running():
+        console.print("[dim]Daemon is not running.[/]")
+        return
+
+    client = DaemonClient()
+    if not await client.connect():
+        console.print("[red]Cannot connect to daemon.[/]")
+        return
+
+    try:
+        response = await client.request("drain", {})
+        if response.get("status") == "ok":
+            console.print("[green]✅ Daemon entering drain mode.[/]")
+        else:
+            console.print(f"[red]Error: {response.get('error', 'unknown')}[/]")
+    finally:
+        await client.close()
+
+
+# ── octane investigate ────────────────────────────────────────
+
+
+@app.command()
+def investigate(
+    query: str = typer.Argument(..., help="The topic to investigate deeply."),
+    max_dimensions: int = typer.Option(
+        None,
+        "--max-dimensions",
+        "-d",
+        help="Maximum number of research dimensions (2-8).",
+        min=2,
+        max=8,
+    ),
+    stream: bool = typer.Option(True, "--stream/--no-stream", help="Stream findings as they arrive."),
+):
+    """🔍 Investigate a topic across multiple independent research dimensions.
+
+    Decomposes your query into parallel research threads, runs each through
+    the full web + memory agent stack, then synthesizes a structured report.
+
+    Examples:
+        octane investigate "impact of tariffs on semiconductor supply chains"
+        octane investigate "longevity interventions" --max-dimensions 6
+    """
+    asyncio.run(_investigate(query, max_dimensions, stream))
+
+
+async def _investigate(query: str, max_dimensions: int | None, stream: bool):
+    from rich.live import Live
+    from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn
+    from rich.markdown import Markdown
+    from octane.osa.investigate import InvestigateOrchestrator
+    from octane.models.synapse import SynapseEventBus
+    from octane.agents.web.agent import WebAgent
+
+    synapse = SynapseEventBus()
+    web_agent = WebAgent(synapse)
+    orchestrator = InvestigateOrchestrator(web_agent=web_agent)
+
+    console.print(
+        Panel(
+            f"[bold white]{query}[/]",
+            title="[bold cyan]🔍 Investigating[/]",
+            border_style="cyan",
+        )
+    )
+
+    kwargs: dict = {}
+    if max_dimensions is not None:
+        kwargs["max_dimensions"] = max_dimensions
+
+    report_text = ""
+    total_ms = 0.0
+    n_ok = 0
+    n_total = 0
+
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(bar_width=None, complete_style="green", finished_style="green"),
+        TextColumn("{task.completed}/{task.total}"),
+        console=console,
+        transient=True,
+    ) as progress:
+        plan_task = progress.add_task("[cyan]Planning dimensions…[/]", total=None)
+        research_task = None
+
+        async for event in orchestrator.run_stream(query, **kwargs):
+            etype = event.get("type")
+
+            if etype == "plan":
+                data = event["data"]
+                n = len(data.get("dimensions", []))
+                progress.update(plan_task, description=f"[green]✅ {n} dimensions planned[/]", completed=1, total=1)
+                if stream:
+                    dims = data.get("dimensions", [])
+                    tbl = Table(show_header=True, box=None, padding=(0, 2))
+                    tbl.add_column("#", style="dim", width=3)
+                    tbl.add_column("Dimension", style="cyan")
+                    tbl.add_column("Priority", style="yellow", width=8)
+                    tbl.add_column("Policy / Query", style="dim")
+                    for d in dims:
+                        policy = d.get("queries", [""])[0][:60] if d.get("queries") else d.get("rationale", "")[:60]
+                        tbl.add_row(d.get("id", ""), d.get("label", ""), str(d.get("priority", "")), policy)
+                    console.print(tbl)
+                research_task = progress.add_task(
+                    "[cyan]Researching…[/]", total=n, completed=0
+                )
+
+            elif etype == "finding":
+                data = event["data"]
+                label = data.get("dimension_label", "?")
+                success = data.get("success", False)
+                latency = data.get("latency_ms", 0)
+                icon = "✅" if success else "⚠️"
+                if research_task is not None:
+                    progress.advance(research_task)
+                if stream:
+                    console.print(f"  {icon} [cyan]{label}[/]  [dim]{latency:.0f}ms[/]")
+
+            elif etype == "synthesis":
+                data = event["data"]
+                report_text = data.get("report", "")
+                progress.update(
+                    plan_task if research_task is None else research_task,
+                    description="[green]✅ Synthesizing report…[/]",
+                )
+
+            elif etype == "done":
+                data = event["data"]
+                total_ms = data.get("total_ms", 0.0)
+                n_ok = data.get("dimensions_completed", 0)
+                n_total = n_ok + data.get("dimensions_failed", 0)
+
+    console.print(
+        Panel(
+            Markdown(report_text) if report_text else "[dim]No report generated.[/]",
+            title="[bold green]📋 Investigation Report[/]",
+            border_style="green",
+        )
+    )
+    console.print(
+        f"[dim]{n_ok}/{n_total} dimensions successful · {total_ms / 1000:.1f}s total[/]"
+    )
+
+
+# ── octane compare ────────────────────────────────────────────
+
+
+@app.command()
+def compare(
+    query: str = typer.Argument(..., help="The comparison query, e.g. 'NVDA vs AMD vs INTC'."),
+    stream: bool = typer.Option(True, "--stream/--no-stream", help="Stream cells as they complete."),
+):
+    """⚖️  Compare items across multiple dimensions in a structured matrix.
+
+    Extracts the items to compare from your query, plans comparison dimensions,
+    runs parallel research for every (item × dimension) cell, and synthesizes
+    a side-by-side report with a verdict.
+
+    Examples:
+        octane compare "NVDA vs AMD vs INTC"
+        octane compare "compare React, Vue, and Svelte for a startup"
+        octane compare "Python or Go for a backend API service"
+    """
+    asyncio.run(_compare(query, stream))
+
+
+async def _compare(query: str, stream: bool):
+    from rich.markdown import Markdown
+    from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn
+    from octane.osa.compare import CompareOrchestrator
+    from octane.models.synapse import SynapseEventBus
+    from octane.agents.web.agent import WebAgent
+
+    synapse = SynapseEventBus()
+    web_agent = WebAgent(synapse)
+    orchestrator = CompareOrchestrator(web_agent=web_agent)
+
+    console.print(
+        Panel(
+            f"[bold white]{query}[/]",
+            title="[bold yellow]⚖️  Comparing[/]",
+            border_style="yellow",
+        )
+    )
+
+    result = None
+    n_cells = 0
+    n_done = 0
+    report_text = ""
+    total_ms = 0.0
+    n_ok = 0
+
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(bar_width=None, complete_style="yellow", finished_style="green"),
+        TextColumn("{task.completed}/{task.total}"),
+        console=console,
+        transient=True,
+    ) as progress:
+        plan_task = progress.add_task("[cyan]Planning comparison matrix…[/]", total=None)
+        cell_task = None
+
+        async for event in orchestrator.run_stream(query):
+            etype = event.get("type")
+
+            if etype == "plan":
+                data = event["data"]
+                items = data.get("items", [])
+                dims = data.get("dimensions", [])
+                n_items = len(items)
+                n_dims = len(dims)
+                n_cells = n_items * n_dims
+                progress.update(
+                    plan_task,
+                    description=f"[green]✅ {n_items} items × {n_dims} dims = {n_cells} cells[/]",
+                    completed=1,
+                    total=1,
+                )
+                if stream:
+                    # Show what items and dimensions will be researched
+                    plan_tbl = Table(show_header=True, box=None, padding=(0, 2))
+                    plan_tbl.add_column("Item", style="yellow")
+                    plan_tbl.add_column("Dimensions", style="cyan")
+                    plan_tbl.add_column("Policy / Angle", style="dim")
+                    for item in items:
+                        dim_labels = ", ".join(d.get("label", "") for d in dims[:3])
+                        policy = item.get("canonical_query", "")[:55]
+                        plan_tbl.add_row(item.get("label", "?"), dim_labels, policy)
+                    console.print(plan_tbl)
+                cell_task = progress.add_task("[yellow]Researching cells…[/]", total=n_cells, completed=0)
+
+            elif etype == "cell":
+                n_done += 1
+                if cell_task is not None:
+                    progress.advance(cell_task)
+                if stream:
+                    d = event["data"]
+                    item = d.get("item_label", "?")
+                    dim = d.get("dimension_label", "?")
+                    ok = "✅" if d.get("success") else "⚠️"
+                    ms = d.get("latency_ms", 0)
+                    console.print(f"  {ok} [yellow]{item}[/] / [cyan]{dim}[/]  [dim]{ms:.0f}ms[/]")
+
+            elif etype == "matrix":
+                if cell_task is not None:
+                    progress.update(cell_task, description="[green]✅ Matrix complete[/]")
+
+            elif etype == "synthesis":
+                data = event["data"]
+                report_text = data.get("report", "")
+
+            elif etype == "done":
+                data = event["data"]
+                total_ms = data.get("total_ms", 0.0)
+                n_ok = data.get("n_successful", 0)
+
+    console.print(
+        Panel(
+            Markdown(report_text) if report_text else "[dim]No report generated.[/]",
+            title="[bold yellow]📊 Comparison Report[/]",
+            border_style="yellow",
+        )
+    )
+    console.print(
+        f"[dim]{n_ok}/{n_cells} cells successful · "
+        f"{total_ms / 1000:.1f}s total[/]"
+    )
+
+
+# ── octane chain ──────────────────────────────────────────────
+
+
+@app.command()
+def chain(
+    steps: list[str] = typer.Argument(
+        ...,
+        help="Ordered steps, e.g. 'ask What is NVDA revenue' 'synthesize {prev}'",
+    ),
+    var: list[str] = typer.Option(
+        [],
+        "--var",
+        "-v",
+        help="Template variables as KEY=VALUE (can be repeated).  e.g. --var ticker=NVDA",
+    ),
+    save: str = typer.Option(
+        None,
+        "--save",
+        "-s",
+        help="Save chain definition to a JSON workflow file.",
+    ),
+):
+    """⛓️  Execute a multi-step pipeline with variable interpolation.
+
+    Steps are executed in order.  Use {prev} to reference the previous step's
+    output, {step_name} to reference a named step, and {all} to join all
+    prior outputs.  Use {{var}} for template variables supplied via --var.
+
+    Examples:
+        octane chain "ask What are NVDA's main products" "synthesize {prev}"
+        octane chain "search NVDA earnings" "analyze {prev}" "synthesize {all}"
+        octane chain "ask {{ticker}} revenue forecast" --var ticker=NVDA
+        octane chain "search {{topic}} latest news" --var topic="AI chips" --save chain.json
+    """
+    asyncio.run(_chain(steps, var, save))
+
+
+async def _chain(steps: list[str], var: list[str], save: str | None):
+    from rich.markdown import Markdown
+    from rich.progress import Progress, SpinnerColumn, TextColumn
+    from octane.osa.chain_parser import ChainParser, ChainValidationError
+    from octane.osa.chain import ChainExecutor
+
+    # Parse --var KEY=VALUE pairs
+    template_vars: dict[str, str] = {}
+    for v in var:
+        if "=" in v:
+            k, _, val = v.partition("=")
+            template_vars[k.strip()] = val.strip()
+        else:
+            console.print(f"[yellow]⚠️  Ignoring malformed --var: {v!r} (expected KEY=VALUE)[/]")
+
+    # Parse chain
+    parser = ChainParser()
+    try:
+        plan = parser.parse(list(steps), template_vars=template_vars)
+    except ChainValidationError as exc:
+        console.print(
+            Panel(
+                f"[red]Step {exc.step_index + 1}: {exc.reason}\n\n"
+                f"Raw: [white]{exc.step_raw}[/]",
+                title="[red]Chain Parse Error[/]",
+                border_style="red",
+            )
+        )
+        raise typer.Exit(1)
+
+    n = len(plan.steps)
+    console.print(
+        Panel(
+            "\n".join(
+                f"  [dim]{i + 1}.[/] [cyan]{s.name}[/]: [white]{s.command}[/] {s.args}"
+                for i, s in enumerate(plan.steps)
+            ),
+            title=f"[bold magenta]⛓️  Chain ({n} steps)[/]",
+            border_style="magenta",
+        )
+    )
+
+    executor = ChainExecutor(template_vars=template_vars)
+
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        console=console,
+        transient=True,
+    ) as progress:
+        tasks: dict[str, object] = {}
+
+        async for event in executor.run_stream(plan, save_path=save):
+            etype = event.get("type")
+
+            if etype == "step_start":
+                d = event["data"]
+                tid = progress.add_task(
+                    f"[magenta]{d['name']}[/] → [white]{d['command']}[/]",
+                    total=None,
+                )
+                tasks[d["name"]] = tid
+
+            elif etype == "step_done":
+                d = event["data"]
+                tid = tasks.get(d["name"])
+                if tid is not None:
+                    progress.update(
+                        tid,  # type: ignore[arg-type]
+                        description=f"[green]✅ {d['name']}[/]  [dim]{d['latency_ms']:.0f}ms[/]",
+                        completed=1,
+                        total=1,
+                    )
+                output_preview = (d.get("output", "") or "")[:120].replace("\n", " ")
+                console.print(f"  ✅ [green]{d['name']}[/]  [dim]{output_preview}…[/]")
+
+            elif etype == "step_error":
+                d = event["data"]
+                console.print(f"  ❌ [red]{d['name']}[/]: {d.get('error', 'unknown error')}")
+
+            elif etype == "done":
+                d = event["data"]
+                n_ok = d["n_successful"]
+                n_total = d["n_steps"]
+                total_ms = d["total_ms"]
+                saved_to = d.get("saved_to")
+
+                console.print(Rule(style="magenta"))
+                console.print(
+                    f"[bold]Chain complete:[/] {n_ok}/{n_total} steps "
+                    f"successful · [dim]{total_ms / 1000:.1f}s[/]"
+                )
+                if saved_to:
+                    console.print(f"[dim]Chain saved to: {saved_to}[/]")
+
+                final = d.get("final_output", "")
+                if final:
+                    console.print(
+                        Panel(
+                            Markdown(final) if len(final) > 80 else final,
+                            title="[bold green]🏁 Final Output[/]",
+                            border_style="green",
+                        )
+                    )
+
+
+# ── octane daemon watch ───────────────────────────────────────
+
+
+@daemon_app.command("watch")
+def daemon_watch(
+    interval: float = typer.Option(
+        1.0, "--interval", "-i",
+        help="Refresh interval in seconds.",
+    ),
+    log_lines: int = typer.Option(
+        18, "--log-lines", "-l",
+        help="Number of recent log lines to show.",
+    ),
+):
+    """👁  Live dashboard — queue table + log stream.
+
+    Shows a continuously refreshed table of all pending/active requests
+    (one row per request), connection health, and a scrolling log window.
+
+    Press Ctrl+C to open the pause prompt — type a task ID to pause
+    that specific request while all others continue.  Press Enter alone
+    to cancel and resume normal watch mode.
+    """
+    asyncio.run(_daemon_watch(interval, log_lines))
+
+
+async def _daemon_watch(interval: float, log_lines: int):
+    import signal as _signal
+    from collections import deque
+    from rich.live import Live
+    from rich.layout import Layout
+    from rich.panel import Panel as RPanel
+    from rich.table import Table as RTable
+    from rich.text import Text as RText
+    from octane.daemon.client import DaemonClient, is_daemon_running
+
+    if not is_daemon_running():
+        console.print("[red]Daemon is not running.[/]  Start it with: [cyan]octane daemon start[/]")
+        return
+
+    # Recent log lines (ring buffer)
+    logs: deque[str] = deque(maxlen=log_lines)
+
+    # Install a custom log sink that captures to our ring buffer
+    import structlog
+    original_processors = None  # We hook via a simple approach below
+
+    pause_requested = False
+
+    def _request_pause(*_):
+        nonlocal pause_requested
+        pause_requested = True
+
+    # SIGINT (Ctrl+C) triggers our pause prompt instead of immediate exit
+    loop = asyncio.get_running_loop()
+    loop.add_signal_handler(_signal.SIGINT, _request_pause)
+
+    def _build_layout(
+        daemon_info: dict,
+        queue_info: dict,
+        requests: list[dict],
+        connections: dict,
+    ) -> Layout:
+        layout = Layout()
+        layout.split_column(
+            Layout(name="header", size=3),
+            Layout(name="body"),
+            Layout(name="logs", size=log_lines + 2),
+        )
+
+        # ── Header ────────────────────────────────────
+        uptime = daemon_info.get("uptime_seconds", 0)
+        pid = daemon_info.get("pid", "?")
+        topo = daemon_info.get("topology", "?")
+        q_size = queue_info.get("size", 0)
+        header_txt = (
+            f"  🔥 [bold cyan]Octane Daemon Watch[/]  "
+            f"PID=[yellow]{pid}[/]  Topology=[cyan]{topo}[/]  "
+            f"Uptime=[white]{uptime:.0f}s[/]  Queue=[white]{q_size}[/]  "
+            f"[dim](Ctrl+C to pause a request)[/]"
+        )
+        layout["header"].update(RPanel(header_txt, border_style="cyan", padding=(0, 1)))
+
+        # ── Request table ─────────────────────────────
+        body_layout = Layout()
+        body_layout.split_row(
+            Layout(name="requests", ratio=3),
+            Layout(name="health", ratio=1),
+        )
+        layout["body"].update(body_layout)
+
+        req_tbl = RTable(
+            show_header=True,
+            box=None,
+            padding=(0, 1),
+            expand=True,
+        )
+        req_tbl.add_column("Task ID", style="dim", width=12)
+        req_tbl.add_column("Command", style="cyan", width=12)
+        req_tbl.add_column("Priority", style="yellow", width=8)
+        req_tbl.add_column("Wait", style="white", width=7)
+        req_tbl.add_column("Aged", style="dim", width=5)
+        req_tbl.add_column("State", style="white", width=8)
+
+        if requests:
+            for req in requests:
+                tid = req.get("task_id", "?")[:12]
+                cmd = req.get("command", "?")[:12]
+                pri = req.get("priority", "?")
+                wait = f"{req.get('wait_sec', 0):.1f}s"
+                aged = str(req.get("aged_count", 0))
+                paused = req.get("paused", False)
+                state_str = "[yellow]⏸ paused[/]" if paused else "[green]▶ queued[/]"
+                req_tbl.add_row(tid, cmd, pri, wait, aged, state_str)
+        else:
+            req_tbl.add_row("[dim]—[/]", "[dim]queue empty[/]", "", "", "", "")
+
+        body_layout["requests"].update(
+            RPanel(req_tbl, title="[bold]📋 Requests[/]", border_style="dim")
+        )
+
+        # ── Health panel ──────────────────────────────
+        health_tbl = RTable(show_header=False, box=None, padding=(0, 1), expand=True)
+        health_tbl.add_column("Svc", style="cyan", no_wrap=True)
+        health_tbl.add_column("Status", no_wrap=True)
+        for svc in ("redis", "postgres", "bodega"):
+            info = connections.get(svc, {})
+            st = info.get("status", "unknown")
+            lat = info.get("latency_ms", 0)
+            lat_str = f" {lat:.0f}ms" if lat > 0 else ""
+            if st == "connected":
+                ico = f"[green]OK[/]{lat_str}"
+            elif st == "degraded":
+                ico = f"[yellow]DEG[/]{lat_str}"
+            else:
+                ico = "[red]DOWN[/]"
+            health_tbl.add_row(svc[:8], ico)
+
+        body_layout["health"].update(
+            RPanel(health_tbl, title="[bold]🔌 Health[/]", border_style="dim")
+        )
+
+        # ── Log window ────────────────────────────────
+        from rich.text import Text as _RichText
+        log_content = "\n".join(logs) if logs else "(waiting for logs…)"
+        try:
+            log_text = _RichText.from_markup(log_content)
+        except Exception:
+            log_text = _RichText(log_content, style="dim")
+        layout["logs"].update(
+            RPanel(log_text, title="[bold]📜 Logs[/]", border_style="dim")
+        )
+
+        return layout
+
+    client = DaemonClient()
+    if not await client.connect():
+        console.print("[red]Cannot connect to daemon socket.[/]")
+        return
+
+    try:
+        with Live(console=console, refresh_per_second=max(1, int(1 / interval)), screen=True) as live:
+            while True:
+                if pause_requested:
+                    pause_requested = False
+                    live.stop()
+                    console.print("\n[bold yellow]⏸  Pause a request[/]")
+                    console.print("[dim]Enter a Task ID to pause (or press Enter to cancel):[/] ", end="")
+                    try:
+                        tid_input = await loop.run_in_executor(None, input)
+                        tid_input = tid_input.strip()
+                        if tid_input:
+                            pause_resp = await client.request("pause_request", {"task_id": tid_input})
+                            if pause_resp.get("status") == "ok":
+                                console.print(f"[green]✅ Request {tid_input[:12]}… paused.[/]")
+                                console.print("[dim]Resume with: octane daemon resume <task_id>[/]")
+                            else:
+                                console.print(f"[red]Error: {pause_resp.get('error', 'unknown')}[/]")
+                        else:
+                            console.print("[dim]Cancelled.[/]")
+                    except (EOFError, KeyboardInterrupt):
+                        pass
+                    live.start()
+                    continue
+
+                # Poll daemon
+                try:
+                    status_resp = await client.request("status", {})
+                    list_resp = await client.request("list_requests", {})
+                except Exception as exc:
+                    logs.appendleft(f"[red]poll error: {exc}[/]")
+                    await asyncio.sleep(interval)
+                    continue
+
+                data = status_resp.get("data", {})
+                daemon_info = data.get("daemon", {})
+                queue_info = data.get("queue", {})
+                connections = daemon_info.get("connections", {})
+                requests = list_resp.get("data", {}).get("requests", [])
+
+                # Grab any new log lines from daemon (if daemon exposes them)
+                # For now surface the last structlog lines from the status payload
+                log_entries = data.get("recent_logs", [])
+                for entry in log_entries:
+                    logs.appendleft(str(entry))
+
+                layout = _build_layout(daemon_info, queue_info, requests, connections)
+                live.update(layout)
+                await asyncio.sleep(interval)
+
+    except asyncio.CancelledError:
+        pass
+    finally:
+        loop.remove_signal_handler(_signal.SIGINT)
+        await client.close()
+        console.print("\n[dim]Watch stopped.[/]")
+
+
+@daemon_app.command("resume")
+def daemon_resume(
+    task_id: str = typer.Argument(..., help="Task ID to resume (from 'octane daemon watch')."),
+):
+    """▶️  Resume a paused daemon request."""
+    asyncio.run(_daemon_resume(task_id))
+
+
+async def _daemon_resume(task_id: str):
+    from octane.daemon.client import DaemonClient, is_daemon_running
+
+    if not is_daemon_running():
+        console.print("[dim]Daemon is not running.[/]")
+        return
+
+    client = DaemonClient()
+    if not await client.connect():
+        console.print("[red]Cannot connect to daemon.[/]")
+        return
+
+    try:
+        resp = await client.request("resume_request", {"task_id": task_id})
+        if resp.get("status") == "ok":
+            console.print(f"[green]✅ Request {task_id[:16]}… resumed.[/]")
+        else:
+            console.print(f"[red]Error: {resp.get('error', 'unknown')}[/]")
+    finally:
+        await client.close()
 
 
 # ── Entry point ───────────────────────────────────────────────
