@@ -182,9 +182,9 @@ def test_topology_balanced_has_all_inference_tiers():
     assert ModelTier.REASON in topo.models
 
 
-def test_topology_power_mid_is_1b():
-    """Power topology upgrades MID to bodega-raptor-1b."""
-    assert TOPOLOGIES["power"].models[ModelTier.MID].model_id == "bodega-raptor-1b"
+def test_topology_power_mid_is_vertex_4b():
+    """Power topology uses bodega-vertex-4b for MID — richer summaries on 32 GB+."""
+    assert TOPOLOGIES["power"].models[ModelTier.MID].model_id == "bodega-vertex-4b"
 
 
 def test_all_topologies_cover_fast_mid_reason():
@@ -441,6 +441,10 @@ def test_router_topology_property():
 async def test_router_chat_passes_model_id_to_client():
     """chat() must forward the tier's model_id to the inner BodegaInferenceClient."""
     router = _make_router("balanced")
+    # Pre-populate loaded model cache so we don't hit real Bodega in unit tests.
+    # The topology model_id is the canonical short alias used when Bodega loads
+    # models with an explicit model_id param.  Direct-match path is tested here.
+    router._loaded_models = {"bodega-raptor-90M": "lm", "bodega-raptor-8b": "lm"}
     expected_model = "bodega-raptor-90M"
 
     mock_response = {
@@ -459,6 +463,8 @@ async def test_router_chat_passes_model_id_to_client():
 @pytest.mark.asyncio
 async def test_router_chat_simple_returns_text():
     router = _make_router("balanced")
+    # Pre-populate loaded model cache — avoids network call to Bodega
+    router._loaded_models = {"bodega-raptor-90M": "lm"}
     mock_response = {"choices": [{"message": {"content": "NVDA"}}], "usage": {}}
     router._client.chat = AsyncMock(return_value=mock_response)
 
@@ -469,6 +475,8 @@ async def test_router_chat_simple_returns_text():
 @pytest.mark.asyncio
 async def test_router_chat_simple_uses_reason_tier_by_default():
     router = _make_router("balanced")
+    # Pre-populate loaded model cache — avoids network call to Bodega
+    router._loaded_models = {"bodega-raptor-90M": "lm", "bodega-raptor-8b": "lm"}
     mock_response = {"choices": [{"message": {"content": "ok"}}], "usage": {}}
     router._client.chat = AsyncMock(return_value=mock_response)
 
@@ -503,7 +511,7 @@ async def test_router_accepts_topology_object():
     topo = get_topology("power")
     router = BodegaRouter(topology=topo)
     assert router.topology.name == "power"
-    assert router.resolve_model_id(ModelTier.MID) == "bodega-raptor-1b"
+    assert router.resolve_model_id(ModelTier.MID) == "bodega-vertex-4b"
 
 
 # ── ModelManager.ensure_topology_loaded() ────────────────────────────────────

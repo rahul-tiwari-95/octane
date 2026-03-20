@@ -245,10 +245,10 @@ TOPOLOGIES: dict[str, Topology] = {
         },
     ),
     # ── power ─────────────────────────────────────────────────────────────────
-    # M2/M3 Max/Ultra 32 GB+.
+    # M2/M3/M4/M5 Max/Ultra 32 GB+.
     # Strategy: maximum throughput, three distinct models per tier.
     #   • max_concurrency=4 for FAST, 2 for MID/REASON
-    #   • MID upgrades to bodega-raptor-1b for richer chunk summaries
+    #   • MID: bodega-vertex-4b (4B instruction-tuned, richer chunk summaries)
     #   • prompt_cache_size=25 — large cache covers all static prefixes
     #   • Speculative decoding with 5 draft tokens (vs 3 in balanced)
     "power": Topology(
@@ -264,8 +264,8 @@ TOPOLOGIES: dict[str, Topology] = {
                 tool_call_parser="qwen3",
             ),
             ModelTier.MID: ModelConfig(
-                model_id="bodega-raptor-1b",
-                model_path="SRSWTI/bodega-raptor-0.9b",
+                model_id="bodega-vertex-4b",
+                model_path="SRSWTI/bodega-vertex-4b",
                 context_length=32768,
                 max_concurrency=2,
                 prompt_cache_size=25,

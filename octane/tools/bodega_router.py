@@ -97,31 +97,51 @@ class BodegaRouter:
 
     async def _resolve_available_model(self, tier: ModelTier) -> str | None:
         """Resolve a tier to an actually-loaded model ID, or None.
-        
-        Falls back to any available LM model if the preferred one isn't loaded.
+
+        Matching strategy (tried in order):
+          1. Direct match — topology model_id == loaded model ID  (fastest path)
+          2. Path match   — topology model_path.lower() == loaded ID.lower()
+                           handles externally-loaded models whose registered ID
+                           is the full HuggingFace path (e.g. Bodega registers
+                           "srswti/bodega-raptor-90m" when loaded without alias)
+          3. Any LM       — last-resort fallback; logs a warning
         """
         loaded = await self._fetch_loaded_models()
 
         if not loaded:
             return None
 
-        # Get preferred model for this tier from topology
-        preferred = self._topology.resolve(tier)
+        preferred_cfg = self._topology.resolve_config(tier)
+        preferred_id   = preferred_cfg.model_id
+        preferred_path = preferred_cfg.model_path
 
-        # If preferred model is loaded, use it
-        if preferred in loaded:
-            return preferred
+        # 1. Direct match
+        if preferred_id in loaded:
+            return preferred_id
 
-        # Otherwise, find any loaded LM model as fallback
-        for model_id, model_type in loaded.items():
+        # 2. Path-based match (case-insensitive)
+        #    Handles Bodega registering models by their HF path
+        preferred_path_lower = preferred_path.lower()
+        for loaded_id in loaded:
+            if loaded_id.lower() == preferred_path_lower:
+                logger.debug(
+                    "router_path_match",
+                    tier=tier.value,
+                    preferred=preferred_id,
+                    matched=loaded_id,
+                )
+                return loaded_id
+
+        # 3. Any available LM model (last resort — all tiers get same model)
+        for loaded_id, model_type in loaded.items():
             if model_type == "lm":
                 logger.info(
                     "bodega_tier_fallback",
                     tier=tier.value,
-                    preferred=preferred,
-                    using=model_id,
+                    preferred=preferred_id,
+                    using=loaded_id,
                 )
-                return model_id
+                return loaded_id
 
         return None
 
