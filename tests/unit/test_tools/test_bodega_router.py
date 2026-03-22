@@ -266,20 +266,42 @@ def test_balanced_prompt_cache_size():
 
 
 def test_power_fast_max_concurrency_is_4():
-    """power routes up to 4 parallel classification/extraction requests."""
-    assert TOPOLOGIES["power"].models[ModelTier.FAST].max_concurrency == 4
+    """power routes up to 8 parallel classification/extraction requests (extreme for 64GB M1 Max)."""
+    assert TOPOLOGIES["power"].models[ModelTier.FAST].max_concurrency == 8
 
 
 def test_power_reason_max_concurrency_is_2():
-    """power allows 2 parallel deep-reasoning requests."""
-    assert TOPOLOGIES["power"].models[ModelTier.REASON].max_concurrency == 2
+    """power allows 4 parallel deep-reasoning requests (extreme for 64GB M1 Max)."""
+    assert TOPOLOGIES["power"].models[ModelTier.REASON].max_concurrency == 4
 
 
 def test_power_reason_num_draft_tokens_is_5():
-    """power uses 5 draft tokens (vs balanced's 3) for more speculative gains."""
+    """power REASON uses axe-stealth-37b (different tokenizer family).
+
+    Speculative decoding is deliberately disabled (num_draft_tokens=0) because
+    the Qwen3-0.6B draft model shares tokenizers only with the raptor-8b family,
+    not with axe-stealth-37b.  Mismatched drafts produce garbage output.
+    """
     cfg = TOPOLOGIES["power"].models[ModelTier.REASON]
-    assert cfg.num_draft_tokens == 5
-    assert cfg.draft_model_path == "Qwen/Qwen3-0.6B-MLX-8bit"
+    assert cfg.num_draft_tokens == 0
+    assert cfg.draft_model_path is None
+    # 37b is the flagship REASON model
+    assert "axe-stealth" in cfg.model_id or "axe-stealth" in cfg.model_path
+
+
+def test_power_reason_is_axe_stealth_37b():
+    """power topology routes REASON tier to axe-stealth-37b."""
+    cfg = TOPOLOGIES["power"].models[ModelTier.REASON]
+    assert "axe-stealth-37b" in cfg.model_path
+    assert cfg.model_type == "multimodal"
+    assert cfg.continuous_batching is True
+
+
+def test_power_fast_has_continuous_batching():
+    """power FAST model enables continuous batching for high-throughput routing."""
+    cfg = TOPOLOGIES["power"].models[ModelTier.FAST]
+    assert cfg.continuous_batching is True
+    assert cfg.cb_completion_batch_size > 0
 
 
 def test_power_prompt_cache_size():

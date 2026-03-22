@@ -39,7 +39,7 @@ import structlog
 logger = structlog.get_logger().bind(component="migrations")
 
 # Current schema version — bump this when schema.sql changes substantially
-SCHEMA_VERSION = "20A"
+SCHEMA_VERSION = "29A"
 
 # Path to schema SQL file (relative to this file)
 _SCHEMA_PATH = Path(__file__).parent / "schema.sql"
@@ -69,7 +69,7 @@ class MigrationRunner:
     """
 
     # All known migration versions in order
-    VERSIONS: list[str] = ["20A"]
+    VERSIONS: list[str] = ["20A", "28A", "29A"]
 
     def __init__(self, dsn: str | None = None) -> None:
         if dsn is None:
@@ -173,14 +173,88 @@ class MigrationRunner:
         # Read schema SQL
         sql = _SCHEMA_PATH.read_text(encoding="utf-8")
 
+        # ── Step 1: try to enable pgvector OUTSIDE the transaction.
+        # CREATE EXTENSION cannot run inside a transaction block, and if the
+        # extension is not installed on the system it raises an error that
+        # would otherwise roll back all subsequent DDL.  We handle it here so
+        # the rest of the schema always applies regardless.
+        vector_available = False
+        try:
+            await conn.execute("CREATE EXTENSION IF NOT EXISTS vector")
+            vector_available = True
+        except Exception as ext_exc:
+            logger.warning(
+                "pgvector_extension_unavailable",
+                hint="Install pgvector (brew install pgvector) to enable semantic search",
+                error=str(ext_exc),
+            )
+
+        # Strip the extension statement from the SQL so it is not re-executed
+        # inside the transaction below (avoids "cannot run inside transaction" errors).
+        # If vector is unavailable also strip any statement that references the
+        # vector type (i.e. the embeddings table and its indexes) — those use
+        # vector(384) columns which require the extension to be loaded.
+        def _keep_stmt(s: str) -> bool:
+            su = s.strip().upper()
+            if not su:
+                return False
+            if "CREATE EXTENSION" in su:
+                return False
+            # When vector is unavailable, skip the embeddings table AND all
+            # indexes/statements that reference it (e.g. idx_embeddings_source
+            # has no VECTOR keyword but the table won't exist).
+            if not vector_available and ("VECTOR" in su or "EMBEDDINGS" in su):
+                return False
+            return True
+
+        cleaned_stmts = [s for s in _split_sql(sql) if _keep_stmt(s)]
+
+        # ── Step 2: incremental migrations (run after the baseline schema) ──
+        # 28A: add provenance JSONB column for chain-of-custody tracking
+        _MIGRATION_28A = """
+            ALTER TABLE web_pages
+                ADD COLUMN IF NOT EXISTS provenance JSONB NOT NULL DEFAULT '{}';
+            ALTER TABLE research_findings_v2
+                ADD COLUMN IF NOT EXISTS provenance JSONB NOT NULL DEFAULT '{}';
+            ALTER TABLE generated_artifacts
+                ADD COLUMN IF NOT EXISTS provenance JSONB NOT NULL DEFAULT '{}';
+            CREATE INDEX IF NOT EXISTS idx_web_pages_provenance
+                ON web_pages USING GIN (provenance);
+            CREATE INDEX IF NOT EXISTS idx_rfv2_provenance
+                ON research_findings_v2 USING GIN (provenance);
+        """
+
+        # 29A: add broker/account detail and sector classification to portfolio_positions
+        _MIGRATION_29A = """
+            ALTER TABLE portfolio_positions
+                ADD COLUMN IF NOT EXISTS broker      TEXT NOT NULL DEFAULT '';
+            ALTER TABLE portfolio_positions
+                ADD COLUMN IF NOT EXISTS account_id  TEXT NOT NULL DEFAULT '';
+            ALTER TABLE portfolio_positions
+                ADD COLUMN IF NOT EXISTS sector      TEXT NOT NULL DEFAULT '';
+            ALTER TABLE portfolio_positions
+                ADD COLUMN IF NOT EXISTS asset_class TEXT NOT NULL DEFAULT 'equity';
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_positions_upsert
+                ON portfolio_positions (ticker, broker, account_id);
+        """
+
+        _INCREMENTAL: dict[str, str] = {
+            "28A": _MIGRATION_28A,
+            "29A": _MIGRATION_29A,
+        }
+
         # Apply within a single transaction
         try:
             async with conn.transaction():
-                # Split on statement boundaries, execute individually so
-                # asyncpg can handle multi-statement files
-                for stmt in _split_sql(sql):
-                    if stmt.strip():
-                        await conn.execute(stmt)
+                # Execute baseline schema statements (idempotent IF NOT EXISTS)
+                for stmt in cleaned_stmts:
+                    await conn.execute(stmt)
+                # Execute incremental migrations for pending versions that have SQL
+                for v in pending:
+                    if v in _INCREMENTAL:
+                        for stmt in _split_sql(_INCREMENTAL[v]):
+                            if stmt.strip():
+                                await conn.execute(stmt)
                 # Record all newly applied versions
                 for v in pending:
                     await conn.execute(

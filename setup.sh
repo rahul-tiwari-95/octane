@@ -77,6 +77,24 @@ if [[ $SKIP_BREW -eq 0 ]]; then
     ok "PostgreSQL ${PG_VERSION} installed"
   fi
 
+  # ── pgvector (semantic search extension) ─────────────────────────────────────
+  if brew list pgvector &>/dev/null 2>&1; then
+    ok "pgvector already installed"
+  else
+    info "Installing pgvector..."
+    brew install pgvector
+    ok "pgvector installed"
+  fi
+  # Link pgvector extension files into the postgresql@16 extension directory
+  PG_EXT_DIR="${BREW_PREFIX}/opt/postgresql@${PG_VERSION}/share/postgresql@${PG_VERSION}/extension"
+  PGVEC_SHARE="$(brew --prefix pgvector 2>/dev/null)/share"
+  if [[ -d "${PGVEC_SHARE}" ]]; then
+    for f in "${PGVEC_SHARE}"/postgresql*/extension/vector*; do
+      [[ -e "$f" ]] && ln -sf "$f" "${PG_EXT_DIR}/" 2>/dev/null || true
+    done
+    ok "pgvector extension linked to postgresql@${PG_VERSION}"
+  fi
+
   # Add postgres bin to PATH for this script
   export PATH="${PG_BIN}:${PATH}"
 
@@ -93,17 +111,30 @@ if [[ $SKIP_BREW -eq 0 ]]; then
     "${PG_BIN}/pg_isready" -q 2>/dev/null || warn "PostgreSQL still not ready. Check: brew services list"
   fi
 
+  # ── Create role ───────────────────────────────────────────────────────────────
+  ROLE_EXISTS="$("${PG_BIN}/psql" -U "$(whoami)" -tAc "SELECT 1 FROM pg_roles WHERE rolname='octane'" postgres 2>/dev/null || echo "")"
+  if [[ "${ROLE_EXISTS}" == "1" ]]; then
+    ok "Role 'octane' already exists"
+  else
+    info "Creating role 'octane'..."
+    "${PG_BIN}/psql" -U "$(whoami)" -c "CREATE ROLE octane WITH LOGIN CREATEDB;" postgres 2>/dev/null \
+      || warn "Could not create role 'octane'"
+    ok "Role 'octane' created"
+  fi
+
   # ── Create database ───────────────────────────────────────────────────────────
   DB_EXISTS="$("${PG_BIN}/psql" -U "$(whoami)" -tAc "SELECT 1 FROM pg_database WHERE datname='octane'" postgres 2>/dev/null || echo "")"
   if [[ "${DB_EXISTS}" == "1" ]]; then
     ok "Database 'octane' already exists"
   else
     info "Creating database 'octane'..."
-    "${PG_BIN}/createdb" octane 2>/dev/null \
-      || "${PG_BIN}/psql" -U "$(whoami)" -c "CREATE DATABASE octane;" postgres 2>/dev/null \
+    "${PG_BIN}/psql" -U "$(whoami)" -c "CREATE DATABASE octane OWNER octane;" postgres 2>/dev/null \
       || warn "Could not create database 'octane' — you may need to run: createdb octane"
     ok "Database 'octane' created"
   fi
+
+  # Ensure octane role has full privileges on the database
+  "${PG_BIN}/psql" -U "$(whoami)" -c "GRANT ALL PRIVILEGES ON DATABASE octane TO octane;" postgres 2>/dev/null || true
 
   echo ""
 fi  # end SKIP_BREW

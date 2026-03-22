@@ -63,20 +63,28 @@ class ModelConfig:
     optional fields so the payload stays minimal.
 
     Args:
-        model_id:          Alias used in inference API calls (e.g. ``"bodega-raptor-8b"``).
-        model_path:        HuggingFace repo ID or absolute local path.
-        model_type:        Bodega model type — ``"lm"``, ``"embeddings"``, etc.
-        context_length:    KV-cache context window in tokens.
-        max_concurrency:   Parallel requests the model handler accepts.
-        prompt_cache_size: Number of prompt-cache slots (0 = disabled).
-                           Each slot eliminates prefill cost for a recurring
-                           system-prompt prefix.
-        reasoning_parser:  Parser for ``<think>`` extraction (e.g. ``"qwen3"``).
-        tool_call_parser:  Parser for tool-call extraction.
-        draft_model_path:  HuggingFace path of the speculative-decoding draft
-                           model.  Must share a tokenizer with *model_path*.
-        num_draft_tokens:  Number of draft tokens per speculation step.
-                           0 = speculative decoding disabled.
+        model_id:              Alias used in inference API calls (e.g. ``"bodega-raptor-8b"``).
+        model_path:            HuggingFace repo ID or absolute local path.
+        model_type:            Bodega model type — ``"lm"``, ``"multimodal"``, etc.
+        context_length:        KV-cache context window in tokens.
+        max_concurrency:       Parallel requests the model handler accepts.
+        prompt_cache_size:     Number of prompt-cache slots (0 = disabled).
+                               Each slot eliminates prefill cost for a recurring
+                               system-prompt prefix.
+        reasoning_parser:      Parser for ``<think>`` extraction (e.g. ``"qwen3"``).
+        tool_call_parser:      Parser for tool-call extraction.
+        draft_model_path:      HuggingFace path of the speculative-decoding draft
+                               model.  Must share a tokenizer with *model_path*.
+        num_draft_tokens:      Number of draft tokens per speculation step.
+                               0 = speculative decoding disabled.
+        continuous_batching:   Enable Bodega continuous batching engine for
+                               high-throughput multi-user workloads.
+        cb_max_num_seqs:       Max simultaneous sequences in the batch scheduler
+                               (0 = use Bodega default of 256).
+        cb_prefill_batch_size: Max new prompts ingested per scheduler step
+                               (0 = use Bodega default of 8).
+        cb_completion_batch_size: Max concurrent token-generation sequences per
+                               GPU step (0 = use Bodega default of 32).
     """
 
     model_id: str
@@ -89,6 +97,10 @@ class ModelConfig:
     tool_call_parser: str | None = None
     draft_model_path: str | None = None
     num_draft_tokens: int = 0
+    continuous_batching: bool = False
+    cb_max_num_seqs: int = 0
+    cb_prefill_batch_size: int = 0
+    cb_completion_batch_size: int = 0
 
     def to_load_params(self) -> dict[str, Any]:
         """Return a dict suitable for ``POST /v1/admin/load-model``.
@@ -112,6 +124,14 @@ class ModelConfig:
             params["draft_model_path"] = self.draft_model_path
         if self.num_draft_tokens > 0:
             params["num_draft_tokens"] = self.num_draft_tokens
+        if self.continuous_batching:
+            params["continuous_batching"] = True
+            if self.cb_max_num_seqs > 0:
+                params["cb_max_num_seqs"] = self.cb_max_num_seqs
+            if self.cb_prefill_batch_size > 0:
+                params["cb_prefill_batch_size"] = self.cb_prefill_batch_size
+            if self.cb_completion_batch_size > 0:
+                params["cb_completion_batch_size"] = self.cb_completion_batch_size
         return params
 
 
@@ -245,43 +265,76 @@ TOPOLOGIES: dict[str, Topology] = {
         },
     ),
     # ── power ─────────────────────────────────────────────────────────────────
-    # M2/M3/M4/M5 Max/Ultra 32 GB+.
-    # Strategy: maximum throughput, three distinct models per tier.
-    #   • max_concurrency=4 for FAST, 2 for MID/REASON
-    #   • MID: bodega-vertex-4b (4B instruction-tuned, richer chunk summaries)
-    #   • prompt_cache_size=25 — large cache covers all static prefixes
-    #   • Speculative decoding with 5 draft tokens (vs 3 in balanced)
+    # M2/M3/M4/M5 Max/Ultra 32 GB+.  (64 GB M1 Max included)
+    # Strategy: two fully distinct models — small for speed, large for depth.
+    #
+    #   FAST   — bodega-raptor-90m  (lm, ~1 GB)
+    #            max_concurrency=8, CB EXTREME:
+    #              cb_max_num_seqs=512, cb_prefill_batch_size=32,
+    #              cb_completion_batch_size=64
+    #            → ~900 tok/s system throughput for classification/routing bursts.
+    #            Each wave of parallel agent calls (web, pnl, memory, etc.) hits
+    #            the 90m simultaneously — CB batches them into one GPU pass.
+    #
+    #   MID    — bodega-vertex-4b  (lm) — when loaded gives richer summaries.
+    #            Falls back to 90m automatically if vertex-4b not loaded.
+    #
+    #   REASON — axe-stealth-37b  (multimodal, ~38 GB)
+    #            max_concurrency=4, CB tuned for 64 GB headroom:
+    #              cb_max_num_seqs=256, cb_prefill_batch_size=16,
+    #              cb_completion_batch_size=32
+    #            → batches the evaluator synthesis + any concurrent research
+    #              or portfolio analysis calls into the same GPU pass.
+    #            All final-answer generation (evaluator, portfolio analyze,
+    #            deep research synthesis) routes here.
+    #            NO speculative decoding — axe-stealth uses a different
+    #            tokenizer family from the Qwen3-0.6B draft model.
     "power": Topology(
         name="power",
         models={
             ModelTier.FAST: ModelConfig(
                 model_id="bodega-raptor-90M",
                 model_path="SRSWTI/bodega-raptor-90m",
+                model_type="lm",
                 context_length=32768,
-                max_concurrency=4,          # ← power: high-throughput routing
+                max_concurrency=8,          # ← 8 parallel streams on 90m
                 prompt_cache_size=25,
                 reasoning_parser="qwen3",
                 tool_call_parser="qwen3",
+                continuous_batching=True,
+                cb_max_num_seqs=512,        # large scheduler queue
+                cb_prefill_batch_size=32,   # fast burst ingestion
+                cb_completion_batch_size=64, # saturate GPU for tiny model
             ),
             ModelTier.MID: ModelConfig(
                 model_id="bodega-vertex-4b",
                 model_path="SRSWTI/bodega-vertex-4b",
+                model_type="lm",
                 context_length=32768,
-                max_concurrency=2,
+                max_concurrency=4,
                 prompt_cache_size=25,
                 reasoning_parser="qwen3",
                 tool_call_parser="qwen3",
+                continuous_batching=True,
+                cb_max_num_seqs=256,
+                cb_prefill_batch_size=16,
+                cb_completion_batch_size=32,
             ),
             ModelTier.REASON: ModelConfig(
-                model_id="bodega-raptor-8b",
-                model_path="SRSWTI/bodega-raptor-8b-mxfp4",
+                model_id="axe-stealth-37b",
+                model_path="srswti/axe-stealth-37b",
+                model_type="multimodal",    # Bodega registers 37b as multimodal
                 context_length=32768,
-                max_concurrency=2,          # ← power: parallel deep reasoning
+                max_concurrency=4,          # ← 4 concurrent synthesis requests
                 prompt_cache_size=25,
                 reasoning_parser="qwen3",
                 tool_call_parser="qwen3",
-                draft_model_path=_DRAFT_MODEL,  # ← speculative decoding ON
-                num_draft_tokens=5,             # ← power: 5 draft tokens (vs 3)
+                # No speculative decoding — axe-stealth-37b uses a different
+                # tokenizer family from the Qwen3-0.6B draft model.
+                continuous_batching=True,
+                cb_max_num_seqs=256,        # 64 GB has headroom for larger queue
+                cb_prefill_batch_size=16,
+                cb_completion_batch_size=32, # 32 concurrent token steps on 37B
             ),
         },
     ),

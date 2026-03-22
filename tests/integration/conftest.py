@@ -5,8 +5,15 @@ Integration tests require:
     Redis on localhost:6379
     Postgres on localhost:5432 with octane DB
 
-Run with:
-    OCTANE_TEST_INTEGRATION=1 sandbox/oct_env/bin/pytest tests/integration/ -v
+E2E tests additionally require:
+    OCTANE_TEST_E2E=1
+    Bodega Inference Engine on localhost:44468 with models loaded
+
+Run integration only:
+    OCTANE_TEST_INTEGRATION=1 python -m pytest tests/integration/ -v
+
+Run integration + e2e:
+    OCTANE_TEST_INTEGRATION=1 OCTANE_TEST_E2E=1 python -m pytest tests/integration/ tests/e2e/ -v
 """
 
 from __future__ import annotations

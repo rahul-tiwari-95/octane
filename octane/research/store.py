@@ -319,6 +319,27 @@ class ResearchStore:
             logger.warning("research_get_findings_failed", error=str(exc))
             return []
 
+    async def search_findings(self, query: str, limit: int = 20) -> list[ResearchFinding]:
+        """Return findings whose content or topic matches *query* (case-insensitive)."""
+        pg = await self._pg()
+        if pg is None:
+            return []
+        try:
+            rows = await pg.fetch(
+                """
+                SELECT * FROM research_findings
+                WHERE content ILIKE $1 OR topic ILIKE $1
+                ORDER BY created_at DESC
+                LIMIT $2
+                """,
+                f"%{query}%",
+                limit,
+            )
+            return [ResearchFinding.from_row(dict(r)) for r in rows]
+        except Exception as exc:
+            logger.warning("research_search_findings_failed", error=str(exc))
+            return []
+
     async def close(self) -> None:
         """Close Redis and Postgres connections."""
         if self._redis_client:

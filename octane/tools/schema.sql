@@ -72,7 +72,7 @@ CREATE INDEX IF NOT EXISTS idx_artifacts_type       ON generated_artifacts (arti
 -- Replaces the single-table research_findings from Session 17 with richer schema.
 CREATE TABLE IF NOT EXISTS research_findings_v2 (
     id              SERIAL      PRIMARY KEY,
-    project_id     x INTEGER     REFERENCES projects(id) ON DELETE CASCADE,
+    project_id      INTEGER     REFERENCES projects(id) ON DELETE CASCADE,
     task_id         TEXT        NOT NULL,
     cycle_num       INTEGER     NOT NULL DEFAULT 0,
     topic           TEXT        NOT NULL,
@@ -88,7 +88,7 @@ CREATE INDEX IF NOT EXISTS idx_rfv2_task_id   ON research_findings_v2 (task_id);
 CREATE INDEX IF NOT EXISTS idx_rfv2_project   ON research_findings_v2 (project_id);
 CREATE INDEX IF NOT EXISTS idx_rfv2_created   ON research_findings_v2 (task_id, created_at DESC);
 
--- ── portfolio_po
+-- ── portfolio_positions ─────────────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS portfolio_positions (
     id              SERIAL      PRIMARY KEY,
     project_id      INTEGER     REFERENCES projects(id) ON DELETE CASCADE,
@@ -96,12 +96,17 @@ CREATE TABLE IF NOT EXISTS portfolio_positions (
     quantity        REAL        NOT NULL DEFAULT 0,
     avg_cost        REAL        NOT NULL DEFAULT 0,
     currency        TEXT        NOT NULL DEFAULT 'USD',
+    broker          TEXT        NOT NULL DEFAULT '',
+    account_id      TEXT        NOT NULL DEFAULT '',
+    sector          TEXT        NOT NULL DEFAULT '',
+    asset_class     TEXT        NOT NULL DEFAULT 'equity',
     notes           TEXT        NOT NULL DEFAULT '',
     created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 CREATE INDEX IF NOT EXISTS idx_positions_project ON portfolio_positions (project_id);
 CREATE INDEX IF NOT EXISTS idx_positions_ticker  ON portfolio_positions (ticker);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_positions_upsert ON portfolio_positions (ticker, broker, account_id);
 
 -- ── tracked_jobs ──────────────────────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS tracked_jobs (

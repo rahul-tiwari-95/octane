@@ -44,6 +44,18 @@ def _load_allocation_pie():
     from octane.catalysts.finance.allocation_pie import allocation_pie
     return allocation_pie
 
+def _load_earnings_calendar():
+    from octane.catalysts.finance.earnings_calendar import earnings_calendar
+    return earnings_calendar
+
+def _load_sector_exposure():
+    from octane.catalysts.finance.sector_exposure import sector_exposure
+    return sector_exposure
+
+def _load_correlation_analysis():
+    from octane.catalysts.finance.correlation_analysis import correlation_analysis
+    return correlation_analysis
+
 
 # ── Registry definition ───────────────────────────────────────────────────────
 
@@ -96,6 +108,34 @@ CATALYST_REGISTRY: dict[str, dict] = {
         ],
         "requires": ["price", "regularMarketPrice"],
         "loader": _load_allocation_pie,
+    },
+    "earnings_calendar": {
+        "sector": "finance",
+        "triggers": [
+            "earnings", "earnings date", "earnings report", "when does",
+            "report date", "quarterly results", "earnings call",
+            "eps estimate", "revenue estimate",
+        ],
+        "requires": ["ticker", "symbol"],
+        "loader": _load_earnings_calendar,
+    },
+    "sector_exposure": {
+        "sector": "finance",
+        "triggers": [
+            "sector", "industry", "which sector", "sector exposure",
+            "sector classification", "what industry", "market segment",
+        ],
+        "requires": ["ticker", "symbol"],
+        "loader": _load_sector_exposure,
+    },
+    "correlation_analysis": {
+        "sector": "finance",
+        "triggers": [
+            "correlation", "correlated", "compare returns", "move together",
+            "diversify", "pairwise", "portfolio correlation",
+        ],
+        "requires": ["time_series"],
+        "loader": _load_correlation_analysis,
     },
 }
 

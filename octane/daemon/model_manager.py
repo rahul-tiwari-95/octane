@@ -106,6 +106,11 @@ class ModelManager:
         self._idle_task: asyncio.Task | None = None
         self._running = False
 
+        # Per-model locks prevent concurrent load/unload races (TOCTOU).
+        # Without this, two tasks requesting a just-unloaded REASON model
+        # would both see existing=None and both call _load_model simultaneously.
+        self._model_locks: dict[str, asyncio.Lock] = {}
+
         # Stats
         self.total_loads: int = 0
         self.total_unloads: int = 0
@@ -183,24 +188,34 @@ class ModelManager:
         """Record that a model was used (resets idle timer)."""
         await self.state.touch_model(model_id)
 
+    def _lock(self, model_id: str) -> asyncio.Lock:
+        """Return the per-model lock, creating it lazily."""
+        if model_id not in self._model_locks:
+            self._model_locks[model_id] = asyncio.Lock()
+        return self._model_locks[model_id]
+
     async def ensure_loaded(self, model_id: str, tier: str) -> bool:
         """Ensure a model is loaded. Loads it on demand if needed.
 
         Returns True if the model is (or was successfully) loaded.
         Returns False if loading failed (no Bodega client, or API error).
+
+        Thread-safe: a per-model lock prevents concurrent callers from
+        issuing duplicate _load_model calls when the model is unloaded.
         """
-        existing = await self.state.get_model(model_id)
-        if existing is not None:
-            # Already loaded — just touch it
-            await self.record_usage(model_id)
-            return True
+        async with self._lock(model_id):
+            existing = await self.state.get_model(model_id)
+            if existing is not None:
+                # Already loaded — just touch it
+                await self.record_usage(model_id)
+                return True
 
-        # Need to load — requires Bodega client
-        if self.bodega is None:
-            logger.warning("model_load_skipped_no_client", model_id=model_id)
-            return False
+            # Need to load — requires Bodega client
+            if self.bodega is None:
+                logger.warning("model_load_skipped_no_client", model_id=model_id)
+                return False
 
-        return await self._load_model(model_id, tier)
+            return await self._load_model(model_id, tier)
 
     async def _load_model(self, model_id: str, tier: str) -> bool:
         """Load a model via Bodega admin API."""
@@ -232,28 +247,33 @@ class ModelManager:
             return False
 
     async def _unload_model(self, model_id: str) -> bool:
-        """Unload a model via Bodega admin API."""
-        if self.bodega is None:
-            logger.warning("model_unload_skipped_no_client", model_id=model_id)
-            # Still remove from state registry
-            await self.state.unregister_model(model_id)
-            self.total_unloads += 1
-            return True
+        """Unload a model via Bodega admin API.
 
-        try:
-            logger.info("model_unloading", model_id=model_id)
-            success = await self.bodega.unload_model(model_id)
-            if success:
+        Holds the per-model lock so ensure_loaded cannot race with an
+        in-progress unload (load-while-unloading race).
+        """
+        async with self._lock(model_id):
+            if self.bodega is None:
+                logger.warning("model_unload_skipped_no_client", model_id=model_id)
+                # Still remove from state registry
                 await self.state.unregister_model(model_id)
                 self.total_unloads += 1
-                logger.info("model_unloaded", model_id=model_id)
                 return True
-            else:
-                logger.error("model_unload_failed", model_id=model_id)
+
+            try:
+                logger.info("model_unloading", model_id=model_id)
+                success = await self.bodega.unload_model(model_id)
+                if success:
+                    await self.state.unregister_model(model_id)
+                    self.total_unloads += 1
+                    logger.info("model_unloaded", model_id=model_id)
+                    return True
+                else:
+                    logger.error("model_unload_failed", model_id=model_id)
+                    return False
+            except Exception as exc:
+                logger.error("model_unload_error", model_id=model_id, error=str(exc))
                 return False
-        except Exception as exc:
-            logger.error("model_unload_error", model_id=model_id, error=str(exc))
-            return False
 
     async def check_idle(self) -> list[str]:
         """Check all loaded models for idle timeout. Unloads idle models.

@@ -76,12 +76,21 @@ class Orchestrator:
         self._memory_agent = None
         self._pg_connected = False
 
-    async def pre_flight(self) -> dict:
-        """Check Bodega is reachable and a model is loaded.
+    async def pre_flight(self, wait_for_bodega: bool = False) -> dict:
+        """Check Bodega is reachable and models are loaded.
 
-        Called once before the first query. If Bodega is down, the
-        Decomposer and Evaluator will gracefully fall back to
-        keyword heuristics and string concatenation respectively.
+        Called once before the first query.  When *wait_for_bodega* is True
+        (interactive CLI mode) and Bodega is offline, this method calls
+        ``router.wait_for_server()`` — which prints live status to stderr and
+        polls until the engine comes back — instead of immediately falling back
+        to keyword heuristics.
+
+        Args:
+            wait_for_bodega: If True, block until Bodega is reachable rather
+                             than returning immediately with a fallback status.
+                             Pass True from interactive CLI commands so the user
+                             sees "Waiting for Bodega..." messaging in the
+                             terminal while they start the inference engine.
 
         Returns a status dict for display in the CLI.
         """
@@ -89,6 +98,11 @@ class Orchestrator:
 
         try:
             health = await self.bodega.health()
+            if health.get("status") != "ok" and wait_for_bodega:
+                # Server is down — wait until it comes up, then re-check
+                await self.bodega.wait_for_server()
+                health = await self.bodega.health()
+
             if health.get("status") == "ok":
                 status["bodega_reachable"] = True
 
@@ -96,6 +110,8 @@ class Orchestrator:
                 if "error" not in model_info and model_info:
                     status["model_loaded"] = True
                     status["model"] = model_info.get("model_path") or model_info.get("model")
+                    # Surface all loaded models for the topology display
+                    status["all_models"] = model_info.get("all_models", [])
                 else:
                     status["note"] = "Bodega reachable but no model loaded — LLM features disabled"
                     logger.warning("bodega_no_model_loaded")
@@ -104,8 +120,22 @@ class Orchestrator:
                 logger.warning("bodega_unreachable")
 
         except Exception as exc:
-            status["note"] = f"Bodega check failed: {exc} — using keyword fallback"
-            logger.warning("bodega_preflight_error", error=str(exc))
+            if wait_for_bodega:
+                try:
+                    await self.bodega.wait_for_server()
+                    health = await self.bodega.health()
+                    if health.get("status") == "ok":
+                        status["bodega_reachable"] = True
+                        model_info = await self.bodega.current_model()
+                        if "error" not in model_info and model_info:
+                            status["model_loaded"] = True
+                            status["model"] = model_info.get("model_path") or model_info.get("model")
+                            status["all_models"] = model_info.get("all_models", [])
+                except Exception:
+                    pass
+            if not status["bodega_reachable"]:
+                status["note"] = f"Bodega check failed: {exc} — using keyword fallback"
+                logger.warning("bodega_preflight_error", error=str(exc))
 
         # Connect Postgres warm tier on first startup (non-blocking, graceful fallback)
         if not self._pg_connected:
@@ -123,7 +153,7 @@ class Orchestrator:
         return status
 
     async def _connect_memory_pg(self) -> None:
-        """Connect MemoryAgent to Postgres warm tier. Safe to call even if Postgres is down."""
+        """Connect MemoryAgent and Router to Postgres. Safe to call even if Postgres is down."""
         memory_agent = self._get_memory_agent()
         if memory_agent is not None:
             try:
@@ -132,6 +162,14 @@ class Orchestrator:
                 # Never crash the pipeline over an infra connection failure.
                 # MemoryAgent will operate in Redis-only fallback mode.
                 logger.warning("memory_pg_connect_error", error=str(exc))
+
+        # Connect the Router's PgClient so WebPageStore and ArtifactStore work.
+        # Without this, page/artifact persistence silently no-ops (available=False).
+        try:
+            await self.router.pg.connect()
+        except Exception as exc:
+            logger.warning("router_pg_connect_error", error=str(exc))
+
         self._pg_connected = True
 
     async def run(
@@ -315,12 +353,30 @@ class Orchestrator:
                     results.append(response)
 
         # STEP 5: EVALUATE — synthesize all results (inject prior memory context + user profile)
+        self.synapse.emit(SynapseEvent(
+            correlation_id=correlation_id,
+            event_type="evaluate_start",
+            source="osa.evaluator",
+            payload={
+                "agents_used": [r.agent for r in results],
+                "total_results": len(results),
+                "successful": sum(1 for r in results if r.success),
+            },
+        ))
+
         output = await self.evaluator.evaluate(
             query, results,
             prior_context=prior_context,
             user_profile=user_profile,
             conversation_history=conversation_history,
         )
+
+        self.synapse.emit(SynapseEvent(
+            correlation_id=correlation_id,
+            event_type="evaluate_done",
+            source="osa.evaluator",
+            payload={"word_count": len(output.split())},
+        ))
 
         # STEP 5.5: MEMORY WRITE — persist the answer for future recall
         if memory_agent and session_id != "cli":
@@ -537,6 +593,18 @@ class Orchestrator:
         # 3.13 when the generator is suspended between yields.  Instead we put
         # a hard wall-clock cap on each individual __anext__() call, which is a
         # plain coroutine that asyncio.wait_for() handles correctly.
+        self.synapse.emit(SynapseEvent(
+            correlation_id=correlation_id,
+            event_type="evaluate_start",
+            source="osa.evaluator",
+            payload={
+                "agents_used": [r.agent for r in results],
+                "total_results": len(results),
+                "successful": sum(1 for r in results if r.success),
+                "mode": "stream",
+            },
+        ))
+
         full_output_parts: list[str] = []
         _eval_gen = self.evaluator.evaluate_stream(
             query, results,
@@ -574,6 +642,13 @@ class Orchestrator:
                 pass
 
         full_output = "".join(full_output_parts).strip()
+
+        self.synapse.emit(SynapseEvent(
+            correlation_id=correlation_id,
+            event_type="evaluate_done",
+            source="osa.evaluator",
+            payload={"word_count": len(full_output.split()), "mode": "stream"},
+        ))
 
         # Memory write
         if memory_agent and session_id != "cli":

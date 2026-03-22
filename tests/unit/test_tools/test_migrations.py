@@ -72,7 +72,7 @@ async def test_migrate_noop_when_current():
 
     # _list_tables
     mock_conn.fetch.side_effect = [
-        [{"version": "20A"}],                        # schema_migrations query
+        [{"version": "20A"}, {"version": "28A"}, {"version": "29A"}],   # schema_migrations query
         [{"table_name": "projects"}, {"table_name": "embeddings"}],  # _list_tables
     ]
 
@@ -81,7 +81,7 @@ async def test_migrate_noop_when_current():
         result = await runner.migrate()
 
     assert result.applied is False
-    assert result.version == "20A"
+    assert result.version == "29A"
     assert "projects" in result.tables
 
 
@@ -123,7 +123,7 @@ async def test_migrate_applies_when_pending():
         result = await runner.migrate()
 
     assert result.applied is True
-    assert result.version == "20A"
+    assert result.version == "29A"
     assert len(result.tables) >= 1
 
 

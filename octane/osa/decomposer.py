@@ -44,6 +44,21 @@ PIPELINE_TEMPLATES: dict[str, dict] = {
         "keywords": ["search", "find", "look up", "what is", "who is", "where is", "how does",
                      "pros", "cons", "review", "compare", "macbook", "iphone", "laptop", "product"],
     },
+    "web_entertainment": {
+        "agent": "web",
+        "sub_agent": "entertainment",
+        "description": "Find movies, TV shows, cast, ratings, streaming info, or recommendations",
+        "keywords": ["movie", "film", "tv show", "series", "watch", "streaming", "netflix",
+                     "hulu", "disney", "imdb", "cast", "director", "actor", "actress",
+                     "recommend", "best movies", "top rated", "now playing", "trailer"],
+    },
+    "web_music": {
+        "agent": "web",
+        "sub_agent": "music",
+        "description": "Search for songs, artists, albums, lyrics, or music recommendations",
+        "keywords": ["song", "artist", "album", "music", "lyrics", "band", "singer",
+                     "playlist", "spotify", "youtube music", "listen", "track", "discography"],
+    },
     "code_generation": {
         "agent": "code",
         "sub_agent": "full_pipeline",
@@ -71,14 +86,16 @@ _VALID_TEMPLATES = set(PIPELINE_TEMPLATES.keys())
 # No JSON, no reasoning, no markdown. Just the token. Reliable at temperature=0.
 _DECOMPOSER_SYSTEM = (
     "You are a query router. Respond with ONLY one of these exact words, nothing else:\n"
-    "web_finance, web_news, web_search, code_generation, memory_recall, sysstat_health\n\n"
+    "web_finance, web_news, web_search, web_entertainment, web_music, code_generation, memory_recall, sysstat_health\n\n"
     "Meanings:\n"
-    "  web_finance    → stock price, market data, financial metrics, earnings\n"
-    "  web_news       → recent news, headlines, current events, announcements\n"
-    "  web_search     → general research, who/what/where questions, information lookup\n"
-    "  code_generation → write code, script, program, algorithm, implementation\n"
-    "  memory_recall  → recall something previously discussed or stored\n"
-    "  sysstat_health → system health, CPU, RAM, model status\n\n"
+    "  web_finance       → stock price, market data, financial metrics, earnings\n"
+    "  web_news          → recent news, headlines, current events, announcements\n"
+    "  web_search        → general research, who/what/where questions, information lookup\n"
+    "  web_entertainment → movies, TV shows, streaming, cast, ratings, recommendations\n"
+    "  web_music         → songs, artists, albums, lyrics, music recommendations\n"
+    "  code_generation   → write code, script, program, algorithm, implementation\n"
+    "  memory_recall     → recall something previously discussed or stored\n"
+    "  sysstat_health    → system health, CPU, RAM, model status\n\n"
     "If unsure, output: web_search"
 )
 

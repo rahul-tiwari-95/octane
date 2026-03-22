@@ -15,19 +15,30 @@ Quick-start::
         tier=ModelTier.FAST,
     )
 
-Tier semantics (matched to live Bodega models):
-    FAST   — bodega-raptor-90M  — keyword extraction, routing, classification
-    MID    — bodega-raptor-90M  — chunk summarization (upgrades to 1B in power)
-    REASON — bodega-raptor-8b   — deep analysis, synthesis, evaluation
+Tier semantics (power topology — 32 GB+ RAM):
+    FAST   — bodega-raptor-90M  (lm)       — routing, extraction, classification
+    MID    — bodega-vertex-4b   (lm)       — chunk summarization (falls back to 90M)
+    REASON — axe-stealth-37b   (multimodal) — final-answer synthesis, deep analysis
     EMBED  — handled in-process; not routed through Bodega
 
-The router dynamically queries Bodega for loaded models and falls back
-gracefully if the preferred tier model isn't available.
+Key behaviours:
+  • Tier-aware fallback: REASON prefers multimodal (large) > lm (small).
+    FAST/MID prefer lm (small 90M) over multimodal (large 37b).
+  • Auto-load: if the preferred model is not loaded Bodega is asked to load
+    it on demand.  This is transparent to all callers.
+  • wait_for_server(): blocks with live terminal feedback until Bodega is
+    reachable.  Called from pre_flight() when the engine is offline.
+  • gather_completions(): fires N chat requests concurrently via
+    asyncio.gather, routing each to the correct model tier.  Both the 90M
+    and the 37B can receive concurrent requests and handle them in parallel
+    thanks to their CB-enabled max_concurrency settings.
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
+import sys
 from collections.abc import AsyncIterator
 from typing import Any
 
@@ -44,7 +55,8 @@ class BodegaRouter:
     """Tier-aware routing wrapper around :class:`BodegaInferenceClient`.
 
     Dynamically queries Bodega for loaded models and falls back gracefully
-    if the preferred tier model isn't available.
+    if the preferred tier model isn't available.  Can auto-load models on
+    demand and waits for the Bodega server to come online if it is offline.
 
     Args:
         topology: Topology name (``'auto'``, ``'compact'``, ``'balanced'``,
@@ -69,16 +81,74 @@ class BodegaRouter:
         self._loaded_models: dict[str, str] | None = None
         logger.debug("bodega_router_init", topology=self._topology.name)
 
+    # ── Server health & wait ──────────────────────────────────────────────────
+
+    async def wait_for_server(
+        self,
+        poll_interval: float = 3.0,
+        max_attempts: int | None = None,
+    ) -> None:
+        """Block until Bodega is reachable, printing live status to stderr.
+
+        Called from pre_flight() when the initial health check fails.  The
+        user sees a clear message to start their inference engine and Octane
+        keeps polling until it comes up — no action required beyond starting
+        the engine.
+
+        Args:
+            poll_interval: Seconds between health check attempts.
+            max_attempts:  Stop after this many attempts (None = infinite).
+        """
+        attempt = 0
+        print(
+            "\n[Octane] Bodega inference engine not reachable at "
+            f"{self._client.base_url}\n"
+            "         Start the engine and Octane will pick it up automatically.\n",
+            file=sys.stderr,
+            flush=True,
+        )
+        while True:
+            attempt += 1
+            if max_attempts is not None and attempt > max_attempts:
+                return
+            try:
+                health = await self._client.health()
+                if health.get("status") == "ok":
+                    print(
+                        f"[Octane] Bodega is online (attempt {attempt}). "
+                        f"Models: {health.get('model_id', 'none')}\n",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    self._loaded_models = None  # force fresh discovery
+                    return
+            except Exception:
+                pass
+            print(
+                f"[Octane] Waiting for Bodega... (attempt {attempt})"
+                f"  Retry in {poll_interval:.0f}s",
+                file=sys.stderr,
+                flush=True,
+            )
+            await asyncio.sleep(poll_interval)
+
     # ── Dynamic model discovery ───────────────────────────────────────────────
 
-    async def _fetch_loaded_models(self) -> dict[str, str]:
-        """Fetch currently loaded models from Bodega. Cached per instance."""
+    async def _fetch_loaded_models(self, *, wait_if_down: bool = False) -> dict[str, str]:
+        """Fetch currently loaded models from Bodega. Cached per instance.
+
+        Args:
+            wait_if_down: If True and Bodega is unreachable, call
+                          wait_for_server() before giving up.
+        """
         if self._loaded_models is not None:
             return self._loaded_models
 
         try:
-            # Use /health endpoint which returns models_detail
             resp = await self._client.health()
+            if resp.get("status") != "ok" and wait_if_down:
+                await self.wait_for_server()
+                resp = await self._client.health()
             models_detail = resp.get("models_detail", [])
             self._loaded_models = {
                 m["id"]: m.get("type", "lm")
@@ -88,6 +158,19 @@ class BodegaRouter:
             logger.debug("bodega_models_discovered", models=list(self._loaded_models.keys()))
             return self._loaded_models
         except Exception as exc:
+            if wait_if_down:
+                await self.wait_for_server()
+                try:
+                    resp = await self._client.health()
+                    models_detail = resp.get("models_detail", [])
+                    self._loaded_models = {
+                        m["id"]: m.get("type", "lm")
+                        for m in models_detail
+                        if m.get("status") == "running"
+                    }
+                    return self._loaded_models
+                except Exception:
+                    pass
             logger.warning("bodega_model_discovery_failed", error=str(exc))
             return {}
 
@@ -95,21 +178,79 @@ class BodegaRouter:
         """Clear cached model list — call after load/unload operations."""
         self._loaded_models = None
 
-    async def _resolve_available_model(self, tier: ModelTier) -> str | None:
+    # ── Auto-load ─────────────────────────────────────────────────────────────
+
+    async def _auto_load_tier(self, tier: ModelTier) -> bool:
+        """Load the topology-configured model for *tier* via Bodega admin API.
+
+        Returns True if the load succeeded, False otherwise.
+        """
+        try:
+            config = self._topology.resolve_config(tier)
+            params = config.to_load_params()
+            logger.info(
+                "bodega_auto_loading_model",
+                tier=tier.value,
+                model_id=config.model_id,
+                model_path=config.model_path,
+            )
+            print(
+                f"[Octane] Auto-loading {config.model_id} ({config.model_path}) "
+                f"for {tier.value} tier...",
+                file=sys.stderr,
+                flush=True,
+            )
+            client = await self._client._get_client()
+            resp = await client.post("/v1/admin/load-model", json=params)
+            resp.raise_for_status()
+            result = resp.json()
+            if result.get("status") == "loaded":
+                self.invalidate_model_cache()
+                print(
+                    f"[Octane] {config.model_id} loaded successfully.",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                return True
+            logger.warning("bodega_auto_load_unexpected", result=result)
+            return False
+        except Exception as exc:
+            logger.warning("bodega_auto_load_failed", tier=tier.value, error=str(exc))
+            return False
+
+    # ── Tier-aware model resolution ───────────────────────────────────────────
+
+    async def _resolve_available_model(
+        self,
+        tier: ModelTier,
+        *,
+        auto_load: bool = True,
+    ) -> str | None:
         """Resolve a tier to an actually-loaded model ID, or None.
 
         Matching strategy (tried in order):
-          1. Direct match — topology model_id == loaded model ID  (fastest path)
-          2. Path match   — topology model_path.lower() == loaded ID.lower()
-                           handles externally-loaded models whose registered ID
-                           is the full HuggingFace path (e.g. Bodega registers
-                           "srswti/bodega-raptor-90m" when loaded without alias)
-          3. Any LM       — last-resort fallback; logs a warning
+          1. Direct match   — topology model_id == loaded model ID
+          2. Path match     — topology model_path.lower() == loaded ID.lower()
+                             handles Bodega registering models by full HF path
+          3. Tier-aware fallback:
+               REASON  → prefer multimodal first (the large 37B), then lm
+               FAST/MID → prefer lm first (the small 90M), then multimodal
+          4. Auto-load — load the topology model from Bodega admin API,
+             then retry resolution (step 1+2).
+
+        This means: with [90M lm, axe-stealth-37b multimodal] loaded,
+          - FAST, MID  → 90M   ✓
+          - REASON     → axe-stealth-37b  ✓   (not 90M as before)
         """
         loaded = await self._fetch_loaded_models()
 
         if not loaded:
-            return None
+            if auto_load:
+                loaded_ok = await self._auto_load_tier(tier)
+                if loaded_ok:
+                    loaded = await self._fetch_loaded_models()
+            if not loaded:
+                return None
 
         preferred_cfg = self._topology.resolve_config(tier)
         preferred_id   = preferred_cfg.model_id
@@ -120,7 +261,6 @@ class BodegaRouter:
             return preferred_id
 
         # 2. Path-based match (case-insensitive)
-        #    Handles Bodega registering models by their HF path
         preferred_path_lower = preferred_path.lower()
         for loaded_id in loaded:
             if loaded_id.lower() == preferred_path_lower:
@@ -132,16 +272,46 @@ class BodegaRouter:
                 )
                 return loaded_id
 
-        # 3. Any available LM model (last resort — all tiers get same model)
-        for loaded_id, model_type in loaded.items():
-            if model_type == "lm":
-                logger.info(
-                    "bodega_tier_fallback",
-                    tier=tier.value,
-                    preferred=preferred_id,
-                    using=loaded_id,
-                )
-                return loaded_id
+        # 3. Tier-aware fallback (no exact or path match)
+        if tier == ModelTier.REASON:
+            # Final-answer synthesis: prefer the largest available model.
+            # multimodal usually means the big 37B; lm is the small 90M.
+            for model_type_pref in ("multimodal", "lm"):
+                for loaded_id, model_type in loaded.items():
+                    if model_type == model_type_pref:
+                        logger.info(
+                            "bodega_tier_fallback",
+                            tier=tier.value,
+                            preferred=preferred_id,
+                            using=loaded_id,
+                            reason=f"type={model_type_pref} fallback",
+                        )
+                        return loaded_id
+        else:
+            # FAST / MID: prefer speed — lm (90M) first, then multimodal.
+            for model_type_pref in ("lm", "multimodal"):
+                for loaded_id, model_type in loaded.items():
+                    if model_type == model_type_pref:
+                        logger.info(
+                            "bodega_tier_fallback",
+                            tier=tier.value,
+                            preferred=preferred_id,
+                            using=loaded_id,
+                            reason=f"type={model_type_pref} fallback",
+                        )
+                        return loaded_id
+
+        # 4. Auto-load: model not found among currently loaded; try to load it
+        if auto_load:
+            loaded_ok = await self._auto_load_tier(tier)
+            if loaded_ok:
+                # Retry steps 1 & 2 with fresh model list
+                loaded = await self._fetch_loaded_models()
+                if preferred_id in loaded:
+                    return preferred_id
+                for loaded_id in loaded:
+                    if loaded_id.lower() == preferred_path_lower:
+                        return loaded_id
 
         return None
 
@@ -172,7 +342,8 @@ class BodegaRouter:
         """Routed chat completion.
 
         Dynamically resolves the tier to an actually-loaded model.
-        Falls back to any available LM model if the preferred one isn't loaded.
+        Falls back to any available model if the preferred one isn't loaded.
+        Auto-loads the model if it isn't present.
 
         Args:
             messages:    OpenAI-format message list.
@@ -182,18 +353,18 @@ class BodegaRouter:
 
         Returns:
             Full Bodega API response dict (OpenAI-compatible).
-            
+
         Raises:
-            RuntimeError: If no LM models are loaded in Bodega.
+            RuntimeError: If no models are loaded or Bodega is unreachable.
         """
         model_id = await self._resolve_available_model(tier)
-        
+
         if model_id is None:
             raise RuntimeError(
-                "No LM models loaded in Bodega. "
-                "Check Bodega status: curl http://localhost:44468/health"
+                f"No model available for tier {tier.value}. "
+                "Ensure Bodega is running: curl http://localhost:44468/health"
             )
-        
+
         logger.debug("router_chat", tier=tier.value, model_id=model_id)
         return await self._client.chat(
             messages=messages,
@@ -246,7 +417,7 @@ class BodegaRouter:
         """Routed streaming chat — yields text chunks as they arrive.
 
         Dynamically resolves the tier to an actually-loaded model.
-        Falls back to any available LM model if the preferred one isn't loaded.
+        Falls back to any available model if the preferred one isn't loaded.
 
         Args:
             prompt:        User prompt.
@@ -255,16 +426,16 @@ class BodegaRouter:
             temperature:   Sampling temperature.
             max_tokens:    Max tokens to generate.
             total_timeout: Read timeout between SSE chunks.
-            
+
         Raises:
-            RuntimeError: If no LM models are loaded in Bodega.
+            RuntimeError: If no models are loaded or Bodega is unreachable.
         """
         model_id = await self._resolve_available_model(tier)
-        
+
         if model_id is None:
             raise RuntimeError(
-                "No LM models loaded in Bodega. "
-                "Check Bodega status: curl http://localhost:44468/health"
+                f"No model available for tier {tier.value}. "
+                "Ensure Bodega is running: curl http://localhost:44468/health"
             )
 
         messages: list[dict[str, str]] = []
@@ -307,6 +478,60 @@ class BodegaRouter:
                             yield text
                     except (json.JSONDecodeError, KeyError, IndexError):
                         continue
+
+    # ── Concurrent batch inference ────────────────────────────────────────────
+
+    async def gather_completions(
+        self,
+        requests: list[dict[str, Any]],
+    ) -> list[str | BaseException]:
+        """Fire N chat requests concurrently, routing each to the right model.
+
+        Both the 90M (FAST) and 37B (REASON) can receive concurrent requests
+        because they are loaded with max_concurrency>1 and continuous batching
+        enabled.  This method lets the caller saturate both models in parallel.
+
+        Args:
+            requests: List of request dicts, each with keys:
+                        ``prompt``   (str, required)
+                        ``tier``     (ModelTier, default REASON)
+                        ``system``   (str, default "")
+                        ``temperature`` (float, default 0.7)
+                        ``max_tokens``  (int, default 1024)
+
+        Returns:
+            List of results in the same order as *requests*.
+            Each entry is either the generated text (str) or an Exception
+            if that individual request failed (other requests still succeed).
+
+        Example::
+
+            results = await router.gather_completions([
+                {"prompt": "Summarise NVDA earnings", "tier": ModelTier.FAST},
+                {"prompt": "Write a full thesis on NVDA vs AMD", "tier": ModelTier.REASON},
+                {"prompt": "What sector is MSFT in?", "tier": ModelTier.FAST},
+            ])
+        """
+        tasks = [
+            self.chat_simple(
+                prompt=req["prompt"],
+                system=req.get("system", ""),
+                tier=req.get("tier", ModelTier.REASON),
+                temperature=req.get("temperature", 0.7),
+                max_tokens=req.get("max_tokens", 1024),
+            )
+            for req in requests
+        ]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        for i, (req, res) in enumerate(zip(requests, results)):
+            if isinstance(res, BaseException):
+                logger.warning(
+                    "gather_completion_failed",
+                    index=i,
+                    tier=req.get("tier", ModelTier.REASON),
+                    error=str(res),
+                )
+        return list(results)
 
     # ── Health & info — delegate through ─────────────────────────────────────
 

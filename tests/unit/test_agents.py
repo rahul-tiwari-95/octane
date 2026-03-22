@@ -3767,7 +3767,7 @@ class TestResearchCLI:
 
         runner = CliRunner()
         with patch(
-            "octane.main._research_status",
+            "octane.cli.research._research_status",
             new=AsyncMock(return_value=None),
         ):
             result = runner.invoke(app, ["research", "status"])
@@ -4340,7 +4340,7 @@ class TestResearchDepthFlag:
         from typer.testing import CliRunner
         from octane.main import app
         runner = CliRunner()
-        with patch("octane.main._research_start", new=AsyncMock(return_value=None)):
+        with patch("octane.cli.research._research_start", new=AsyncMock(return_value=None)):
             result = runner.invoke(app, ["research", "start", "test topic", "--depth", "shallow"])
         assert "Invalid" not in (result.output or "")
 

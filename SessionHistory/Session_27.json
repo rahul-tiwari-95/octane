@@ -1,0 +1,80 @@
+{
+  "session": 27,
+  "title": "Integration Tests, Daemon Hardening, Auto-Store on Deep Queries",
+  "date": "2025-07",
+  "status": "complete",
+  "test_results": {
+    "passed": 719,
+    "skipped": 32,
+    "failed": 0,
+    "warnings": 4,
+    "notes": "32 skipped = new integration tests guarded by OCTANE_TEST_INTEGRATION=1 / OCTANE_TEST_E2E=1"
+  },
+  "parts": {
+    "A": {
+      "title": "Integration Tests Against Live Infrastructure",
+      "status": "complete",
+      "file": "tests/integration/test_session27_integration.py",
+      "test_count": 32,
+      "guards": {
+        "OCTANE_TEST_INTEGRATION": "Redis + Postgres tests",
+        "OCTANE_TEST_E2E": "Also enables Bodega live inference tests"
+      },
+      "test_classes": [
+        "TestRedisConnectivity — ping + set/get roundtrip",
+        "TestPostgresConnectivity — connect, schema tables, columns, idempotency",
+        "TestWebPageStore — store, dedup, seen, recent, count",
+        "TestResearchStore — add_finding, register_task, log_entry roundtrip",
+        "TestBodegaRouterLive (E2E) — health, tier routing, inference returns text",
+        "TestOSAPipelineLive (E2E) — health command, ask response, memory store+recall",
+        "TestAutoStoreOnDeepQuery (E2E) — router.pg connected, web_pages count increases",
+        "TestDatabaseSchema — tables, columns, research_findings created on demand"
+      ]
+    },
+    "B": {
+      "title": "Daemon Multi-Terminal Contention Fix",
+      "status": "complete",
+      "file": "octane/daemon/model_manager.py",
+      "root_cause": "ensure_loaded() had a TOCTOU race: check get_model(), then _load_model() with no lock between. Two concurrent callers both saw existing=None and both invoked _load_model() simultaneously → double-load race condition against Bodega.",
+      "fix": {
+        "mechanism": "Per-model asyncio.Lock stored in self._model_locks dict, lazily created by _lock(model_id) helper",
+        "functions_locked": [
+          "ensure_loaded() — wraps entire check-then-load in async with self._lock(model_id)",
+          "_unload_model() — wraps entire unload in async with self._lock(model_id) to prevent load-while-unloading race"
+        ],
+        "topology_risk": "compact and balanced topologies auto-unload REASON tier after 2-5 min idle; without lock, high concurrency terminals reliably triggered the race"
+      }
+    },
+    "C": {
+      "title": "Auto-Store on --deep Queries",
+      "status": "complete",
+      "files_modified": [
+        "octane/osa/orchestrator.py",
+        "octane/cli/ask.py"
+      ],
+      "root_cause": "Router.__init__ created self.pg = PgClient() but never called connect(). PgClient.available = False by default. WebPageStore.store() checks `if not self.available: return None`. All web page persistence silently no-oped.",
+      "fix_orchestrator": "_connect_memory_pg() now also calls await self.router.pg.connect() with graceful except/warning on failure",
+      "fix_ask": "Added _store_deep_finding() async helper + fire-and-forget asyncio.ensure_future() call after --deep output completes. Persists synthesis result to research_findings table via ResearchStore."
+    }
+  },
+  "rejected_proposals": {
+    "MCP_server": {
+      "reason": "Premature brand dilution. Octane becomes a feature of VS Code / Claude Desktop instead of a product in its own right. Does not serve target users (hedge fund analysts, lawyers). Creates Anthropic protocol dependency.",
+      "user_quote": "The pitch is seductive but premature... Octane becomes a feature of their product instead of a product in its own right."
+    }
+  },
+  "architecture_notes": {
+    "persistence_chain": "Orchestrator._connect_memory_pg() → Router.pg.connect() + MemoryAgent.connect_pg() → WebPageStore/ArtifactStore become active",
+    "model_lifecycle": "ModelManager._lock(model_id) → asyncio.Lock per model → ensure_loaded + _unload_model both hold lock → zero double-load races",
+    "research_store": "ResearchStore uses its own separate asyncpg connection (lazy), independent of Router.pg"
+  },
+  "files_created": [
+    "tests/integration/test_session27_integration.py"
+  ],
+  "files_modified": [
+    "octane/osa/orchestrator.py",
+    "octane/cli/ask.py",
+    "octane/daemon/model_manager.py",
+    "tests/integration/conftest.py"
+  ]
+}

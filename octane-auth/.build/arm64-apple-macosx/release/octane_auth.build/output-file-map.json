@@ -1,0 +1,13 @@
+{
+  "": {
+    "dependencies": "/Users/rahul/SRSWTI/octane/octane-auth/.build/arm64-apple-macosx/release/octane_auth.build/octane_auth.d",
+    "object": "/Users/rahul/SRSWTI/octane/octane-auth/.build/arm64-apple-macosx/release/octane_auth.build/octane_auth.o",
+    "swift-dependencies": "/Users/rahul/SRSWTI/octane/octane-auth/.build/arm64-apple-macosx/release/octane_auth.build/master.swiftdeps"
+  },
+  "/Users/rahul/SRSWTI/octane/octane-auth/Sources/main.swift": {
+    "object": "/Users/rahul/SRSWTI/octane/octane-auth/.build/arm64-apple-macosx/release/octane_auth.build/main.swift.o",
+    "swiftmodule": "/Users/rahul/SRSWTI/octane/octane-auth/.build/arm64-apple-macosx/release/octane_auth.build/main~partial.swiftmodule",
+    "swift-dependencies": "/Users/rahul/SRSWTI/octane/octane-auth/.build/arm64-apple-macosx/release/octane_auth.build/main.swiftdeps",
+    "diagnostics": "/Users/rahul/SRSWTI/octane/octane-auth/.build/arm64-apple-macosx/release/octane_auth.build/main.dia"
+  }
+}

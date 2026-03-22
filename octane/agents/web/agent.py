@@ -104,6 +104,10 @@ class WebAgent(BaseAgent):
             return await self._fetch_finance(query, request)
         elif sub_agent in ("news", "web_news"):
             return await self._fetch_news(query, request, deep=deep)
+        elif sub_agent in ("entertainment", "web_entertainment"):
+            return await self._fetch_entertainment(query, request)
+        elif sub_agent in ("music", "web_music"):
+            return await self._fetch_music(query, request)
         else:
             # "search", "web_search", or any unknown → general Brave search
             return await self._fetch_search(query, request, deep=deep)
@@ -592,6 +596,138 @@ class WebAgent(BaseAgent):
         return AgentResponse(
             agent=self.name, success=True,
             output=summary, data={"news": news_raw, "web": web_raw},
+            correlation_id=request.correlation_id,
+        )
+
+    # ── Entertainment ─────────────────────────────────────────────────────
+
+    async def _fetch_entertainment(self, query: str, request: AgentRequest) -> AgentResponse:
+        """Fetch movie/TV data from TMDB via Bodega Entertainment flow.
+
+        Tries movie search first; falls back to TV search + web search for richer context.
+        """
+        q = query.lower()
+        is_tv = any(kw in q for kw in ("tv", "series", "show", "episode", "season"))
+
+        if is_tv:
+            movies_raw, tv_raw = await asyncio.gather(
+                self._intel.movies_search(query),
+                self._intel.tv_search(query),
+                return_exceptions=True,
+            )
+        else:
+            movies_raw = await self._intel.movies_search(query)
+            tv_raw = {}
+
+        if isinstance(movies_raw, Exception):
+            movies_raw = {}
+        if isinstance(tv_raw, Exception):
+            tv_raw = {}
+
+        # Also run a web search for reviews/streaming info in parallel
+        web_raw = await self._intel.web_search(f"{query} movie review streaming", count=4)
+        if isinstance(web_raw, Exception):
+            web_raw = {}
+
+        combined = {
+            "movies": movies_raw,
+            "tv": tv_raw,
+            "web": web_raw,
+        }
+
+        # Build a quick structured summary from TMDB results
+        parts: list[str] = []
+        for result in movies_raw.get("results", [])[:5]:
+            title = result.get("title") or result.get("name", "")
+            year = (result.get("release_date") or result.get("first_air_date") or "")[:4]
+            rating = result.get("vote_average", "")
+            overview = result.get("overview", "")[:200]
+            if title:
+                parts.append(f"**{title}** ({year}) — Rating: {rating}/10\n{overview}")
+        for result in tv_raw.get("results", [])[:3]:
+            title = result.get("name") or result.get("title", "")
+            year = (result.get("first_air_date") or "")[:4]
+            rating = result.get("vote_average", "")
+            overview = result.get("overview", "")[:200]
+            if title:
+                parts.append(f"**{title}** ({year}) — Rating: {rating}/10\n{overview}")
+
+        if parts:
+            tmdb_summary = "\n\n".join(parts)
+        else:
+            tmdb_summary = ""
+
+        # Synthesize with LLM if we have web results or TMDB data
+        web_results = web_raw.get("web", {}).get("results", []) if isinstance(web_raw, dict) else []
+        if tmdb_summary or web_results:
+            synthesis_input = tmdb_summary
+            if web_results:
+                snippets = "\n".join(
+                    f"- {r.get('title', '')}: {r.get('description', '')[:200]}"
+                    for r in web_results[:4]
+                )
+                synthesis_input = (synthesis_input + "\n\n" + snippets).strip()
+            if self._bodega:
+                summary = await self._synthesizer.synthesize_search(query, [
+                    {"title": "Entertainment Results", "description": synthesis_input}
+                ])
+            else:
+                summary = synthesis_input
+        else:
+            summary = f"No entertainment results found for '{query}'."
+
+        return AgentResponse(
+            agent=self.name, success=True,
+            output=summary, data=combined,
+            correlation_id=request.correlation_id,
+        )
+
+    # ── Music ─────────────────────────────────────────────────────────────
+
+    async def _fetch_music(self, query: str, request: AgentRequest) -> AgentResponse:
+        """Fetch music data from YouTube Music via Bodega Music flow."""
+        raw = await self._intel.music_search(query)
+        if isinstance(raw, Exception):
+            raw = {}
+        if "error" in raw:
+            # Fall back to web search
+            web_raw = await self._intel.web_search(f"{query} music", count=5)
+            summary = self._format_web_results(web_raw, query)
+            return AgentResponse(
+                agent=self.name, success=True,
+                output=summary, data=web_raw,
+                correlation_id=request.correlation_id,
+            )
+
+        # Build a readable summary from YouTube Music results
+        parts: list[str] = []
+        for category, items in raw.items():
+            if not isinstance(items, list) or not items:
+                continue
+            parts.append(f"**{category.title()}**")
+            for item in items[:4]:
+                title = item.get("title") or item.get("name", "")
+                artist = ""
+                if isinstance(item.get("artists"), list) and item["artists"]:
+                    artist = item["artists"][0].get("name", "")
+                elif isinstance(item.get("artist"), str):
+                    artist = item["artist"]
+                album = item.get("album", {}).get("name", "") if isinstance(item.get("album"), dict) else ""
+                line = f"  - {title}"
+                if artist:
+                    line += f" · {artist}"
+                if album:
+                    line += f" · {album}"
+                parts.append(line)
+
+        if parts:
+            summary = "\n".join(parts)
+        else:
+            summary = f"No music results found for '{query}'."
+
+        return AgentResponse(
+            agent=self.name, success=True,
+            output=summary, data=raw,
             correlation_id=request.correlation_id,
         )
 
