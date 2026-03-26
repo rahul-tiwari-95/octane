@@ -98,11 +98,11 @@ class QueryStrategist:
             self._bodega.chat_simple(
                 prompt=prompt,
                 system=_STRATEGIST_SYSTEM_BASE,
-                tier=ModelTier.FAST,
+                tier=ModelTier.MID,
                 temperature=0.3,
                 max_tokens=2048,  # reasoning models burn 300-1000 tokens on <think>; need headroom
             ),
-            timeout=45.0,  # 90M reasoning model can take 20-30s on first inference
+            timeout=45.0,
         )
 
         # Extract content after </think> block — preserve reasoning as debug log

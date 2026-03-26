@@ -215,23 +215,18 @@ class CompareOrchestrator:
             dimension: ComparisonDimension,
         ) -> ComparisonCell:
             async with semaphore:
-                return await self._research_one_cell(query, item, dimension, session_id)
+                try:
+                    return await self._research_one_cell(query, item, dimension, session_id)
+                except Exception as exc:
+                    return ComparisonCell(item=item, dimension=dimension, error=str(exc))
 
-        tasks = [
-            _research_cell(item, dim)
+        # Fire all cells and yield results as they complete (not all at once).
+        pending = [
+            asyncio.ensure_future(_research_cell(item, dim))
             for item, dim in plan.task_matrix
         ]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-
-        for (item, dim), result in zip(plan.task_matrix, results):
-            if isinstance(result, Exception):
-                cell = ComparisonCell(
-                    item=item,
-                    dimension=dim,
-                    error=str(result),
-                )
-            else:
-                cell = result
+        for coro in asyncio.as_completed(pending):
+            cell: ComparisonCell = await coro
             cells.append(cell)
             yield {"type": "cell", "data": cell.to_dict()}
 
@@ -425,28 +420,43 @@ class CompareOrchestrator:
             matrix_text=matrix_text,
         )
 
+        import re
+        import sys
+        import time
         try:
-            report = await self._bodega.chat_simple(
-                user_prompt,
-                system=_COMPARE_SYNTHESIS_SYSTEM,
-                tier=ModelTier.REASON,
-                max_tokens=2500,
-                temperature=0.1,
+            _t0 = time.monotonic()
+            print("[octane] Synthesis: sending to bodega-raptor-8b (REASON tier)...", file=sys.stderr, flush=True)
+            report = await asyncio.wait_for(
+                self._bodega.chat_simple(
+                    user_prompt,
+                    system=_COMPARE_SYNTHESIS_SYSTEM,
+                    tier=ModelTier.REASON,
+                    max_tokens=2500,
+                    temperature=0.1,
+                ),
+                timeout=90.0,
             )
-            import re
+            print(f"[octane] Synthesis done in {time.monotonic() - _t0:.1f}s", file=sys.stderr, flush=True)
             report = re.sub(r"<think>.*?</think>", "", report, flags=re.DOTALL).strip()
             return report
+        except asyncio.TimeoutError:
+            print("[octane] Synthesis timed out after 90s — using matrix text fallback", file=sys.stderr, flush=True)
+            logger.warning("compare_synthesis_timeout")
+            return matrix_text
         except Exception as exc:
+            print(f"[octane] Synthesis error: {exc} — trying MID tier", file=sys.stderr, flush=True)
             logger.warning("compare_synthesis_reason_failed", error=str(exc))
             # Fallback: try MID tier (lightweight loaded model)
             try:
-                import re
-                report = await self._bodega.chat_simple(
-                    user_prompt,
-                    system=_COMPARE_SYNTHESIS_SYSTEM,
-                    tier=ModelTier.MID,
-                    max_tokens=2500,
-                    temperature=0.1,
+                report = await asyncio.wait_for(
+                    self._bodega.chat_simple(
+                        user_prompt,
+                        system=_COMPARE_SYNTHESIS_SYSTEM,
+                        tier=ModelTier.MID,
+                        max_tokens=2500,
+                        temperature=0.1,
+                    ),
+                    timeout=90.0,
                 )
                 return re.sub(r"<think>.*?</think>", "", report, flags=re.DOTALL).strip()
             except Exception as exc2:

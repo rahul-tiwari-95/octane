@@ -195,15 +195,15 @@ class TestDepthAnalyzer:
         result = await da.generate_followups("test", ["finding"])
         assert result[0]["api"] == "search"
 
-    def test_uses_fast_tier(self):
-        """DepthAnalyzer must use ModelTier.FAST to keep latency low."""
+    def test_uses_mid_tier(self):
+        """DepthAnalyzer must use ModelTier.MID for better follow-up quality."""
         import inspect
         from octane.agents.web.depth_analyzer import DepthAnalyzer
         from octane.tools.topology import ModelTier
 
         src = inspect.getsource(DepthAnalyzer._llm_followups)
-        assert "ModelTier.FAST" in src, (
-            "DepthAnalyzer must route to ModelTier.FAST (small model) for follow-up generation"
+        assert "ModelTier.MID" in src, (
+            "DepthAnalyzer must route to ModelTier.MID for follow-up generation"
         )
 
 

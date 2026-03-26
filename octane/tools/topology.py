@@ -41,6 +41,9 @@ class ModelTier(str, enum.Enum):
              summarization, structured data extraction.
     REASON — Large model (~8B params).  Deep reasoning.  Good for: full
              synthesis, evaluation, complex analysis.
+    CLASSIFY — Daemon-exclusive model (~4B params).  Reserved for internal
+             operations: query classification, routing, dimension planning,
+             judging, logging.  Never competes with user inference.
     EMBED  — Local embedding model (sentence-transformers).  Not routed
              through Bodega — handled in-process.
     """
@@ -48,6 +51,7 @@ class ModelTier(str, enum.Enum):
     FAST = "fast"
     MID = "mid"
     REASON = "reason"
+    CLASSIFY = "classify"
     EMBED = "embed"
 
 
@@ -220,6 +224,18 @@ TOPOLOGIES: dict[str, Topology] = {
                 tool_call_parser="qwen3",
                 # draft_model_path=None     ← speculative decoding OFF (no RAM budget)
             ),
+            # CLASSIFY — daemon-exclusive.  On compact, vertex-4b shares the
+            # tight memory budget but max_concurrency=1 keeps pressure minimal.
+            ModelTier.CLASSIFY: ModelConfig(
+                model_id="bodega-vertex-4b",
+                model_path="srswti/bodega-vertex-4b",
+                model_type="lm",
+                context_length=8192,
+                max_concurrency=1,
+                prompt_cache_size=5,
+                reasoning_parser="qwen3",
+                tool_call_parser="qwen3",
+            ),
         },
     ),
     # ── balanced (default) ────────────────────────────────────────────────────
@@ -262,13 +278,23 @@ TOPOLOGIES: dict[str, Topology] = {
                 draft_model_path=_DRAFT_MODEL,  # ← speculative decoding ON
                 num_draft_tokens=3,
             ),
+            ModelTier.CLASSIFY: ModelConfig(
+                model_id="bodega-vertex-4b",
+                model_path="srswti/bodega-vertex-4b",
+                model_type="lm",
+                context_length=16384,
+                max_concurrency=2,          # ← balanced: 2 parallel classify ops
+                prompt_cache_size=10,
+                reasoning_parser="qwen3",
+                tool_call_parser="qwen3",
+            ),
         },
     ),
     # ── power ─────────────────────────────────────────────────────────────────
     # M2/M3/M4/M5 Max/Ultra 32 GB+.  (64 GB M1 Max included)
-    # Strategy: two fully distinct models — small for speed, large for depth.
+    # Strategy: two models — 90m for burst routing, 8b for ALL reasoning.
     #
-    #   FAST   — bodega-raptor-90m  (lm, ~1 GB)
+    #   FAST   — bodega-raptor-90m  (lm, ~670 MB)
     #            max_concurrency=8, CB EXTREME:
     #              cb_max_num_seqs=512, cb_prefill_batch_size=32,
     #              cb_completion_batch_size=64
@@ -276,19 +302,17 @@ TOPOLOGIES: dict[str, Topology] = {
     #            Each wave of parallel agent calls (web, pnl, memory, etc.) hits
     #            the 90m simultaneously — CB batches them into one GPU pass.
     #
-    #   MID    — bodega-vertex-4b  (lm) — when loaded gives richer summaries.
-    #            Falls back to 90m automatically if vertex-4b not loaded.
+    #   MID    — bodega-raptor-8b  (lm, ~5 GB mxfp4) — chunk summarisation,
+    #            structured extraction, richer mid-depth reasoning.
+    #            Speculative decoding ON (Qwen3-0.6B draft, same tokenizer).
     #
-    #   REASON — axe-stealth-37b  (multimodal, ~38 GB)
-    #            max_concurrency=4, CB tuned for 64 GB headroom:
-    #              cb_max_num_seqs=256, cb_prefill_batch_size=16,
-    #              cb_completion_batch_size=32
-    #            → batches the evaluator synthesis + any concurrent research
-    #              or portfolio analysis calls into the same GPU pass.
-    #            All final-answer generation (evaluator, portfolio analyze,
-    #            deep research synthesis) routes here.
-    #            NO speculative decoding — axe-stealth uses a different
-    #            tokenizer family from the Qwen3-0.6B draft model.
+    #   REASON — bodega-raptor-8b  (lm, ~5 GB mxfp4) — final synthesis,
+    #            comparison reports, memory notes, deep analysis.
+    #            Same model as MID — both route to one resident 8b instance.
+    #            CB handles concurrent MID+REASON calls automatically.
+    #            Speculative decoding + CB = fast single-user AND multi-agent.
+    #            From sweep data: (concurrency=32, prefill_batch=16) yields
+    #            best mixed-query throughput at ~600 tok/s system.
     "power": Topology(
         name="power",
         models={
@@ -307,34 +331,54 @@ TOPOLOGIES: dict[str, Topology] = {
                 cb_completion_batch_size=64, # saturate GPU for tiny model
             ),
             ModelTier.MID: ModelConfig(
-                model_id="bodega-vertex-4b",
-                model_path="SRSWTI/bodega-vertex-4b",
+                model_id="bodega-raptor-8b",
+                model_path="srswti/bodega-raptor-8b-mxfp4",
                 model_type="lm",
                 context_length=32768,
-                max_concurrency=4,
+                max_concurrency=6,
                 prompt_cache_size=25,
                 reasoning_parser="qwen3",
                 tool_call_parser="qwen3",
+                draft_model_path=_DRAFT_MODEL,
+                num_draft_tokens=3,
+                continuous_batching=True,
+                cb_max_num_seqs=256,
+                cb_prefill_batch_size=16,
+                cb_completion_batch_size=32, # sweep: (32,16) best mixed throughput
+            ),
+            ModelTier.REASON: ModelConfig(
+                model_id="bodega-raptor-8b",
+                model_path="srswti/bodega-raptor-8b-mxfp4",
+                model_type="lm",
+                context_length=32768,
+                max_concurrency=6,          # same instance as MID — CB shares slots
+                prompt_cache_size=25,
+                reasoning_parser="qwen3",
+                tool_call_parser="qwen3",
+                draft_model_path=_DRAFT_MODEL,  # speculative decoding ON
+                num_draft_tokens=5,             # power: more aggresive speculation (32GB+ headroom)
                 continuous_batching=True,
                 cb_max_num_seqs=256,
                 cb_prefill_batch_size=16,
                 cb_completion_batch_size=32,
             ),
-            ModelTier.REASON: ModelConfig(
-                model_id="axe-stealth-37b",
-                model_path="srswti/axe-stealth-37b",
-                model_type="multimodal",    # Bodega registers 37b as multimodal
-                context_length=32768,
-                max_concurrency=4,          # ← 4 concurrent synthesis requests
-                prompt_cache_size=25,
+            # CLASSIFY — daemon-exclusive control plane.  On power topology,
+            # vertex-4b handles all classification/routing/judging with 4
+            # parallel slots and continuous batching.  At ~2.5 GB it's
+            # negligible on 32 GB+ machines.
+            ModelTier.CLASSIFY: ModelConfig(
+                model_id="bodega-vertex-4b",
+                model_path="srswti/bodega-vertex-4b",
+                model_type="lm",
+                context_length=16384,
+                max_concurrency=4,          # ← 4 parallel classify/route/judge
+                prompt_cache_size=20,
                 reasoning_parser="qwen3",
                 tool_call_parser="qwen3",
-                # No speculative decoding — axe-stealth-37b uses a different
-                # tokenizer family from the Qwen3-0.6B draft model.
                 continuous_batching=True,
-                cb_max_num_seqs=256,        # 64 GB has headroom for larger queue
-                cb_prefill_batch_size=16,
-                cb_completion_batch_size=32, # 32 concurrent token steps on 37B
+                cb_max_num_seqs=128,
+                cb_prefill_batch_size=8,
+                cb_completion_batch_size=16,
             ),
         },
     ),

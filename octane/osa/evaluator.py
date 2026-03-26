@@ -3,6 +3,9 @@
 Session 2: LLM-powered synthesis using Bodega Inference.
 Falls back to simple concatenation if Bodega is unavailable.
 
+Session 29: Adaptive output length — short answers for quick questions,
+thorough responses for deep/compare/investigate queries.
+
 Phase 3+: Quality scoring, confidence gates, re-execution triggers.
 """
 
@@ -36,11 +39,79 @@ Rules:
 - If the data contains a date that is not today, note that it may be outdated."""
 
 
-def _build_system_prompt(user_profile: dict | None) -> str:
+# ── Adaptive output length ────────────────────────────────────────────────────
+
+_COMPARE_SIGNALS = re.compile(
+    r"\b(compare|vs\.?|versus|difference|between .+ and|head.to.head|benchmark)\b",
+    re.IGNORECASE,
+)
+_DEEP_SIGNALS = re.compile(
+    r"\b(explain|analyze|investigate|deep dive|in.depth|thorough|detailed|comprehensive|breakdown)\b",
+    re.IGNORECASE,
+)
+_BRIEF_SIGNALS = re.compile(
+    r"\b(price|stock price|what is|who is|when did|how much|quick|briefly|tldr|tl;dr)\b",
+    re.IGNORECASE,
+)
+
+
+def _estimate_output_tokens(query: str, num_results: int, is_deep: bool = False) -> int:
+    """Estimate appropriate max_tokens for the evaluator based on query and context.
+
+    Returns a token budget between 600 and 4000.
+    """
+    if is_deep:
+        return 4000
+
+    if _COMPARE_SIGNALS.search(query):
+        return 3000
+
+    if _DEEP_SIGNALS.search(query):
+        return 2500
+
+    if _BRIEF_SIGNALS.search(query) and num_results <= 1:
+        return 600
+
+    # Scale with number of agent results — more data = more synthesis needed
+    base = 1200
+    per_result = 300
+    return min(base + per_result * num_results, 3000)
+
+
+def _length_hint(query: str, is_deep: bool = False) -> str:
+    """Return a length instruction to append to the system prompt."""
+    if is_deep or _COMPARE_SIGNALS.search(query):
+        return (
+            "\nOutput length: Be thorough. Use structured sections, bullet points, "
+            "and supporting detail. The user expects a comprehensive answer."
+        )
+    if _DEEP_SIGNALS.search(query):
+        return (
+            "\nOutput length: Provide a detailed answer with context and reasoning. "
+            "Use paragraphs or bullets as appropriate."
+        )
+    if _BRIEF_SIGNALS.search(query):
+        return (
+            "\nOutput length: Be concise and direct. A few sentences is ideal. "
+            "Skip preamble — get to the answer immediately."
+        )
+    return ""
+
+
+def _build_system_prompt(
+    user_profile: dict | None,
+    query: str = "",
+    is_deep: bool = False,
+) -> str:
     """Build a personalized system prompt from the user's preference profile."""
     # Always ground the LLM in the current wall-clock date so it can flag
     # stale data (e.g. a stock price from 4 months ago) accurately.
     lines = [_EVALUATOR_SYSTEM_BASE, f"\nToday's date: {today_human()}."]
+
+    # Adaptive length hint based on query complexity
+    hint = _length_hint(query, is_deep=is_deep)
+    if hint:
+        lines.append(hint)
 
     if user_profile:
         verbosity = user_profile.get("verbosity", "concise")
@@ -92,6 +163,7 @@ class Evaluator:
         prior_context: str | None = None,
         user_profile: dict | None = None,
         conversation_history: list[dict[str, str]] | None = None,
+        is_deep: bool = False,
     ) -> str:
         """Assemble agent results into a final output.
 
@@ -127,6 +199,7 @@ class Evaluator:
                 return await self._synthesize_with_llm(
                     original_query, output_parts, failed, prior_context, user_profile,
                     conversation_history=conversation_history,
+                    is_deep=is_deep,
                 )
             except Exception as exc:
                 logger.warning("llm_synthesis_failed", error=str(exc), fallback="concatenation")
@@ -144,9 +217,11 @@ class Evaluator:
         prior_context: str | None = None,
         user_profile: dict | None = None,
         conversation_history: list[dict[str, str]] | None = None,
+        is_deep: bool = False,
     ) -> str:
         """Use Bodega to synthesize agent results into a cohesive response."""
-        system = _build_system_prompt(user_profile)
+        system = _build_system_prompt(user_profile, query=query, is_deep=is_deep)
+        max_tokens = _estimate_output_tokens(query, len(output_parts), is_deep=is_deep)
         context_lines = []
 
         # Inject rolling conversation history for multi-turn continuity
@@ -182,9 +257,9 @@ class Evaluator:
                         system=system,
                         tier=tier,
                         temperature=0.3,
-                        max_tokens=1500,
+                        max_tokens=max_tokens,
                     ),
-                    timeout=30.0,
+                    timeout=60.0,
                 )
                 # Strip <think> blocks (complete or truncated)
                 clean = re.sub(r"<think>.*?</think>", "", response, flags=re.DOTALL)
@@ -218,6 +293,7 @@ class Evaluator:
         prior_context: str | None = None,
         user_profile: dict | None = None,
         conversation_history: list[dict[str, str]] | None = None,
+        is_deep: bool = False,
     ) -> AsyncIterator[str]:
         """Like evaluate(), but yields text chunks as they stream from Bodega.
 
@@ -253,7 +329,8 @@ class Evaluator:
             return
 
         # Build prompt — inject conversation history + prior memory context
-        system = _build_system_prompt(user_profile)
+        system = _build_system_prompt(user_profile, query=original_query, is_deep=is_deep)
+        max_tokens = _estimate_output_tokens(original_query, len(output_parts), is_deep=is_deep)
         context_lines = []
 
         if conversation_history:
@@ -288,7 +365,7 @@ class Evaluator:
                     system=system,
                     tier=tier,
                     temperature=0.3,
-                    max_tokens=1500,  # enough for reasoning + response
+                    max_tokens=max_tokens,
                 ):
                     streamed_any = True
                     raw_buffer += chunk
@@ -343,6 +420,7 @@ class Evaluator:
                 prior_context=prior_context,
                 user_profile=user_profile,
                 conversation_history=conversation_history,
+                is_deep=is_deep,
             )
         except Exception as eval_exc:
             logger.warning(

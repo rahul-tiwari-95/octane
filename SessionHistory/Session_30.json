@@ -1,0 +1,218 @@
+{
+  "session": 30,
+  "title": "Extraction Pipeline — YouTube, arXiv, PDF, EPUB Content Extraction + CLI",
+  "date": "2026-03-25",
+  "status": "complete",
+  "test_results": {
+    "passed": 952,
+    "skipped": 32,
+    "failed": 1,
+    "failed_reason": "test_daemon_status_when_not_running — env-dependent, daemon IS running (PID 82245). Not a regression.",
+    "warnings": 12,
+    "delta_from_session_29": "+82 new extractor tests (from Session 29B baseline of 661 → Session 29 total of 870)"
+  },
+
+  "context_reference": "context/OCTANE_YOUTUBE_PDF_ARXIV_EXTRACTION_PIPLEINE.md",
+
+  "dependencies_installed": [
+    "scrapetube==2.6.0",
+    "youtube-transcript-api>=1.2.4",
+    "yt-dlp==2026.3.17",
+    "pymupdf4llm==1.27.2.2",
+    "pymupdf==1.27.2.2",
+    "arxiv==2.4.1",
+    "ebooklib==0.20",
+    "beautifulsoup4",
+    "langchain-text-splitters==1.1.1",
+    "langchain-core==1.2.22"
+  ],
+
+  "optional_not_installed": [
+    "mlx-whisper (Tier 3 YouTube transcription — local whisper)",
+    "docling (Tier 2 PDF extraction — scanned PDFs with OCR)"
+  ],
+
+  "parts": {
+    "A": {
+      "title": "octane/extractors/ Module — Core Models and Data Structures",
+      "status": "complete",
+      "files_created": [
+        "octane/extractors/__init__.py",
+        "octane/extractors/models.py"
+      ],
+      "description": "SourceType enum (YOUTUBE/ARXIV/PDF/EPUB/WEB), TaskState enum (8 states), ChunkMetadata dataclass (page/chapter/section/timestamps/is_junk), TextChunk dataclass (text + metadata + reliability + auto word/char counts), ExtractedDocument dataclass (full document with source_type, raw_text, chunks, content_hash via SHA-256, reliability_score auto-populated from SOURCE_RELIABILITY table).",
+      "trust_scoring": {
+        "SOURCE_RELIABILITY": {
+          "arxiv": 0.92,
+          "pdf": 0.75,
+          "epub": 0.70,
+          "youtube": 0.55,
+          "web": 0.40
+        },
+        "RELIABILITY_MODIFIERS": {
+          "peer_reviewed": "+0.10",
+          "high_citation": "+0.08",
+          "verified_channel": "+0.05",
+          "long_form_lecture": "+0.04",
+          "auto_generated_captions": "-0.05",
+          "scanned_ocr": "-0.08",
+          "music_content": "-0.20",
+          "short_form": "-0.10"
+        }
+      }
+    },
+
+    "B": {
+      "title": "YouTube Extraction — Search, Transcript, Classifier",
+      "status": "complete",
+      "files_created": [
+        "octane/extractors/youtube/__init__.py",
+        "octane/extractors/youtube/search.py",
+        "octane/extractors/youtube/transcript.py",
+        "octane/extractors/youtube/classifier.py"
+      ],
+      "description": "YouTube search via scrapetube (primary) with yt-dlp fallback. 3-tier transcript extraction: Tier 1 youtube-transcript-api v1.2+ instance API, Tier 2 yt-dlp subtitle extraction with VTT parsing and deduplication, Tier 3 placeholder for mlx-whisper. Music-vs-spoken classifier using title/channel patterns, category hints, and duration heuristics.",
+      "live_test_result": {
+        "video": "https://www.youtube.com/watch?v=XfpMkf4rD6E",
+        "title": "Stanford CS25: V2 I Introduction to Transformers w/ Andrej Karpathy",
+        "words": 12771,
+        "chunks": 93,
+        "reliability": 0.55,
+        "method": "youtube-transcript-api"
+      }
+    },
+
+    "C": {
+      "title": "arXiv Extraction — Search and PDF Download",
+      "status": "complete",
+      "files_created": [
+        "octane/extractors/academic/__init__.py",
+        "octane/extractors/academic/arxiv_search.py"
+      ],
+      "description": "arXiv search via arxiv Python package. PDF download with caching to ~/.octane/cache/papers/. Sanitized filenames, duplicate-safe caching by arxiv_id + version.",
+      "live_test_result": {
+        "arxiv_id": "1706.03762",
+        "title": "Attention Is All You Need",
+        "authors": "Ashish Vaswani, Noam Shazeer, Niki Parmar, Jakob Uszkoreit, Llion Jones, Aidan N. Gomez, Lukasz Kaiser, Illia Polosukhin",
+        "words": 6186,
+        "chunks": 29,
+        "reliability": 0.92,
+        "method": "pymupdf4llm",
+        "cached_path": "~/.octane/cache/papers/1706.03762v7.Attention_Is_All_You_Need.pdf"
+      }
+    },
+
+    "D": {
+      "title": "PDF + EPUB Extraction",
+      "status": "complete",
+      "files_created": [
+        "octane/extractors/pdf/__init__.py",
+        "octane/extractors/pdf/extractor.py",
+        "octane/extractors/epub/__init__.py",
+        "octane/extractors/epub/extractor.py"
+      ],
+      "description": "PDF extraction using pymupdf4llm (Tier 1) with auto-routing: if chars/page < 50, routes to docling for scanned PDFs (Tier 2, optional). EPUB extraction using ebooklib + BeautifulSoup4 with chapter structure preservation. Quality param: fast (pymupdf only), deep (docling), auto (auto-detect).",
+      "live_test_result": {
+        "pdf_file": "~/.octane/cache/papers/1706.03762v7.Attention_Is_All_You_Need.pdf",
+        "words": 6186,
+        "chunks": 29,
+        "method": "pymupdf4llm",
+        "reliability": 0.75
+      }
+    },
+
+    "E": {
+      "title": "Chunking Module — Source-Aware Strategies",
+      "status": "complete",
+      "files_created": [
+        "octane/extractors/chunker.py"
+      ],
+      "description": "Three chunking strategies: (1) chunk_text for PDF/arXiv using RecursiveCharacterTextSplitter with 2048 char chunks (~512 tokens), 200 char overlap, section-aware separators. (2) chunk_transcript_by_time for YouTube with 45-second windows. (3) chunk_epub_chapters with chapter-first then recursive split for large chapters.",
+      "chunk_config": {
+        "char_size": 2048,
+        "char_overlap": 200,
+        "approx_tokens": 512,
+        "youtube_window_seconds": 45
+      }
+    },
+
+    "F": {
+      "title": "Unified Pipeline + CLI",
+      "status": "complete",
+      "files_created": [
+        "octane/extractors/pipeline.py",
+        "octane/cli/extract.py"
+      ],
+      "files_modified": [
+        "octane/cli/__init__.py"
+      ],
+      "description": "pipeline.py: async extract() entry point with detect_source_type() using regex for YouTube URLs, arXiv URLs/IDs, file extensions. Dispatches to _extract_youtube(), _extract_arxiv(), _extract_pdf(), _extract_epub() with run_in_executor for sync I/O. CLI: octane extract run <source>, octane extract search-youtube <query>, octane extract search-arxiv <query>. Options: --quality, --type, --chunks.",
+      "cli_commands": {
+        "octane extract run <source>": "Extract content from YouTube URL, arXiv ID, PDF path, or EPUB path",
+        "octane extract search-youtube <query>": "Search YouTube and display results table",
+        "octane extract search-arxiv <query>": "Search arXiv and display results table"
+      }
+    },
+
+    "G": {
+      "title": "Bug Fix — ExtractedDocument reliability_score sentinel",
+      "status": "complete",
+      "files_modified": [
+        "octane/extractors/models.py"
+      ],
+      "description": "Fixed reliability_score default from 0.5 to -1.0 sentinel. The __post_init__ used 'not self.reliability_score' which treated explicit 0.0 (no-transcript case) as falsy and overwrote it with SOURCE_RELIABILITY base score. Changed to 'self.reliability_score < 0' check."
+    },
+
+    "H": {
+      "title": "Comprehensive Unit Tests — 82 Tests",
+      "status": "complete",
+      "files_created": [
+        "tests/unit/test_session30_extractors.py"
+      ],
+      "test_coverage": {
+        "TestSourceType": "Enum values, from-string, invalid raises",
+        "TestTaskState": "All 9 states exist",
+        "TestSourceReliability": "All types scored, arXiv highest, web lowest, range 0-1",
+        "TestReliabilityModifiers": "peer_reviewed positive, music negative, all bounded",
+        "TestChunkMetadata": "Defaults, custom values",
+        "TestTextChunk": "Auto word/char counts, explicit counts preserved, empty text",
+        "TestExtractedDocument": "Content hash auto, empty text no hash, reliability from type, total_words, total_chunks, to_dict",
+        "TestDetectSourceType": "4 YouTube URL formats, 5 arXiv patterns, PDF/EPUB/web fallback, whitespace stripping",
+        "TestClassifier": "Music video, lecture, tutorial, podcast, remix, empty metadata, category hints, duration",
+        "TestParseDuration": "Seconds, MM:SS, HH:MM:SS, empty, None",
+        "TestVTTParsing": "Basic 3-segment parse, deduplication, HTML tag stripping, position tag stripping, time conversion",
+        "TestTranscriptToText": "Join, whitespace strip, skip empty",
+        "TestChunkText": "Short single chunk, long splits, reliability applied, arXiv separators",
+        "TestChunkTranscriptByTime": "Basic ~45s chunking, empty, single segment, sequential indices, reliability",
+        "TestChunkEpubChapters": "Small chapters, large chapter split, empty skipped, reliability, cross-chapter indices",
+        "TestPipelineExtractMocked": "YouTube mocked, YouTube no-transcript, PDF mocked, unsupported type error",
+        "TestE2EExtraction": "Live YouTube, live arXiv, live YouTube search, live arXiv search"
+      }
+    }
+  },
+
+  "new_files_count": 16,
+  "total_new_tests": 82,
+  "all_files_created": [
+    "octane/extractors/__init__.py",
+    "octane/extractors/models.py",
+    "octane/extractors/youtube/__init__.py",
+    "octane/extractors/youtube/search.py",
+    "octane/extractors/youtube/transcript.py",
+    "octane/extractors/youtube/classifier.py",
+    "octane/extractors/academic/__init__.py",
+    "octane/extractors/academic/arxiv_search.py",
+    "octane/extractors/pdf/__init__.py",
+    "octane/extractors/pdf/extractor.py",
+    "octane/extractors/epub/__init__.py",
+    "octane/extractors/epub/extractor.py",
+    "octane/extractors/chunker.py",
+    "octane/extractors/pipeline.py",
+    "octane/cli/extract.py",
+    "tests/unit/test_session30_extractors.py"
+  ],
+  "files_modified": [
+    "octane/cli/__init__.py",
+    "octane/extractors/models.py"
+  ]
+}

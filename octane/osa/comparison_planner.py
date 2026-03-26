@@ -36,8 +36,11 @@ Output schema:
 
 from __future__ import annotations
 
+import asyncio
 import json
 import re
+import sys
+import time
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -250,16 +253,27 @@ class ComparisonPlanner:
             return self._keyword_fallback(query)
 
         try:
-            raw = await self._bodega.chat_simple(
-                f"Comparison query: {query}",
-                system=_COMPARISON_PLANNER_SYSTEM,
-                tier=ModelTier.REASON,
-                max_tokens=1200,
-                temperature=0.0,
+            _t0 = time.monotonic()
+            print("[octane] Planning: sending to bodega-raptor-8b (MID tier)...", file=sys.stderr, flush=True)
+            raw = await asyncio.wait_for(
+                self._bodega.chat_simple(
+                    f"Comparison query: {query}",
+                    system=_COMPARISON_PLANNER_SYSTEM,
+                    tier=ModelTier.MID,
+                    max_tokens=800,
+                    temperature=0.0,
+                ),
+                timeout=45.0,
             )
+            print(f"[octane] Planning done in {time.monotonic() - _t0:.1f}s", file=sys.stderr, flush=True)
             return self._parse_response(query, raw)
 
+        except asyncio.TimeoutError:
+            print("[octane] Planning timed out after 45s — using keyword fallback", file=sys.stderr, flush=True)
+            logger.warning("comparison_planner_timeout", query=query[:60])
+            return self._keyword_fallback(query)
         except Exception as exc:
+            print(f"[octane] Planning failed: {exc}", file=sys.stderr, flush=True)
             logger.warning("comparison_planner_llm_failed", error=str(exc))
             return self._keyword_fallback(query)
 

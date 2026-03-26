@@ -71,7 +71,7 @@ class BodegaRouter:
         self,
         topology: str | Topology = "auto",
         base_url: str | None = None,
-        timeout: float = 120.0,
+        timeout: float = 600.0,
     ) -> None:
         self._client = BodegaInferenceClient(base_url=base_url, timeout=timeout)
         self._topology: Topology = (
@@ -233,14 +233,13 @@ class BodegaRouter:
           2. Path match     — topology model_path.lower() == loaded ID.lower()
                              handles Bodega registering models by full HF path
           3. Tier-aware fallback:
-               REASON  → prefer multimodal first (the large 37B), then lm
-               FAST/MID → prefer lm first (the small 90M), then multimodal
-          4. Auto-load — load the topology model from Bodega admin API,
-             then retry resolution (step 1+2).
-
-        This means: with [90M lm, axe-stealth-37b multimodal] loaded,
-          - FAST, MID  → 90M   ✓
-          - REASON     → axe-stealth-37b  ✓   (not 90M as before)
+               ALL tiers  → prefer lm over multimodal (multimodal CB not yet
+                            supported by Bodega; avoids routing to vision models
+                            for text-only synthesis).
+          4. Auto-load — load the topology model from Bodega admin API if a
+             type-based fallback was not found.  Skipped for REASON when any
+             lm model is already available (prevents downloading a large model
+             when a capable lm is ready).
         """
         loaded = await self._fetch_loaded_models()
 
@@ -273,10 +272,11 @@ class BodegaRouter:
                 return loaded_id
 
         # 3. Tier-aware fallback (no exact or path match)
+        # All tiers prefer lm over multimodal — Bodega continuous batching for
+        # multimodal is not yet supported, and lm models handle text synthesis
+        # (the primary use-case for REASON) equally well.
         if tier == ModelTier.REASON:
-            # Final-answer synthesis: prefer the largest available model.
-            # multimodal usually means the big 37B; lm is the small 90M.
-            for model_type_pref in ("multimodal", "lm"):
+            for model_type_pref in ("lm", "multimodal"):
                 for loaded_id, model_type in loaded.items():
                     if model_type == model_type_pref:
                         logger.info(
@@ -289,6 +289,27 @@ class BodegaRouter:
                         return loaded_id
         else:
             # FAST / MID: prefer speed — lm (90M) first, then multimodal.
+            #
+            # Exception: for MID, if the topology-configured model is distinct
+            # from what's loaded (e.g. 8b configured but only 90m loaded), try
+            # auto-loading it before falling back to the 90m.  FAST always falls
+            # back immediately because its topology model IS the 90m.
+            if tier == ModelTier.MID and auto_load:
+                loaded_ok = await self._auto_load_tier(tier)
+                if loaded_ok:
+                    loaded = await self._fetch_loaded_models()
+                    if preferred_id in loaded:
+                        return preferred_id
+                    for loaded_id in loaded:
+                        if loaded_id.lower() == preferred_path_lower:
+                            return loaded_id
+                # auto-load failed or model still not found — fall through to
+                # type-based fallback so the query still completes
+                logger.warning(
+                    "bodega_mid_autoload_failed_falling_back",
+                    preferred=preferred_id,
+                )
+
             for model_type_pref in ("lm", "multimodal"):
                 for loaded_id, model_type in loaded.items():
                     if model_type == model_type_pref:
@@ -301,8 +322,12 @@ class BodegaRouter:
                         )
                         return loaded_id
 
-        # 4. Auto-load: model not found among currently loaded; try to load it
-        if auto_load:
+        # 4. Auto-load: model not found and no type-based fallback found.
+        #    Skip auto-load for REASON if ANY lm model is loaded — we never want
+        #    to trigger a large model download when a capable lm is available.
+        if tier == ModelTier.REASON and any(t == "lm" for t in loaded.values()):
+            return None
+        if auto_load and tier != ModelTier.MID:
             loaded_ok = await self._auto_load_tier(tier)
             if loaded_ok:
                 # Retry steps 1 & 2 with fresh model list

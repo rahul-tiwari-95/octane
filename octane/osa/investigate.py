@@ -216,21 +216,21 @@ class InvestigateOrchestrator:
 
         async def _research_dimension(dim: ResearchDimension) -> DimensionFinding:
             async with semaphore:
-                return await self._research_one(query, dim, session_id)
+                try:
+                    return await self._research_one(query, dim, session_id)
+                except Exception as exc:
+                    return DimensionFinding(
+                        dimension=dim,
+                        error=str(exc),
+                        agent_used="error",
+                    )
 
-        tasks = [_research_dimension(dim) for dim in plan.sorted_dimensions]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-
-        for dim, result in zip(plan.sorted_dimensions, results):
-            if isinstance(result, Exception):
-                finding = DimensionFinding(
-                    dimension=dim,
-                    error=str(result),
-                    agent_used="error",
-                )
-            else:
-                finding = result
-
+        pending = [
+            asyncio.ensure_future(_research_dimension(dim))
+            for dim in plan.sorted_dimensions
+        ]
+        for coro in asyncio.as_completed(pending):
+            finding: DimensionFinding = await coro
             findings.append(finding)
             yield {"type": "finding", "data": finding.to_dict()}
 

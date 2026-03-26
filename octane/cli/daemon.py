@@ -51,7 +51,6 @@ async def _daemon_start_foreground(topology: str):
         await lifecycle.run()
     except KeyboardInterrupt:
         console.print("\n[dim]Daemon stopped.[/]")
-        console.print("[dim]Daemon stopped - [/]")
 
 
 async def _daemon_start_background(topology: str):
@@ -393,5 +392,120 @@ async def _daemon_resume(task_id: str):
             console.print(f"[green]✅ Request {task_id[:16]}… resumed.[/]")
         else:
             console.print(f"[red]Error: {resp.get('error', 'unknown')}[/]")
+    finally:
+        await client.close()
+
+
+@daemon_app.command("models")
+def daemon_models():
+    """📦 Show loaded models, concurrency slots, and pressure status."""
+    asyncio.run(_daemon_models())
+
+
+async def _daemon_models():
+    from octane.daemon.client import DaemonClient, is_daemon_running
+
+    if not is_daemon_running():
+        console.print("[dim]Daemon is not running.[/]")
+        console.print("[dim]Start with: octane daemon start[/]")
+        return
+
+    client = DaemonClient()
+    if not await client.connect():
+        console.print("[red]Cannot connect to daemon.[/]")
+        return
+
+    try:
+        resp = await client.request("models", {})
+        if resp.get("status") != "ok":
+            console.print(f"[red]Error: {resp.get('error', 'unknown')}[/]")
+            return
+
+        data = resp.get("data", {})
+        models = data.get("models", {})
+        pressure = data.get("pressure", {})
+        classify_model = data.get("classify_model")
+
+        tbl = Table(show_header=True, box=None, padding=(0, 2))
+        tbl.add_column("Model", style="cyan", no_wrap=True)
+        tbl.add_column("Slots", style="white", justify="center")
+        tbl.add_column("Active", style="yellow", justify="center")
+        tbl.add_column("Waiting", style="white", justify="center")
+        tbl.add_column("Served", style="dim", justify="right")
+        tbl.add_column("Avg Wait", style="dim", justify="right")
+        tbl.add_column("Pressure", style="white")
+        tbl.add_column("Role", style="dim")
+
+        _PRESSURE_STYLE = {
+            "idle": "[dim]idle[/]",
+            "nominal": "[green]nominal[/]",
+            "busy": "[yellow]busy[/]",
+            "full": "[red]full[/]",
+            "saturated": "[bold red]SATURATED[/]",
+        }
+
+        for mid, info in models.items():
+            p_label = pressure.get(mid, "?")
+            role = "🧠 CLASSIFY" if mid == classify_model else ""
+            tbl.add_row(
+                mid,
+                str(info.get("max_concurrency", "?")),
+                str(info.get("active", 0)),
+                str(info.get("waiting", 0)),
+                str(info.get("total_served", 0)),
+                f"{info.get('avg_wait_ms', 0):.0f}ms",
+                _PRESSURE_STYLE.get(p_label, p_label),
+                role,
+            )
+
+        if not models:
+            console.print("[dim]No models registered in proxy.[/]")
+            return
+
+        console.print(Panel(tbl, title="[bold cyan]📦 Inference Proxy — Models[/]", border_style="cyan"))
+    finally:
+        await client.close()
+
+
+@daemon_app.command("pressure")
+def daemon_pressure():
+    """🌡  Show per-model pressure — idle / nominal / busy / saturated."""
+    asyncio.run(_daemon_pressure())
+
+
+async def _daemon_pressure():
+    from octane.daemon.client import DaemonClient, is_daemon_running
+
+    if not is_daemon_running():
+        console.print("[dim]Daemon is not running.[/]")
+        return
+
+    client = DaemonClient()
+    if not await client.connect():
+        console.print("[red]Cannot connect to daemon.[/]")
+        return
+
+    try:
+        resp = await client.request("pressure", {})
+        if resp.get("status") != "ok":
+            console.print(f"[red]Error: {resp.get('error', 'unknown')}[/]")
+            return
+
+        data = resp.get("data", {})
+        if not data:
+            console.print("[dim]No models registered.[/]")
+            return
+
+        _EMOJIS = {
+            "idle": "💤",
+            "nominal": "✅",
+            "busy": "⚡",
+            "full": "🔴",
+            "saturated": "🔥",
+        }
+
+        for mid, label in data.items():
+            emoji = _EMOJIS.get(label, "❓")
+            console.print(f"  {emoji}  [cyan]{mid}[/]  →  {label}")
     finally:
         await client.close()

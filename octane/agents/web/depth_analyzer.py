@@ -14,8 +14,8 @@ Example:
         - "Iran leadership succession vacuum [month_year]"
         - "Iran retaliation threat after Israel strike [month_year]"
 
-Uses ModelTier.FAST (90M) for the follow-up generation — lightweight,
-fast, keeps overall latency low while multiplying search breadth.
+Uses ModelTier.MID (8B) for the follow-up generation — better reasoning
+for identifying gaps and angles while keeping latency acceptable.
 """
 
 from __future__ import annotations
@@ -131,7 +131,7 @@ class DepthAnalyzer:
             self._bodega.chat_simple(
                 prompt=prompt,
                 system=_DEPTH_SYSTEM,
-                tier=ModelTier.FAST,
+                tier=ModelTier.MID,
                 temperature=0.4,
                 max_tokens=2048,  # headroom for <think> + JSON output
             ),

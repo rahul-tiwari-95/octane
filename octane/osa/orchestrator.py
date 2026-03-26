@@ -369,6 +369,7 @@ class Orchestrator:
             prior_context=prior_context,
             user_profile=user_profile,
             conversation_history=conversation_history,
+            is_deep=False,
         )
 
         self.synapse.emit(SynapseEvent(
@@ -611,6 +612,7 @@ class Orchestrator:
             prior_context=prior_context,
             user_profile=user_profile,
             conversation_history=conversation_history,
+            is_deep=is_deep,
         )
         try:
             while True:
@@ -777,6 +779,7 @@ class Orchestrator:
             prior_context=prior_context,
             user_profile=user_profile,
             conversation_history=conversation_history,
+            is_deep=False,
         )
         try:
             while True:

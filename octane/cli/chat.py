@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 
 import typer
 from rich.panel import Panel
@@ -12,6 +13,7 @@ from octane.cli._shared import console, _get_synapse
 
 _CHAT_HELP = """[bold]Slash commands:[/]
   [cyan]/help[/]          — show this message
+  [cyan]/deep[/]          — toggle deep mode (multi-round search + expanded output)
   [cyan]/trace [id][/]    — show Synapse trace for last response (or a specific id)
   [cyan]/history[/]       — print current conversation history
   [cyan]/clear[/]         — clear conversation history and start fresh
@@ -25,26 +27,34 @@ def register(app: typer.Typer) -> None:
     app.command()(session)
 
 
-def chat():
+def chat(
+    verbose: bool = typer.Option(False, "--verbose", "-v", help="Enable debug logging"),
+):
     """💬 Interactive multi-turn chat session with Octane."""
+    if verbose:
+        from octane.utils import setup_logging
+        setup_logging(level_override="debug")
     asyncio.run(_chat())
 
 
 async def _chat():
     from octane.osa.orchestrator import Orchestrator
+    from octane.tools.topology import detect_topology, get_topology, ModelTier
 
     synapse = _get_synapse()
     osa = Orchestrator(synapse, hil_interactive=True)
-    session_id = f"chat_{int(__import__('time').time())}"
+    session_id = f"chat_{int(time.time())}"
 
     conversation_history: list[dict[str, str]] = []
     last_correlation_id: str | None = None
+    deep_mode = False
 
     console.print(Panel(
         "[bold green]Octane Chat[/]\n"
         "[dim]Type your message and press Enter. "
         "Use [bold cyan]/help[/bold cyan] for slash commands, "
-        "[bold]exit[/bold] or [bold]quit[/bold] to end the session.[/]",
+        "[bold cyan]/deep[/bold cyan] to toggle deep mode, "
+        "[bold]exit[/bold] or [bold]quit[/bold] to end.[/]",
         border_style="green",
     ))
 
@@ -52,8 +62,14 @@ async def _chat():
         status = await osa.pre_flight(wait_for_bodega=True)
 
     if status["bodega_reachable"] and status["model_loaded"]:
-        model_display = (status.get("model") or "").split("/")[-1] or "model loaded"
-        console.print(f"[dim]🧠 {model_display} ready[/]\n")
+        try:
+            topo_name = detect_topology()
+            topo = get_topology(topo_name)
+            reason_model = topo.resolve(ModelTier.REASON)
+            console.print(f"[dim]🧠 {reason_model} ready · topology: {topo_name}[/]\n")
+        except Exception:
+            model_display = (status.get("model") or "").split("/")[-1] or "model loaded"
+            console.print(f"[dim]🧠 {model_display} ready[/]\n")
     else:
         note = status.get("note", "Bodega offline")
         console.print(f"[yellow]⚠ {note}[/]\n")
@@ -61,7 +77,8 @@ async def _chat():
     turn = 0
     while True:
         try:
-            query = console.input("[bold cyan]You:[/] ").strip()
+            mode_tag = " [bold cyan](deep)[/]" if deep_mode else ""
+            query = console.input(f"[bold cyan]You:{mode_tag}[/] ").strip()
         except (EOFError, KeyboardInterrupt):
             console.print("\n[dim]Session ended.[/]")
             break
@@ -75,6 +92,12 @@ async def _chat():
 
             if cmd == "/help":
                 console.print(_CHAT_HELP)
+                continue
+
+            elif cmd == "/deep":
+                deep_mode = not deep_mode
+                state = "[bold cyan]ON[/]" if deep_mode else "[dim]off[/]"
+                console.print(f"[dim]⬇ Deep mode: {state}[/]\n")
                 continue
 
             elif cmd == "/clear":
@@ -101,6 +124,10 @@ async def _chat():
                     console.print("[yellow]No trace available yet — ask something first.[/]\n")
                 continue
 
+            elif cmd in ("/exit", "/quit"):
+                console.print("[dim]Goodbye.[/]")
+                break
+
             else:
                 console.print(f"[yellow]Unknown command '{cmd}'. Type /help for options.[/]\n")
                 continue
@@ -116,11 +143,15 @@ async def _chat():
         _status.start()
         response_parts: list[str] = []
         _first = True
+        t0 = time.monotonic()
+
+        extra_metadata = {"deep": True} if deep_mode else None
 
         async for chunk in osa.run_stream(
             query,
             session_id=session_id,
             conversation_history=conversation_history,
+            extra_metadata=extra_metadata,
         ):
             if _first:
                 _status.stop()
@@ -133,9 +164,11 @@ async def _chat():
             _status.stop()
         console.print()
 
+        elapsed = time.monotonic() - t0
         assistant_reply = "".join(response_parts).strip()
         conversation_history.append({"role": "assistant", "content": assistant_reply})
 
+        word_count = len(assistant_reply.split())
         egress_events = [
             e for e in synapse._events
             if e.event_type == "egress"
@@ -143,11 +176,11 @@ async def _chat():
         if egress_events:
             last_correlation_id = egress_events[-1].correlation_id
             console.print(
-                f"[dim]  ↳ trace: {last_correlation_id[:16]}…  "
-                f"(/trace to inspect)[/]\n"
+                f"[dim]  ↳ {word_count} words · {elapsed:.1f}s · "
+                f"trace: {last_correlation_id[:16]}…  (/trace to inspect)[/]\n"
             )
         else:
-            console.print()
+            console.print(f"[dim]  ↳ {word_count} words · {elapsed:.1f}s[/]\n")
 
         if len(conversation_history) > 12:
             conversation_history = conversation_history[-12:]

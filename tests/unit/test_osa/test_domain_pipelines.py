@@ -117,22 +117,17 @@ class TestInvestmentAnalysisPipeline:
 class TestComparativeAnalysisPipeline:
     """Tests for the comparative_analysis domain pipeline."""
 
-    def test_produces_three_nodes(self):
-        """comparative_analysis should produce 3 nodes: A, B, compare."""
+    def test_produces_two_nodes(self):
+        """comparative_analysis should produce 2 nodes: A and B (evaluator synthesizes)."""
         dag = build_dag("compare NVDA vs AMD", "comparative_analysis")
         assert dag is not None
-        assert len(dag.nodes) == 3
+        assert len(dag.nodes) == 2
 
-    def test_code_node_depends_on_both_web_nodes(self):
-        """The code node must depend on both web nodes."""
+    def test_both_nodes_are_web(self):
+        """Both nodes should be web agents (no code node)."""
         dag = build_dag("NVDA versus AMD performance comparison", "comparative_analysis")
-        code_nodes = [n for n in dag.nodes if n.agent == "code"]
-        assert len(code_nodes) == 1
-        code_node = code_nodes[0]
-        web_nodes = [n for n in dag.nodes if n.agent == "web"]
-        assert len(code_node.depends_on) == 2
-        web_ids = {n.task_id for n in web_nodes}
-        assert set(code_node.depends_on) == web_ids
+        assert all(n.agent == "web" for n in dag.nodes)
+        assert len(dag.nodes) == 2
 
     def test_returns_none_when_items_not_extractable(self):
         """If two items cannot be extracted, returns None (fallback to LLM)."""
@@ -278,9 +273,9 @@ class TestDAGPlannerDomainIntegration:
 
         dag = await planner.plan("compare NVDA vs AMD performance")
 
-        # Domain pipeline should fire (3 nodes) without calling chat_simple
+        # Domain pipeline should fire (2 nodes) without calling chat_simple
         assert dag is not None
-        assert len(dag.nodes) == 3
+        assert len(dag.nodes) == 2
         mock_bodega.chat_simple.assert_not_called()
 
     @pytest.mark.asyncio
@@ -331,4 +326,4 @@ class TestDAGPlannerDomainIntegration:
         dag = await planner.plan("compare NVDA versus AMD chips")
 
         assert dag is not None
-        assert len(dag.nodes) == 3   # comparative_analysis
+        assert len(dag.nodes) == 2   # comparative_analysis (2 web nodes, evaluator synthesizes)

@@ -2,11 +2,63 @@
 
 from __future__ import annotations
 
+import re
+import sys
+from datetime import datetime
+from pathlib import Path
+
 from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 
-console = Console()
+# Pre-compiled ANSI escape code stripper — used when writing to log files.
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*[mGKHF]")
+
+
+# ── test_runs tee ─────────────────────────────────────────────────────────────
+# Every octane command saves its terminal output (ANSI-stripped) to
+# test_runs/<timestamp>_<cmd>.log.  Upload these files to share bug reports.
+
+class _TeeFile:
+    """File-like object that writes to stdout (with colour) and a plain log file."""
+
+    def __init__(self, log_path: Path) -> None:
+        self._stdout = sys.stdout  # snapshot before Rich's Live can replace it
+        self._log = open(log_path, "w", encoding="utf-8")  # noqa: WPS515
+
+    def write(self, s: str) -> int:
+        self._stdout.write(s)
+        self._log.write(_ANSI_RE.sub("", s))  # strip ANSI for readable log
+        return len(s)
+
+    def flush(self) -> None:
+        self._stdout.flush()
+        self._log.flush()
+
+    def fileno(self) -> int:
+        return self._stdout.fileno()
+
+    def isatty(self) -> bool:
+        return hasattr(self._stdout, "isatty") and self._stdout.isatty()
+
+
+def _build_console() -> Console:
+    """Return a Console that tees output to test_runs/ if possible."""
+    try:
+        project_root = Path(__file__).resolve().parents[2]
+        log_dir = project_root / "test_runs"
+        log_dir.mkdir(exist_ok=True)
+        ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        cmd_parts = [a for a in sys.argv[1:] if not a.startswith("-")]
+        cmd_slug = "_".join(cmd_parts[:3])[:40].replace(" ", "_") if cmd_parts else "octane"
+        log_path = log_dir / f"{ts}_{cmd_slug}.log"
+        tee = _TeeFile(log_path)
+        return Console(file=tee, force_terminal=True, highlight=False)
+    except Exception:
+        return Console()
+
+
+console = _build_console()
 
 
 def _get_synapse():

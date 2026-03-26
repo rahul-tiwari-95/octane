@@ -228,7 +228,12 @@ def _build_investment_dag(query: str) -> TaskDAG | None:
 
 
 def _build_comparative_dag(query: str) -> TaskDAG | None:
-    """Three nodes: fetch item_a, fetch item_b, then code comparison (depends on both)."""
+    """Two parallel nodes: fetch item_a and item_b. Evaluator handles synthesis.
+
+    Session 29: Removed the code_generation node — synthesizing a comparison
+    table is the Evaluator's job (REASON tier), not the code agent's. The old
+    code node caused 90m to attempt JSON plan generation and fail repeatedly.
+    """
     items = _extract_compare_items(query)
     if items is None:
         logger.debug("comparative_pipeline_no_items", query=query[:80])
@@ -256,26 +261,12 @@ def _build_comparative_dag(query: str) -> TaskDAG | None:
             "pipeline": "comparative_analysis",
         },
     )
-    node_compare = TaskNode(
-        agent="code",
-        instruction=(
-            f"Using the data provided above, create a structured side-by-side comparison "
-            f"of {item_a} and {item_b}. Include a summary table with key metrics."
-        ),
-        metadata={
-            "template": "code_generation",
-            "sub_agent": "full_pipeline",
-            "source": "domain_pipeline",
-            "pipeline": "comparative_analysis",
-        },
-        depends_on=[node_a.task_id, node_b.task_id],
-    )
 
-    logger.info("domain_pipeline_comparative", item_a=item_a, item_b=item_b, nodes=3)
+    logger.info("domain_pipeline_comparative", item_a=item_a, item_b=item_b, nodes=2)
     return TaskDAG(
         original_query=query,
         reasoning=f"Domain pipeline: comparative_analysis ({item_a} vs {item_b})",
-        nodes=[node_a, node_b, node_compare],
+        nodes=[node_a, node_b],
     )
 
 

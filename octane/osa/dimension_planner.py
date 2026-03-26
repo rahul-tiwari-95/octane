@@ -201,8 +201,8 @@ class DimensionPlanner:
             raw = await self._bodega.chat_simple(
                 f"Query to investigate: {query}",
                 system=_DIMENSION_PLANNER_SYSTEM,
-                tier=ModelTier.REASON,
-                max_tokens=1200,
+                tier=ModelTier.MID,
+                max_tokens=800,
                 temperature=0.0,
             )
             return self._parse_response(query, raw, limit)

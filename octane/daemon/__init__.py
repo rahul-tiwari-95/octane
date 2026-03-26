@@ -7,6 +7,9 @@ The daemon is the beating heart of Octane. It manages:
 - Intelligent data routing (algorithmic Redis vs Postgres placement)
 - Model lifecycle (aggressive unloading, reload on demand)
 - Unix socket IPC for CLI ↔ daemon communication
+- Inference proxy — backpressure-aware gateway to Bodega with per-model
+  semaphores.  Dedicated CLASSIFY model (bodega-vertex-4b) for internal
+  routing/classification/judging so user-facing inference never stalls.
 
 The daemon is OPTIONAL — all CLI commands work without it.
 When running, it accelerates everything through shared state and pools.

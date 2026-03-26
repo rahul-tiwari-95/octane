@@ -60,11 +60,13 @@ async def _investigate(query: str, max_dimensions: int | None, stream: bool):
             border_style="cyan",
         )
     )
-
+    console.print(
+        "[dim]⚙  Planning dimensions (~5s) · Web research in parallel · "
+        "Synthesis via 8B model[/]"
+    )
     kwargs: dict = {}
     if max_dimensions is not None:
         kwargs["max_dimensions"] = max_dimensions
-
     report_text = ""
     total_ms = 0.0
     n_ok = 0
@@ -76,9 +78,9 @@ async def _investigate(query: str, max_dimensions: int | None, stream: bool):
         BarColumn(bar_width=None, complete_style="green", finished_style="green"),
         TextColumn("{task.completed}/{task.total}"),
         console=console,
-        transient=True,
+        transient=False,
     ) as progress:
-        plan_task = progress.add_task("[cyan]Planning dimensions…[/]", total=None)
+        plan_task = progress.add_task("[cyan]Planning dimensions (8B)…[/]", total=None)
         research_task = None
 
         async for event in orchestrator.run_stream(query, **kwargs):
@@ -119,13 +121,13 @@ async def _investigate(query: str, max_dimensions: int | None, stream: bool):
                 data = event["data"]
                 report_text = data.get("report", "")
                 t = plan_task if research_task is None else research_task
-                progress.update(t, description="[green]✅ Synthesizing report…[/]")
+                progress.update(t, description="[yellow]🧠 Synthesizing (8B)…[/]")
 
             elif etype == "done":
                 data = event["data"]
-                total_ms = data.get("total_ms", 0.0)
                 n_ok = data.get("dimensions_completed", 0)
                 n_total = n_ok + data.get("dimensions_failed", 0)
+                total_ms = data.get("total_ms", 0.0)
 
     console.print(
         Panel(
@@ -173,8 +175,10 @@ async def _compare(query: str, stream: bool):
             border_style="yellow",
         )
     )
-
-    n_cells = 0
+    console.print(
+        "[dim]⚙  Planning comparison matrix (~5s) · Web research in parallel · "
+        "Synthesis via 8B model[/]"
+    )
     n_done = 0
     report_text = ""
     total_ms = 0.0
@@ -186,9 +190,9 @@ async def _compare(query: str, stream: bool):
         BarColumn(bar_width=None, complete_style="yellow", finished_style="green"),
         TextColumn("{task.completed}/{task.total}"),
         console=console,
-        transient=True,
+        transient=False,
     ) as progress:
-        plan_task = progress.add_task("[cyan]Planning comparison matrix…[/]", total=None)
+        plan_task = progress.add_task("[cyan]Planning comparison matrix (8B)…[/]", total=None)
         cell_task = None
 
         async for event in orchestrator.run_stream(query):

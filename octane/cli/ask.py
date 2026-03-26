@@ -32,6 +32,10 @@ def ask(
 
 
 async def _ask(query: str, verbose: bool = False, deep: bool = False, monitor: bool = False):
+    if verbose:
+        from octane.utils import setup_logging
+        setup_logging(level_override="debug")
+
     from octane.daemon.client import is_daemon_running
 
     # ── Try daemon routing first ──────────────────────────────────────────────
@@ -326,6 +330,36 @@ Your task:
 
 _MAX_RECALL_CHARS = 12_000  # chars of stored content to include in a single prompt
 
+_RECALL_STOPWORDS = frozenset({
+    "a", "an", "the", "and", "or", "but", "in", "on", "at", "to", "for",
+    "of", "with", "by", "from", "up", "about", "into", "is", "was", "are",
+    "were", "be", "been", "being", "have", "has", "had", "do", "does", "did",
+    "will", "would", "shall", "should", "may", "might", "can", "could",
+    "i", "me", "my", "we", "our", "you", "your", "he", "she", "it",
+    "they", "them", "this", "that", "these", "those", "what", "which",
+    "who", "when", "where", "how", "why", "all", "every", "any", "some",
+    "no", "not", "only", "just", "give", "tell", "show", "summarize",
+    "summarise", "everything", "stored", "based", "using", "find", "get",
+    "me", "us", "about", "please",
+})
+
+
+def _extract_recall_keywords(query: str) -> list[str]:
+    """Extract meaningful search tokens from a natural-language recall query.
+
+    Strips stopwords, punctuation, and short words so that a sentence like
+    'Summarize everything stored about NVDA' → ['nvda'] and the Postgres
+    ILIKE search actually finds matching rows.
+    """
+    seen: set[str] = set()
+    keywords: list[str] = []
+    for tok in query.split():
+        clean = tok.strip(".,!?:;\"'()[]{}").lower()
+        if len(clean) > 2 and clean not in _RECALL_STOPWORDS and clean not in seen:
+            seen.add(clean)
+            keywords.append(clean)
+    return keywords if keywords else [query.lower()]
+
 
 async def _ask_recall(query: str) -> None:
     """Stream an answer synthesized exclusively from stored Postgres/Redis data."""
@@ -345,18 +379,21 @@ async def _ask_recall(query: str) -> None:
     pages_chunks: list[str] = []
 
     if pg.available:
-        kw = f"%{query}%"
+        # Extract meaningful keywords — avoids sending the whole sentence as ILIKE
+        # e.g. "Summarize everything stored about NVDA" → ["nvda"]
+        keywords = _extract_recall_keywords(query)
+        patterns = [f"%{kw}%" for kw in keywords]
 
         # research_findings
         findings = await pg.fetch(
             """
             SELECT topic, content, cycle_num, created_at
             FROM   research_findings
-            WHERE  content ILIKE $1 OR topic ILIKE $1
+            WHERE  topic ILIKE ANY($1) OR content ILIKE ANY($1)
             ORDER  BY created_at DESC
             LIMIT  12
             """,
-            kw,
+            patterns,
         )
         for row in findings:
             ts = str(row["created_at"])[:10]
@@ -370,11 +407,11 @@ async def _ask_recall(query: str) -> None:
             """
             SELECT title, url, content, fetched_at
             FROM   web_pages
-            WHERE  content ILIKE $1 OR title ILIKE $1 OR url ILIKE $1
+            WHERE  content ILIKE ANY($1) OR title ILIKE ANY($1) OR url ILIKE ANY($1)
             ORDER  BY fetched_at DESC
             LIMIT  8
             """,
-            kw,
+            patterns,
         )
         for row in pages:
             ts = str(row["fetched_at"])[:10]

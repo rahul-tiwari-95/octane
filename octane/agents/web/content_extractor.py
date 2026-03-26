@@ -57,12 +57,14 @@ class ExtractedContent:
                       "browser"     — extracted by BrowserAgent (set by caller)
                       "failed"      — fetch/extraction returned nothing
                       "unavailable" — trafilatura is not installed
+        title:      Page title extracted from HTML metadata (empty if unknown).
         error:      Short error message (empty on success).
     """
     url: str
     text: str
     word_count: int
     method: str          # "trafilatura" | "browser" | "failed" | "unavailable"
+    title: str = field(default="")
     error: str = field(default="")
 
 
@@ -169,11 +171,21 @@ class ContentExtractor:
                     method="failed", error="extracted text too short",
                 )
 
+            # Extract page title from metadata (fast, CPU-only, no extra fetch)
+            page_title = ""
+            try:
+                meta = trafilatura.extract_metadata(html, default_url=url)
+                if meta and meta.title:
+                    page_title = meta.title.strip()
+            except Exception:
+                pass
+
             text = self._chunk_text(text.strip(), cap)
             word_count = len(text.split())
             logger.info("trafilatura_extracted", url=url, chars=len(text), words=word_count)
             return ExtractedContent(
                 url=url, text=text, word_count=word_count, method="trafilatura",
+                title=page_title,
             )
 
         except Exception as exc:

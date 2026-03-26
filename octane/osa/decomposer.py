@@ -70,7 +70,22 @@ PIPELINE_TEMPLATES: dict[str, dict] = {
         "agent": "memory",
         "sub_agent": "read",
         "description": "Recall something previously stored or discussed",
-        "keywords": ["remember", "recall", "memory", "forget", "stored", "saved", "previously"],
+        "keywords": [
+            "remember", "recall", "memory", "forget", "stored", "saved", "previously",
+            "read before", "have read", "i've read", "i read", "i've seen", "have seen",
+            "i looked at", "we discussed", "told you", "i mentioned", "articles i",
+            "before about", "earlier about", "past session",
+        ],
+    },
+    "conversational": {
+        "agent": "web",
+        "sub_agent": "chat",
+        "description": "Casual greeting, acknowledgement, or short conversational message",
+        "keywords": [
+            "hi", "hello", "hey", "thanks", "thank you", "ok", "okay", "got it",
+            "sure", "sounds good", "great", "nice", "cool", "awesome", "perfect",
+            "good morning", "good evening", "good afternoon", "bye", "goodbye",
+        ],
     },
     "sysstat_health": {
         "agent": "sysstat",
@@ -82,11 +97,24 @@ PIPELINE_TEMPLATES: dict[str, dict] = {
 
 _VALID_TEMPLATES = set(PIPELINE_TEMPLATES.keys())
 
+# Short queries that are pure greetings — route directly to conversational.
+# Checked BEFORE any LLM call so "hi" is instant.
+_GREETING_EXACT = frozenset({
+    "hi", "hello", "hey", "hey!", "hi!", "hello!",
+    "thanks", "thank you", "thx", "ty",
+    "ok", "okay", "k", "kk", "got it", "sure", "cool", "great", "nice",
+    "sounds good", "perfect", "awesome", "good morning", "good evening",
+    "good afternoon", "morning", "evening", "afternoon",
+    "bye", "goodbye", "cya", "ttyl",
+    "yes", "no", "yep", "nope", "yup",
+})
+
 # Single-token prompt: LLM must output exactly one template name — nothing else.
 # No JSON, no reasoning, no markdown. Just the token. Reliable at temperature=0.
 _DECOMPOSER_SYSTEM = (
     "You are a query router. Respond with ONLY one of these exact words, nothing else:\n"
-    "web_finance, web_news, web_search, web_entertainment, web_music, code_generation, memory_recall, sysstat_health\n\n"
+    "web_finance, web_news, web_search, web_entertainment, web_music, code_generation, "
+    "memory_recall, sysstat_health, conversational\n\n"
     "Meanings:\n"
     "  web_finance       → stock price, market data, financial metrics, earnings\n"
     "  web_news          → recent news, headlines, current events, announcements\n"
@@ -94,8 +122,9 @@ _DECOMPOSER_SYSTEM = (
     "  web_entertainment → movies, TV shows, streaming, cast, ratings, recommendations\n"
     "  web_music         → songs, artists, albums, lyrics, music recommendations\n"
     "  code_generation   → write code, script, program, algorithm, implementation\n"
-    "  memory_recall     → recall something previously discussed or stored\n"
-    "  sysstat_health    → system health, CPU, RAM, model status\n\n"
+    "  memory_recall     → recall something previously discussed, stored, or read before\n"
+    "  sysstat_health    → system health, CPU, RAM, model status\n"
+    "  conversational    → greeting, thanks, acknowledgement, or casual short message\n\n"
     "If unsure, output: web_search"
 )
 
@@ -172,6 +201,11 @@ class Decomposer:
 
         source is 'llm' or 'keyword_fallback'.
         """
+        # Fast pre-check: pure greetings and one-word acks should NEVER hit web.
+        query_lower = query.strip().lower().rstrip("!.,?")
+        if query_lower in _GREETING_EXACT:
+            return "conversational", "Greeting/ack detected — no web search needed", "keyword_fallback"
+
         if self._bodega is not None:
             try:
                 result = await asyncio.wait_for(
@@ -229,9 +263,13 @@ class Decomposer:
 
         Scores each template by how many of its keywords appear in the query.
         Returns the highest-scoring template (ties broken by order).
+        Skips 'conversational' — those are handled by the _GREETING_EXACT
+        pre-check in _classify() before this is ever called.
         """
         scores: dict[str, int] = {}
         for name, template in PIPELINE_TEMPLATES.items():
+            if name == "conversational":
+                continue  # handled via _GREETING_EXACT pre-check only
             score = sum(1 for kw in template["keywords"] if kw in query_lower)
             scores[name] = score
 

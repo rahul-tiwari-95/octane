@@ -4,10 +4,14 @@ import structlog
 from octane.config import settings
 
 
-def setup_logging() -> None:
+def setup_logging(level_override: str | None = None) -> None:
     """Configure structlog for Octane.
 
     Uses console renderer for development, JSON for production.
+
+    Args:
+        level_override: If provided, override settings.log_level (e.g. "debug"
+            when --verbose is passed on the CLI).
     """
     shared_processors: list[structlog.types.Processor] = [
         structlog.contextvars.merge_contextvars,
@@ -22,8 +26,9 @@ def setup_logging() -> None:
         renderer = structlog.dev.ConsoleRenderer(colors=True)
 
     # Map log level name to numeric value
+    level_name = (level_override or settings.log_level).lower()
     level_map = {"debug": 10, "info": 20, "warning": 30, "warn": 30, "error": 40, "critical": 50}
-    log_level = level_map.get(settings.log_level.lower(), 20)
+    log_level = level_map.get(level_name, 30)
 
     structlog.configure(
         processors=[

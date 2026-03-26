@@ -4,11 +4,11 @@
   "date": "2026-03-22",
   "status": "complete",
   "test_results": {
-    "passed": 788,
+    "passed": 834,
     "skipped": 32,
     "failed": 0,
     "warnings": 4,
-    "delta_from_session_28": "+32 new tests (parsers x25, store x16, catalysts x17, migration update x2 — net +32 beyond Session 28 baseline of 756)"
+    "delta_from_session_28": "+78 new tests (from Session 28 baseline of 756)"
   },
 
   "context_additions": [
@@ -108,6 +108,58 @@
         "test_catalysts.py": "TestEarningsCalendar (5), TestSectorExposure (4), TestCorrelationAnalysis (4), TestCatalystRegistry (6) = 19 tests"
       },
       "migration_test_updates": "test_migrate_noop_when_current updated to feed 3 versions including 29A; test_migrate_applies_when_pending updated to assert result.version == '29A'"
+    },
+
+    "F": {
+      "title": "Output Quality, Tier Routing, Chat UX, Structlog Quiet Mode",
+      "status": "complete",
+      "description": "Focused on closing the gap between infrastructure and output quality. Wired MID tier (8b) into QueryStrategist and DepthAnalyzer. Removed the code_generation node from comparative_analysis pipeline (evaluator handles synthesis). Added adaptive output length to Evaluator based on query complexity. Suppressed structlog noise by default (WARNING level), verbose opts in. Upgraded octane chat with /deep toggle, timing, word count, topology display.",
+      "changes": {
+        "tier_routing": {
+          "QueryStrategist": "FAST → MID — 8b generates better search variations than 90m",
+          "DepthAnalyzer": "FAST → MID — 8b produces smarter follow-up research queries",
+          "comparative_analysis_pipeline": "Removed code_generation node — evaluator (REASON tier) handles comparison synthesis directly, eliminating the 90m JSON planning failure that caused 153s delays"
+        },
+        "adaptive_output_length": {
+          "mechanism": "_estimate_output_tokens() returns 600-4000 tokens based on query signals",
+          "brief_signals": "price, stock price, what is, who is → 600 tokens",
+          "compare_signals": "compare, vs, versus, between X and Y → 3000 tokens",
+          "deep_signals": "explain, analyze, investigate, thorough → 2500 tokens",
+          "deep_mode": "is_deep=True → 4000 tokens",
+          "default": "1200 + 300 per agent result, capped at 3000",
+          "length_hints": "System prompt includes explicit length instruction matching query complexity"
+        },
+        "structlog_quiet": {
+          "default_log_level": "WARNING (was INFO) — clean CLI output by default",
+          "verbose_override": "--verbose on ask/chat re-configures to DEBUG",
+          "setup_logging": "Now accepts level_override parameter"
+        },
+        "chat_improvements": {
+          "deep_toggle": "/deep slash command toggles deep mode mid-conversation",
+          "timing": "Response time shown after each answer (e.g. '↳ 142 words · 3.2s')",
+          "word_count": "Word count displayed per response",
+          "topology_display": "Shows model name + topology at startup",
+          "verbose_flag": "--verbose flag on octane chat enables debug logging",
+          "mode_indicator": "Prompt shows (deep) when deep mode is active"
+        }
+      },
+      "files_modified": [
+        {"path": "octane/agents/web/query_strategist.py", "change": "tier=ModelTier.FAST → tier=ModelTier.MID"},
+        {"path": "octane/agents/web/depth_analyzer.py", "change": "tier=ModelTier.FAST → tier=ModelTier.MID, updated docstring"},
+        {"path": "octane/osa/evaluator.py", "change": "Added _estimate_output_tokens(), _length_hint(), is_deep param on evaluate/evaluate_stream, adaptive max_tokens + system prompt, timeout 30→60s"},
+        {"path": "octane/osa/orchestrator.py", "change": "Wired is_deep through to all 3 evaluate/evaluate_stream call sites"},
+        {"path": "octane/osa/domain_pipelines.py", "change": "comparative_analysis: removed code_generation node, now 2 nodes (fetch A + fetch B)"},
+        {"path": "octane/cli/chat.py", "change": "Added /deep toggle, timing, word count, topology display, --verbose flag, mode indicator in prompt"},
+        {"path": "octane/cli/ask.py", "change": "Added verbose→setup_logging(level_override='debug')"},
+        {"path": "octane/config.py", "change": "Default log_level changed from INFO to WARNING"},
+        {"path": "octane/utils/__init__.py", "change": "setup_logging() now accepts level_override parameter"}
+      ],
+      "tests_updated": [
+        {"path": "tests/e2e/test_e2e_tier_wiring.py", "change": "QueryStrategist tests: FAST → MID assertions"},
+        {"path": "tests/unit/test_osa/test_domain_pipelines.py", "change": "comparative_analysis: 3 nodes → 2 nodes, code_node test → both_nodes_are_web"},
+        {"path": "tests/unit/test_session22_deepening.py", "change": "DepthAnalyzer tier test: FAST → MID"}
+      ],
+      "root_cause_of_153s_failure": "comparative_analysis pipeline routed to code agent → code planner needed JSON from 90m → 90m can't generate structured JSON → 3 retry loops → 153s thin output. Fix: removed code node entirely, evaluator does the synthesis on REASON tier (37b)."
     }
   },
 
@@ -154,6 +206,58 @@
     "catalyst_pattern": "All 3 new catalysts follow the existing resolve_data → output_dict pattern. yfinance is imported lazily with ImportError → RuntimeError for clean messages.",
     "correlation_fallback": "correlation_analysis fetches additional ticker history from yfinance when only one time-series is available in resolved_data.",
     "cli_analyze_fallback": "portfolio analyze works even without a running daemon — prints the structured context so the user can copy-paste into octane ask."
+  },
+
+  "session_29B": {
+    "title": "Daemon Inference Re-enablement + .env Path Fix",
+    "status": "complete",
+    "date": "2026-03-23/24",
+    "description": "Re-enabled daemon as the coordination layer for multi-client inference. Previously bypassed (_daemon_infer returned None) to fix CLI hangs. Root cause of hangs was actually _TeeFile deadlock + asyncio.gather batching, not the daemon itself. With those fixed, daemon routing was safely re-enabled. Also fixed .env loading so Octane works from any cwd.",
+    "changes": {
+      "daemon_inference_routing": {
+        "file": "octane/tools/bodega_inference.py",
+        "description": "_daemon_infer() re-enabled with full daemon IPC: DaemonClient connect → request('infer', payload) → parse response. Falls back to direct HTTP on any daemon error. Self-detection guard prevents daemon process from recursing into its own socket.",
+        "architecture": "Terminal → Daemon (Unix socket) → InferenceProxy (per-model semaphore) → Bodega HTTP → GPU",
+        "fallback": "Any daemon error silently falls through to direct HTTP — zero user-visible degradation",
+        "verified": "5 concurrent clients completed in 3.55s through daemon, pressure report shows idle after drain"
+      },
+      "env_path_fix": {
+        "file": "octane/config.py",
+        "bug": "model_config had env_file='.env' (relative) — only worked when cwd was project root. Running 'octane investigate' from ~/ caused bodega_intel_url to default to port 44469 (not running) instead of 44467 (running)",
+        "fix": "Anchored .env path to repo root: _REPO_ROOT = Path(__file__).resolve().parent.parent; _ENV_FILE = _REPO_ROOT / '.env'",
+        "symptom": "web_search_failed error='All connection attempts failed' when running octane from home directory"
+      },
+      "topology_cleanup": {
+        "description": "Removed phantom axe-stealth-37b from power topology, replaced with bodega-raptor-8b for REASON tier. CB tuned: cb_completion_batch_size=32, cb_prefill_batch_size=16, num_draft_tokens=5"
+      },
+      "thinking_disabled": {
+        "description": "enable_thinking: False injected globally into all BodegaInferenceClient payloads — carries through both direct HTTP and daemon paths"
+      },
+      "streaming_fix": {
+        "description": "asyncio.gather replaced with asyncio.as_completed in both compare.py and investigate.py — cells/findings now stream incrementally instead of arriving all at once"
+      },
+      "teefile_deadlock_fix": {
+        "file": "octane/cli/_shared.py",
+        "description": "_TeeFile now snapshots self._stdout = sys.stdout at __init__ time to prevent infinite recursion when Rich Progress replaces sys.stdout with FileProxy"
+      }
+    },
+    "test_results": {
+      "passed": 661,
+      "failed": 1,
+      "skipped": 32,
+      "note": "1 failure is env-dependent: test_daemon_status_when_not_running fails because daemon IS running (PID 82245)"
+    },
+    "files_modified": [
+      {"path": "octane/tools/bodega_inference.py", "change": "_daemon_infer() re-enabled with full IPC + graceful fallback"},
+      {"path": "octane/config.py", "change": ".env path anchored to repo root via Path(__file__).resolve().parent.parent"},
+      {"path": "octane/tools/topology.py", "change": "power REASON = bodega-raptor-8b, CB tuned, axe-stealth-37b removed"},
+      {"path": "octane/tools/bodega_router.py", "change": "REASON fallback prefers lm over multimodal"},
+      {"path": "octane/cli/_shared.py", "change": "_TeeFile snapshots sys.stdout at init"},
+      {"path": "octane/cli/power.py", "change": "kwargs init, done event handler, Progress transient=False"},
+      {"path": "octane/osa/compare.py", "change": "asyncio.gather → asyncio.as_completed"},
+      {"path": "octane/osa/investigate.py", "change": "asyncio.gather → asyncio.as_completed"},
+      {"path": "octane/osa/comparison_planner.py", "change": "45s asyncio.wait_for timeout"}
+    ]
   },
 
   "session_30_plan": {

@@ -16,6 +16,7 @@ def register_all(app: typer.Typer) -> None:
         dag,
         daemon,
         db,
+        extract,
         files,
         health,
         model,
@@ -54,4 +55,5 @@ def register_all(app: typer.Typer) -> None:
     app.add_typer(airgap.airgap_app,  name="airgap")
     app.add_typer(store.store_app,       name="store")
     app.add_typer(portfolio.portfolio_app, name="portfolio")
+    app.add_typer(extract.extract_app,   name="extract")
     audit.register(app)

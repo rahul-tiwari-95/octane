@@ -43,6 +43,7 @@ class IdlePolicy:
     fast_idle_sec: float = 0.0       # FAST: always resident (tiny model)
     mid_idle_sec: float = 0.0        # MID: always resident (often same as FAST)
     reason_idle_sec: float = 300.0   # REASON: 5 min default
+    classify_idle_sec: float = 0.0   # CLASSIFY: daemon-exclusive, always resident
 
 
 IDLE_POLICIES: dict[str, IdlePolicy] = {
@@ -50,16 +51,19 @@ IDLE_POLICIES: dict[str, IdlePolicy] = {
         fast_idle_sec=0.0,         # 90M — always loaded, negligible memory
         mid_idle_sec=0.0,          # Same model as FAST on compact
         reason_idle_sec=120.0,     # 8B — unload after 2 min (tight RAM)
+        classify_idle_sec=0.0,     # vertex-4b — daemon-exclusive, always loaded
     ),
     "balanced": IdlePolicy(
         fast_idle_sec=0.0,
         mid_idle_sec=0.0,
         reason_idle_sec=300.0,     # 8B — unload after 5 min
+        classify_idle_sec=0.0,     # always loaded
     ),
     "power": IdlePolicy(
         fast_idle_sec=0.0,
         mid_idle_sec=0.0,
         reason_idle_sec=0.0,       # Never unload — 64 GB can hold everything
+        classify_idle_sec=0.0,     # always loaded
     ),
 }
 
@@ -70,6 +74,7 @@ MODEL_MEMORY_ESTIMATES: dict[str, float] = {
     "bodega-raptor-90M": 180.0,      # ~180 MB (tiny)
     "bodega-raptor-1b": 900.0,       # ~900 MB (0.9B params)
     "bodega-raptor-8b": 5000.0,      # ~5 GB (8B params, 4-bit quant)
+    "bodega-vertex-4b": 2500.0,      # ~2.5 GB (4B params)
 }
 
 
@@ -127,6 +132,8 @@ class ModelManager:
             return self.policy.mid_idle_sec
         elif tier_lower == "reason":
             return self.policy.reason_idle_sec
+        elif tier_lower == "classify":
+            return self.policy.classify_idle_sec
         return 0.0  # Unknown tier → never unload
 
     async def start(self) -> None:

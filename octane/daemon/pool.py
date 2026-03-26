@@ -158,7 +158,9 @@ class PoolManager:
         """Get the shared Bodega inference client."""
         if self._bodega is None:
             from octane.tools.bodega_inference import BodegaInferenceClient
-            self._bodega = BodegaInferenceClient()
+            # 600 s: allows axe-stealth-37b to generate up to ~6000 tokens
+            # at ~10 tok/s without timing out, which covers synthesis workloads.
+            self._bodega = BodegaInferenceClient(timeout=600.0)
             # Quick health check
             try:
                 health = await self._bodega.health()

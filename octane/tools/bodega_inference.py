@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
+import re
 from collections.abc import AsyncIterator
 from typing import Any
 
@@ -18,6 +20,44 @@ from octane.config import settings
 
 logger = structlog.get_logger().bind(component="bodega_inference")
 
+# Pre-compiled patterns for stripping think-block content.
+# Reasoning models (axe-stealth-37b, qwen3, etc.) emit <think>...</think>
+# inline in the content field when loaded WITHOUT reasoning_parser.
+# Stripping here keeps ALL callers clean — dimension_planner, evaluator,
+# synthesizer, decomposer, etc.
+_THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
+_THINKING_RE = re.compile(r"<thinking>.*?</thinking>", re.DOTALL | re.IGNORECASE)
+# Unclosed block — model was cut off mid-think; strip from opening tag to end.
+_THINK_OPEN_RE = re.compile(r"<think>.*", re.DOTALL | re.IGNORECASE)
+
+
+def _strip_think_tags(text: str, log_trace: bool = True) -> str:
+    """Remove <think>...</think> blocks from a model response.
+
+    When a reasoning model is loaded WITHOUT reasoning_parser, Bodega
+    returns the full thinking chain inside the content field.  This
+    function strips it before any caller ever sees it, so no component
+    needs to handle think-blocks individually.
+
+    If log_trace=True (default) the first 400 chars of the stripped
+    thinking chain are logged at DEBUG for observability.
+    """
+    # Capture the think block for debug logging before removing it.
+    think_match = _THINK_RE.search(text) or _THINKING_RE.search(text)
+    if think_match and log_trace:
+        matched = think_match.group(0)
+        # Extract inner content between the outer tags robustly.
+        open_end = matched.find(">")
+        close_start = matched.rfind("<")
+        inner = matched[open_end + 1 : close_start].strip() if open_end >= 0 else matched
+        logger.debug("model_think_stripped", trace=inner[:400])
+
+    text = _THINK_RE.sub("", text)
+    text = _THINKING_RE.sub("", text)
+    # Unclosed opening tag (generation cut off mid-think)
+    text = _THINK_OPEN_RE.sub("", text)
+    return text.strip()
+
 
 class BodegaInferenceClient:
     """Async client for the local Bodega Inference Engine.
@@ -25,12 +65,19 @@ class BodegaInferenceClient:
     Provides chat completion, health checks, and model info.
     Admin endpoints (load/unload) are exposed but should ONLY be called
     by SysStat.ModelManager.
+
+    When the Octane daemon is running, inference requests are routed
+    through the daemon's InferenceProxy (per-model semaphore backpressure).
+    When the daemon is not running, requests go directly to Bodega HTTP.
     """
 
-    def __init__(self, base_url: str | None = None, timeout: float = 120.0) -> None:
+    def __init__(self, base_url: str | None = None, timeout: float = 600.0) -> None:
         self.base_url = (base_url or settings.bodega_inference_url).rstrip("/")
         self.timeout = timeout
         self._client: httpx.AsyncClient | None = None
+        # Daemon routing: cached check to avoid stat() on every call.
+        self._daemon_checked: bool = False
+        self._daemon_available: bool = False
 
     async def _get_client(self) -> httpx.AsyncClient:
         if self._client is None or self._client.is_closed:
@@ -45,6 +92,93 @@ class BodegaInferenceClient:
         if self._client and not self._client.is_closed:
             await self._client.aclose()
             self._client = None
+
+    def _check_daemon(self) -> bool:
+        """Check if daemon is running (cached per-client lifetime).
+
+        Returns False if we ARE the daemon process — prevents recursive
+        socket connections when the daemon's internal OSA pipeline creates
+        its own BodegaInferenceClient instances.
+        """
+        if not self._daemon_checked:
+            try:
+                from octane.daemon.client import is_daemon_running, get_pid_path
+                # If our PID matches the daemon PID, we ARE the daemon.
+                # Skip the IPC route — go directly to Bodega HTTP.
+                pid_path = get_pid_path()
+                if pid_path.exists():
+                    try:
+                        daemon_pid = int(pid_path.read_text().strip())
+                        if daemon_pid == os.getpid():
+                            self._daemon_available = False
+                            self._daemon_checked = True
+                            return False
+                    except (ValueError, OSError):
+                        pass
+                self._daemon_available = is_daemon_running()
+            except Exception:
+                self._daemon_available = False
+            self._daemon_checked = True
+        return self._daemon_available
+
+    async def _daemon_infer(
+        self,
+        messages: list[dict[str, str]],
+        model: str,
+        temperature: float,
+        max_tokens: int,
+    ) -> dict[str, Any] | None:
+        """Try to route an inference request through the daemon.
+
+        Returns the Bodega response dict if daemon handled it, None if
+        daemon is not available (caller should fall back to direct HTTP).
+
+        The socket timeout is set to (self.timeout + 30s) so the daemon
+        always has time to complete the Bodega HTTP call before the
+        client gives up waiting on the socket.
+
+        Benefits of daemon routing:
+            - Per-model semaphore backpressure (5 terminals don't swamp Bodega)
+            - Priority scheduling (interactive P0 ahead of background P3)
+            - Metrics: active/waiting/avg_wait_ms per model
+            - Model lifecycle coordination (idle unload, ensure_loaded)
+        """
+        if not self._check_daemon():
+            return None
+
+        try:
+            from octane.daemon.client import DaemonClient
+
+            client = DaemonClient()
+            if not await client.connect(timeout=5.0):
+                return None
+
+            try:
+                result = await client.request(
+                    "infer",
+                    {
+                        "model": model,
+                        "messages": messages,
+                        "temperature": temperature,
+                        "max_tokens": max_tokens,
+                        "timeout": self.timeout,
+                    },
+                    timeout=self.timeout + 30.0,
+                )
+            finally:
+                await client.close()
+
+            if result.get("status") == "ok":
+                return result.get("data", {})
+
+            # Daemon returned an error — log and fall through to direct HTTP.
+            error = result.get("error", "unknown daemon error")
+            logger.warning("daemon_infer_fallback", error=error, model=model)
+            return None
+
+        except Exception as exc:
+            logger.debug("daemon_infer_unavailable", error=str(exc))
+            return None
 
     # ---- Inference ----
 
@@ -66,12 +200,21 @@ class BodegaInferenceClient:
         Returns:
             Full API response dict
         """
+        # Try daemon route first — backpressure-aware gateway.
+        daemon_result = await self._daemon_infer(messages, model, temperature, max_tokens)
+        if daemon_result is not None:
+            return daemon_result
+
+        # Direct HTTP fall-through (daemon not running or unavailable).
         client = await self._get_client()
         payload = {
             "model": model,
             "messages": messages,
             "temperature": temperature,
             "max_tokens": max_tokens,
+            # Disable chain-of-thought for all Qwen3-family models.
+            # Has no effect on models without thinking support.
+            "chat_template_kwargs": {"enable_thinking": False},
         }
 
         response = await client.post("/v1/chat/completions", json=payload)
@@ -80,7 +223,7 @@ class BodegaInferenceClient:
 
         # If the model was loaded with reasoning_parser="qwen3", Bodega extracts
         # the <think> block into message["reasoning_content"] automatically.
-        # Log it at DEBUG and strip it so callers always receive clean content.
+        # Log it at DEBUG.
         message = result.get("choices", [{}])[0].get("message", {})
         if reasoning := message.get("reasoning_content"):
             logger.debug(
@@ -88,6 +231,10 @@ class BodegaInferenceClient:
                 trace=reasoning[:400],
                 model=model,
             )
+        elif message.get("content") and "<think>" in message["content"]:
+            # Model loaded WITHOUT reasoning_parser: think block is in content.
+            # Strip it here so every caller gets clean text.
+            message["content"] = _strip_think_tags(message["content"])
 
         logger.debug(
             "chat_completion",
@@ -116,7 +263,10 @@ class BodegaInferenceClient:
             max_tokens=max_tokens,
         )
 
-        return result["choices"][0]["message"]["content"]
+        content = result["choices"][0]["message"]["content"]
+        # Belt-and-suspenders: strip any residual think tags that weren't
+        # caught in chat() (e.g. if caller bypasses chat() directly).
+        return _strip_think_tags(content, log_trace=False) if "<think>" in content else content
 
     async def chat_stream(
         self,
@@ -170,6 +320,14 @@ class BodegaInferenceClient:
         ) as stream_client:
             async with stream_client.stream("POST", "/v1/chat/completions", json=payload) as response:
                 response.raise_for_status()
+
+                # Stateful think-block filter.
+                # Reasoning models emit <think>...</think> as raw token stream.
+                # We suppress all tokens from <think> to </think> inclusive so
+                # the caller's terminal never shows the thinking chain.
+                _in_think = False
+                _think_buf: list[str] = []   # accumulates partial </think> tag
+
                 async for line in response.aiter_lines():
                     if not line.startswith("data:"):
                         continue
@@ -180,8 +338,45 @@ class BodegaInferenceClient:
                         chunk = json.loads(data)
                         delta = chunk["choices"][0].get("delta", {})
                         text = delta.get("content", "")
-                        if text:
-                            yield text
+                        if not text:
+                            continue
+
+                        # ── think-block suppression ────────────────────────
+                        if _in_think:
+                            _think_buf.append(text)
+                            combined = "".join(_think_buf)
+                            close_idx = combined.lower().find("</think>")
+                            if close_idx >= 0:
+                                _in_think = False
+                                _think_buf = []
+                                remainder = combined[close_idx + 8:]
+                                # Strip any leading whitespace/newline after </think>
+                                remainder = remainder.lstrip("\n ")
+                                if remainder:
+                                    yield remainder
+                            continue
+
+                        if "<think>" in text.lower():
+                            # Think block starting mid-chunk
+                            before, _, after = text.lower().partition("<think>")
+                            # Emit content before <think>
+                            pre = text[: len(before)]
+                            if pre:
+                                yield pre
+                            # Check if </think> is in the same chunk
+                            rest = text[len(before) + 7:]
+                            close_idx = rest.lower().find("</think>")
+                            if close_idx >= 0:
+                                remainder = rest[close_idx + 8:].lstrip("\n ")
+                                if remainder:
+                                    yield remainder
+                            else:
+                                _in_think = True
+                                _think_buf = [rest]
+                            continue
+                        # ── end think-block suppression ────────────────────
+
+                        yield text
                     except (json.JSONDecodeError, KeyError, IndexError):
                         continue
 

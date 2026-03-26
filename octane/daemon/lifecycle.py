@@ -41,6 +41,7 @@ from typing import Any
 import structlog
 
 from octane.daemon.client import get_pid_path, get_socket_path, is_daemon_running
+from octane.daemon.inference_proxy import InferenceProxy
 from octane.daemon.model_manager import ModelManager
 from octane.daemon.pool import PoolManager
 from octane.daemon.queue import AGING_INTERVAL_SEC, DaemonQueue, Priority, QueueItem
@@ -75,6 +76,7 @@ class DaemonLifecycle:
         self.queue: DaemonQueue | None = None
         self.pool: PoolManager | None = None
         self.model_manager: ModelManager | None = None
+        self.inference_proxy: InferenceProxy | None = None
         self.server: DaemonServer | None = None
 
         # Background tasks
@@ -110,6 +112,112 @@ class DaemonLifecycle:
         try:
             bodega = await self.pool.get_bodega()
             self.model_manager.bodega = bodega
+
+            # ── Inference Proxy: backpressure-aware gateway to Bodega ─────
+            self.inference_proxy = InferenceProxy(bodega)
+
+            # Register all models defined in the topology so the proxy's
+            # per-model semaphores are created before any request arrives.
+            from octane.tools.topology import get_topology, ModelTier
+            topo_obj = get_topology(topo)
+            for tier, cfg in topo_obj.models.items():
+                if tier == ModelTier.EMBED:
+                    continue  # EMBED is in-process, not Bodega
+                self.inference_proxy.register_model(
+                    cfg.model_id, cfg.max_concurrency,
+                    model_path=cfg.model_path,
+                )
+
+            # Sync InferenceProxy with the LIVE Bodega state.
+            # Models already loaded in Bodega before daemon start (e.g. user
+            # manually loaded them, or a previous daemon run left them loaded)
+            # get registered so they can receive inference traffic immediately.
+            # This also removes stale topology entries for models that are NOT
+            # actually loaded — preventing slots being held for phantom models.
+            try:
+                health = await bodega.health()
+                live_models = {
+                    m["id"]: m.get("type", "lm")
+                    for m in health.get("models_detail", [])
+                    if m.get("status") == "running"
+                }
+                # Register any live model not already in the proxy.
+                for live_id, live_type in live_models.items():
+                    canonical = self.inference_proxy._resolve(live_id)
+                    if canonical is None:
+                        # Determine a sensible concurrency from topology or default.
+                        default_conc = 2
+                        for tier, cfg in topo_obj.models.items():
+                            if (cfg.model_id.lower() == live_id.lower()
+                                    or cfg.model_path.lower() == live_id.lower()):
+                                default_conc = cfg.max_concurrency
+                                break
+                        self.inference_proxy.register_model(
+                            live_id, default_conc, model_path=live_id,
+                        )
+                        logger.info(
+                            "proxy_sync_registered_live_model",
+                            model_id=live_id,
+                            concurrency=default_conc,
+                        )
+                # Remove topology slots whose models are NOT in live Bodega.
+                # Keeps the proxy accurate so `octane daemon models` reflects reality.
+                topo_ids: set[str] = set()
+                for tier, cfg in topo_obj.models.items():
+                    if tier != ModelTier.EMBED:
+                        topo_ids.add(cfg.model_id)
+                for slot_id in list(self.inference_proxy._slots.keys()):
+                    # Only remove topo-registered slots that aren't actually loaded.
+                    if slot_id not in topo_ids:
+                        continue
+                    canonical_live = any(
+                        slot_id.lower() == lid.lower()
+                        or self.inference_proxy._resolve(lid) == slot_id
+                        for lid in live_models
+                    )
+                    if not canonical_live:
+                        self.inference_proxy.unregister_model(slot_id)
+                        logger.info(
+                            "proxy_sync_removed_phantom_model",
+                            model_id=slot_id,
+                        )
+            except Exception as exc:
+                logger.warning("proxy_sync_failed", error=str(exc))
+
+            # Auto-load CLASSIFY model (vertex-4b) — daemon's private brain.
+            classify_cfg = topo_obj.models.get(ModelTier.CLASSIFY)
+            if classify_cfg:
+                self.inference_proxy.classify_model = classify_cfg.model_id
+                logger.info(
+                    "classify_model_loading",
+                    model_id=classify_cfg.model_id,
+                    model_path=classify_cfg.model_path,
+                )
+                try:
+                    params = classify_cfg.to_load_params()
+                    await bodega.load_model(**params)
+                    await self.model_manager.register_loaded(
+                        classify_cfg.model_id, "classify",
+                        classify_cfg.context_length * 0.002,  # rough VRAM
+                    )
+                    logger.info(
+                        "classify_model_loaded",
+                        model_id=classify_cfg.model_id,
+                    )
+                except Exception as exc:
+                    # 409 Conflict = model already loaded in Bodega — treat as success.
+                    if "409" in str(exc):
+                        logger.info(
+                            "classify_model_already_loaded",
+                            model_id=classify_cfg.model_id,
+                        )
+                    else:
+                        logger.warning(
+                            "classify_model_load_failed",
+                            model_id=classify_cfg.model_id,
+                            error=str(exc),
+                        )
+
         except Exception as exc:
             logger.warning("bodega_init_failed", error=str(exc))
 
@@ -141,8 +249,12 @@ class DaemonLifecycle:
             "drain": self._handle_drain,
             "pause_request": self._handle_pause_request,
             "resume_request": self._handle_resume_request,
-            "list_requests": self._handle_list_requests,
-            # ── Queued commands ───────────────────────────────────────────────
+            "list_requests": self._handle_list_requests,            # ── Inference gateway ─────────────────────────────────────────
+            "infer": self._handle_infer,
+            "models": self._handle_models,
+            "load_model": self._handle_load_model,
+            "unload_model": self._handle_unload_model,
+            "pressure": self._handle_pressure,            # ── Queued commands ───────────────────────────────────────────────
             "ask": self._handle_ask,
             "investigate": self._handle_investigate,
             "compare": self._handle_compare,
@@ -169,6 +281,7 @@ class DaemonLifecycle:
                 "server": self.server.snapshot() if self.server else {},
                 "pools": self.pool.snapshot() if self.pool else {},
                 "model_manager": self.model_manager.snapshot() if self.model_manager else {},
+                "inference_proxy": self.inference_proxy.snapshot() if self.inference_proxy else {},
             },
         }
 
@@ -237,6 +350,126 @@ class DaemonLifecycle:
                     logger.info("request_resumed", task_id=task_id)
                     return {"status": "ok", "data": {"task_id": task_id, "paused": False}}
         return {"status": "error", "error": f"task_id not found: {task_id}"}
+
+    # ── Inference gateway handlers ────────────────────────────────────────────
+
+    async def _handle_infer(self, payload: dict) -> dict:
+        """Proxy an inference request through the InferenceProxy.
+
+        The CLI sends:
+            {"model": "axe-stealth-37b", "messages": [...], "temperature": 0.7,
+             "max_tokens": 2048, "timeout": 300}
+
+        The proxy acquires a per-model semaphore slot, calls Bodega, and
+        returns the full chat completion response.
+        """
+        if not self.inference_proxy:
+            return {"status": "error", "error": "inference proxy not initialized"}
+
+        model = payload.get("model", "current")
+        messages = payload.get("messages")
+        if not messages:
+            return {"status": "error", "error": "messages required"}
+
+        temperature = payload.get("temperature", 0.7)
+        max_tokens = payload.get("max_tokens", 2048)
+        timeout = payload.get("timeout", 300.0)
+
+        try:
+            result = await self.inference_proxy.chat(
+                messages=messages,
+                model=model,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                timeout=timeout,
+            )
+            return {"status": "ok", "data": result}
+        except asyncio.TimeoutError:
+            return {
+                "status": "error",
+                "error": f"inference slot timeout for {model} (waited {timeout}s)",
+            }
+        except Exception as exc:
+            logger.error("infer_error", model=model, error=str(exc))
+            return {"status": "error", "error": str(exc)}
+
+    async def _handle_models(self, _payload: dict) -> dict:
+        """List all models known to the InferenceProxy with pressure status."""
+        if not self.inference_proxy:
+            return {"status": "ok", "data": {"models": {}, "pressure": {}}}
+        return {
+            "status": "ok",
+            "data": {
+                "models": self.inference_proxy.snapshot()["models"],
+                "pressure": self.inference_proxy.pressure_report(),
+                "classify_model": self.inference_proxy.classify_model,
+            },
+        }
+
+    async def _handle_load_model(self, payload: dict) -> dict:
+        """Load a model via Bodega admin API and register in proxy."""
+        if not self.inference_proxy or not self.inference_proxy.bodega:
+            return {"status": "error", "error": "bodega not available"}
+
+        model_path = payload.get("model_path")
+        if not model_path:
+            return {"status": "error", "error": "model_path required"}
+
+        model_id = payload.get("model_id", model_path.split("/")[-1])
+        max_concurrency = payload.get("max_concurrency", 1)
+
+        try:
+            result = await self.inference_proxy.bodega.load_model(**payload)
+            self.inference_proxy.register_model(model_id, max_concurrency)
+            if self.model_manager:
+                await self.model_manager.register_loaded(
+                    model_id,
+                    payload.get("tier", "mid"),
+                )
+            return {"status": "ok", "data": result}
+        except Exception as exc:
+            logger.error("load_model_error", model_id=model_id, error=str(exc))
+            return {"status": "error", "error": str(exc)}
+
+    async def _handle_unload_model(self, payload: dict) -> dict:
+        """Unload a model via Bodega admin API and deregister from proxy."""
+        if not self.inference_proxy or not self.inference_proxy.bodega:
+            return {"status": "error", "error": "bodega not available"}
+
+        model_id = payload.get("model_id")
+        if not model_id:
+            return {"status": "error", "error": "model_id required"}
+
+        # Prevent unloading the CLASSIFY model
+        if model_id == self.inference_proxy.classify_model:
+            return {
+                "status": "error",
+                "error": f"{model_id} is the daemon-exclusive CLASSIFY model and cannot be unloaded",
+            }
+
+        try:
+            result = await self.inference_proxy.bodega.unload_model(model_id)
+            self.inference_proxy.unregister_model(model_id)
+            if self.model_manager:
+                await self._unload_via_manager(model_id)
+            return {"status": "ok", "data": result}
+        except Exception as exc:
+            logger.error("unload_model_error", model_id=model_id, error=str(exc))
+            return {"status": "error", "error": str(exc)}
+
+    async def _unload_via_manager(self, model_id: str) -> None:
+        """Deregister from model_manager state (bypass Bodega call — already done)."""
+        if self.state:
+            await self.state.unregister_model(model_id)
+
+    async def _handle_pressure(self, _payload: dict) -> dict:
+        """Return per-model pressure report."""
+        if not self.inference_proxy:
+            return {"status": "ok", "data": {}}
+        return {
+            "status": "ok",
+            "data": self.inference_proxy.pressure_report(),
+        }
 
     # ── Queued command handlers ───────────────────────────────────────────────
 
@@ -311,20 +544,26 @@ class DaemonLifecycle:
 
         async def stream_investigate():
             try:
-                from octane.osa.investigate import run_investigation
+                from octane.osa.investigate import InvestigateOrchestrator
+                from octane.agents.web.agent import WebAgent
+                from octane.models.synapse import SynapseEventBus
+
+                synapse = SynapseEventBus()
+                web_agent = WebAgent(synapse)
+                orchestrator = InvestigateOrchestrator(web_agent=web_agent)
+
+                max_dimensions = payload.get("max_dimensions")
+                kwargs = {}
+                if max_dimensions is not None:
+                    kwargs["max_dimensions"] = max_dimensions
 
                 yield {"status": "stream", "data": {"task_id": task_id, "state": "running"}}
 
-                result = await run_investigation(query)
+                async for event in orchestrator.run_stream(query, **kwargs):
+                    yield {"status": "stream", "data": event}
 
                 await self.queue.remove(task_id)
-                yield {
-                    "status": "done",
-                    "data": {
-                        "task_id": task_id,
-                        "result": result,
-                    },
-                }
+                yield {"status": "done", "data": {"task_id": task_id}}
             except Exception as exc:
                 logger.error("investigate_error", task_id=task_id, error=str(exc))
                 await self.queue.remove(task_id)
@@ -350,20 +589,21 @@ class DaemonLifecycle:
 
         async def stream_compare():
             try:
-                from octane.osa.compare import run_comparison
+                from octane.osa.compare import CompareOrchestrator
+                from octane.agents.web.agent import WebAgent
+                from octane.models.synapse import SynapseEventBus
+
+                synapse = SynapseEventBus()
+                web_agent = WebAgent(synapse)
+                orchestrator = CompareOrchestrator(web_agent=web_agent)
 
                 yield {"status": "stream", "data": {"task_id": task_id, "state": "running"}}
 
-                result = await run_comparison(query)
+                async for event in orchestrator.run_stream(query):
+                    yield {"status": "stream", "data": event}
 
                 await self.queue.remove(task_id)
-                yield {
-                    "status": "done",
-                    "data": {
-                        "task_id": task_id,
-                        "result": result,
-                    },
-                }
+                yield {"status": "done", "data": {"task_id": task_id}}
             except Exception as exc:
                 logger.error("compare_error", task_id=task_id, error=str(exc))
                 await self.queue.remove(task_id)

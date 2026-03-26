@@ -182,9 +182,11 @@ def test_topology_balanced_has_all_inference_tiers():
     assert ModelTier.REASON in topo.models
 
 
-def test_topology_power_mid_is_vertex_4b():
-    """Power topology uses bodega-vertex-4b for MID — richer summaries on 32 GB+."""
-    assert TOPOLOGIES["power"].models[ModelTier.MID].model_id == "bodega-vertex-4b"
+def test_topology_power_mid_is_raptor_8b():
+    """Power topology uses bodega-raptor-8b-mxfp4 for MID — 3-tier structure on 64 GB+."""
+    cfg = TOPOLOGIES["power"].models[ModelTier.MID]
+    assert cfg.model_id == "bodega-raptor-8b"
+    assert "bodega-raptor-8b-mxfp4" in cfg.model_path
 
 
 def test_all_topologies_cover_fast_mid_reason():
@@ -271,29 +273,30 @@ def test_power_fast_max_concurrency_is_4():
 
 
 def test_power_reason_max_concurrency_is_2():
-    """power allows 4 parallel deep-reasoning requests (extreme for 64GB M1 Max)."""
-    assert TOPOLOGIES["power"].models[ModelTier.REASON].max_concurrency == 4
+    """power REASON uses bodega-raptor-8b with max_concurrency=6."""
+    assert TOPOLOGIES["power"].models[ModelTier.REASON].max_concurrency == 6
 
 
 def test_power_reason_num_draft_tokens_is_5():
-    """power REASON uses axe-stealth-37b (different tokenizer family).
+    """power REASON uses bodega-raptor-8b with speculative decoding ON.
 
-    Speculative decoding is deliberately disabled (num_draft_tokens=0) because
-    the Qwen3-0.6B draft model shares tokenizers only with the raptor-8b family,
-    not with axe-stealth-37b.  Mismatched drafts produce garbage output.
+    Qwen3-0.6B draft shares the same tokenizer family as raptor-8b,
+    so speculative decoding is safe and improves single-user latency.
+    Power topology uses 5 draft tokens (vs balanced's 3) for more aggressive
+    speculation on 32GB+ machines.
     """
     cfg = TOPOLOGIES["power"].models[ModelTier.REASON]
-    assert cfg.num_draft_tokens == 0
-    assert cfg.draft_model_path is None
-    # 37b is the flagship REASON model
-    assert "axe-stealth" in cfg.model_id or "axe-stealth" in cfg.model_path
+    assert cfg.num_draft_tokens == 5
+    assert cfg.draft_model_path is not None
+    # REASON routes to the same 8b model as MID
+    assert "raptor-8b" in cfg.model_id or "raptor-8b" in cfg.model_path
 
 
-def test_power_reason_is_axe_stealth_37b():
-    """power topology routes REASON tier to axe-stealth-37b."""
+def test_power_reason_is_raptor_8b():
+    """power topology routes REASON tier to bodega-raptor-8b (lm)."""
     cfg = TOPOLOGIES["power"].models[ModelTier.REASON]
-    assert "axe-stealth-37b" in cfg.model_path
-    assert cfg.model_type == "multimodal"
+    assert "bodega-raptor-8b" in cfg.model_path or "bodega-raptor-8b" in cfg.model_id
+    assert cfg.model_type == "lm"
     assert cfg.continuous_batching is True
 
 
@@ -533,7 +536,7 @@ async def test_router_accepts_topology_object():
     topo = get_topology("power")
     router = BodegaRouter(topology=topo)
     assert router.topology.name == "power"
-    assert router.resolve_model_id(ModelTier.MID) == "bodega-vertex-4b"
+    assert router.resolve_model_id(ModelTier.MID) == "bodega-raptor-8b"
 
 
 # ── ModelManager.ensure_topology_loaded() ────────────────────────────────────
@@ -558,8 +561,9 @@ async def test_ensure_topology_loaded_calls_load_for_unique_models():
 
     # compact: FAST and MID share bodega-raptor-90M → only loaded once
     # REASON is bodega-raptor-8b → loaded once
-    # Total = 2 load calls
-    assert manager.bodega.load_model.await_count == 2
+    # CLASSIFY is bodega-vertex-4b → loaded once
+    # Total = 3 load calls
+    assert manager.bodega.load_model.await_count == 3
 
 
 @pytest.mark.asyncio
@@ -576,7 +580,7 @@ async def test_ensure_topology_loaded_dedup_status():
 
 @pytest.mark.asyncio
 async def test_ensure_topology_loaded_power_loads_three_models():
-    """power has 3 distinct models — all 3 should be loaded."""
+    """power has 3 distinct models — REASON shares bodega-raptor-8b with MID (deduped to 1 skip)."""
     manager = _make_manager()
     topo = get_topology("power")
     results = await manager.ensure_topology_loaded(topo)
@@ -584,6 +588,8 @@ async def test_ensure_topology_loaded_power_loads_three_models():
     assert manager.bodega.load_model.await_count == 3
     loaded_tiers = [k for k, v in results.items() if v["status"] == "loaded"]
     assert len(loaded_tiers) == 3
+    skipped_tiers = [k for k, v in results.items() if v["status"] == "skipped"]
+    assert len(skipped_tiers) == 1
 
 
 @pytest.mark.asyncio
@@ -645,8 +651,8 @@ async def test_ensure_topology_loaded_handles_load_error_gracefully():
     results = await manager.ensure_topology_loaded(topo)
 
     failed = [k for k, v in results.items() if v["status"] == "failed"]
-    # All 3 tiers in power should fail
-    assert len(failed) == 3
+    # All 4 tiers in power should fail (FAST, MID, REASON, CLASSIFY)
+    assert len(failed) == 4
 
 
 @pytest.mark.asyncio

@@ -11,7 +11,7 @@ exercised — we verify what tier arrived at the router boundary.
 No live infrastructure required — all HTTP is replaced by mock coroutines.
 
 Agents and their expected tiers (from Session 20B wiring):
-    QueryStrategist.strategize()            → ModelTier.FAST
+    QueryStrategist.strategize()            → ModelTier.MID
     Synthesizer.synthesize_news()           → ModelTier.MID
     Synthesizer.synthesize_search()         → ModelTier.MID
     Synthesizer._summarize_chunk()          → ModelTier.MID
@@ -87,32 +87,32 @@ def _last_tier(mock_chat_simple: AsyncMock) -> ModelTier:
 
 
 @pytest.mark.asyncio
-async def test_query_strategist_uses_fast_tier():
-    """QueryStrategist.strategize() must route to ModelTier.FAST."""
+async def test_query_strategist_uses_mid_tier():
+    """QueryStrategist.strategize() must route to ModelTier.MID."""
     from octane.agents.web.query_strategist import QueryStrategist
 
     # Return valid JSON that strategize() will parse
     valid_json = json.dumps([
         {"query": "NVDA stock price", "api": "finance", "rationale": "market data"},
     ])
-    router = _make_router(fast_response=valid_json)
+    router = _make_router(mid_response=valid_json)
 
     qs = QueryStrategist(bodega=router)
     await qs.strategize("What is NVDA stock price?")
 
     router.chat_simple.assert_awaited()
-    assert _last_tier(router.chat_simple) == ModelTier.FAST, (
-        "QueryStrategist must call chat_simple with tier=ModelTier.FAST"
+    assert _last_tier(router.chat_simple) == ModelTier.MID, (
+        "QueryStrategist must call chat_simple with tier=ModelTier.MID"
     )
 
 
 @pytest.mark.asyncio
-async def test_query_strategist_fast_tier_is_not_reason():
+async def test_query_strategist_mid_tier_is_not_reason():
     """Sanity: the QueryStrategist must NOT use REASON (that's for evaluation)."""
     from octane.agents.web.query_strategist import QueryStrategist
 
     valid_json = json.dumps([{"query": "q", "api": "search", "rationale": "r"}])
-    router = _make_router(fast_response=valid_json)
+    router = _make_router(mid_response=valid_json)
 
     qs = QueryStrategist(bodega=router)
     await qs.strategize("lookup something")
