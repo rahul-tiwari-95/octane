@@ -87,6 +87,16 @@ class BodegaInferenceClient:
             )
         return self._client
 
+    async def _reset_client(self) -> httpx.AsyncClient:
+        """Close stale client and create fresh (e.g. after broken pipe from Mac sleep)."""
+        try:
+            if self._client and not self._client.is_closed:
+                await self._client.aclose()
+        except Exception:
+            pass
+        self._client = None
+        return await self._get_client()
+
     async def close(self) -> None:
         """Close the HTTP client."""
         if self._client and not self._client.is_closed:
@@ -206,7 +216,6 @@ class BodegaInferenceClient:
             return daemon_result
 
         # Direct HTTP fall-through (daemon not running or unavailable).
-        client = await self._get_client()
         payload = {
             "model": model,
             "messages": messages,
@@ -217,7 +226,19 @@ class BodegaInferenceClient:
             "chat_template_kwargs": {"enable_thinking": False},
         }
 
-        response = await client.post("/v1/chat/completions", json=payload)
+        # Retry once on stale-connection errors (e.g. after Mac sleep)
+        for attempt in range(2):
+            client = await self._get_client()
+            try:
+                response = await client.post("/v1/chat/completions", json=payload)
+                break
+            except (BrokenPipeError, ConnectionResetError, ConnectionRefusedError,
+                    OSError, httpx.ConnectError, httpx.RemoteProtocolError) as e:
+                if attempt == 0:
+                    logger.debug("bodega_chat_retry", error=str(e))
+                    await self._reset_client()
+                    continue
+                raise
         response.raise_for_status()
         result = response.json()
 
@@ -384,13 +405,21 @@ class BodegaInferenceClient:
 
     async def health(self) -> dict[str, Any]:
         """Check server health."""
-        client = await self._get_client()
-        try:
-            response = await client.get("/health")
-            response.raise_for_status()
-            return response.json()
-        except httpx.HTTPError as e:
-            return {"status": "error", "error": str(e)}
+        for attempt in range(2):
+            client = await self._get_client()
+            try:
+                response = await client.get("/health")
+                response.raise_for_status()
+                return response.json()
+            except (BrokenPipeError, ConnectionResetError, OSError,
+                    httpx.ConnectError, httpx.RemoteProtocolError) as e:
+                if attempt == 0:
+                    await self._reset_client()
+                    continue
+                return {"status": "error", "error": str(e)}
+            except httpx.HTTPError as e:
+                return {"status": "error", "error": str(e)}
+        return {"status": "error", "error": "health check exhausted retries"}
 
     async def current_model(self) -> dict[str, Any]:
         """Get info about the currently loaded model(s).

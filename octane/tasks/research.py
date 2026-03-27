@@ -187,7 +187,65 @@ async def research_cycle(
     except Exception:
         _bodega = None
 
-    # ── 3a. Pre-cycle Bodega health check ─────────────────────────────────
+    # ── 3a. Pre-cycle Bodega health check + pause-and-poll ───────────────
+    import time as _time
+
+    async def _wait_for_bodega(reason: str = "") -> bool:
+        """Poll until Bodega is reachable, logging status to research store.
+
+        Returns True when Bodega is back, False if the task was stopped or
+        the maximum wait (2 h) was exceeded.
+        """
+        MAX_WAIT = 7200          # 2 hours
+        POLL_INTERVAL = 30       # seconds
+        STATUS_EVERY = 4         # log a status message every N polls (~2 min)
+
+        tag = f" ({reason})" if reason else ""
+        await store.log_entry(task_id, f"⏸ Bodega unavailable{tag} — polling for access…")
+        log.info("research_cycle: bodega unavailable, entering poll loop  task=%s", task_id)
+
+        start = _time.monotonic()
+        attempt = 0
+        while True:
+            # Allow clean cancellation while waiting
+            task_meta = await store.get_task(task_id)
+            if task_meta is not None and task_meta.status == "stopped":
+                await store.log_entry(task_id, "⏹ Task stopped while waiting for Bodega")
+                return False
+
+            attempt += 1
+            elapsed = _time.monotonic() - start
+            if elapsed > MAX_WAIT:
+                await store.log_entry(
+                    task_id,
+                    f"⏸ Gave up waiting for Bodega after {int(elapsed)}s — skipping cycle",
+                )
+                return False
+
+            try:
+                health = await _bodega.health()
+                if health.get("status") == "ok":
+                    await store.log_entry(
+                        task_id,
+                        f"▶ Bodega available — resuming research (waited {int(elapsed)}s)",
+                    )
+                    log.info(
+                        "research_cycle: bodega back online  task=%s waited=%ds",
+                        task_id, int(elapsed),
+                    )
+                    return True
+            except Exception:
+                pass
+
+            if attempt % STATUS_EVERY == 0:
+                mins = int(elapsed) // 60
+                await store.log_entry(
+                    task_id,
+                    f"⏸ Still waiting for Bodega… ({mins}m elapsed)",
+                )
+
+            await _asyncio.sleep(POLL_INTERVAL)
+
     bodega_available = False
     if _bodega is not None:
         try:
@@ -195,9 +253,12 @@ async def research_cycle(
             bodega_available = _health.get("status") == "ok"
         except Exception:
             bodega_available = False
+
     if not bodega_available:
-        await store.log_entry(task_id, "⚠ Bodega unavailable — cycle will use keyword fallbacks")
-        log.warning("research_cycle: bodega unavailable  task=%s cycle=%d", task_id, cycle_num)
+        bodega_available = await _wait_for_bodega("cycle start")
+        if not bodega_available:
+            await store.close()
+            return
 
     angle_gen = AngleGenerator(bodega=_bodega)
     angles = await angle_gen.generate(topic, depth=depth)
@@ -250,11 +311,20 @@ async def research_cycle(
         try:
             await store.log_entry(task_id, f"  🔎 [{label}] {q}")
             osa = Orchestrator(synapse, hil_interactive=False)
-            # Skip the per-angle Bodega health-check preflight: it blocks for up to
-            # 120 s when Bodega is busy generating a prior angle's synthesis response
-            # (local MLX models are single-threaded).  Bodega reachability was already
-            # verified when the AngleGenerator ran at cycle start.
-            osa._preflight_done = True
+            # Always attempt preflight — Bodega was confirmed up at cycle start.
+            # If it went down mid-cycle (Mac sleep), pause and poll.
+            try:
+                await _asyncio.wait_for(osa.pre_flight(), timeout=15.0)
+            except (_asyncio.TimeoutError, Exception):
+                # Bodega may have gone down mid-cycle — wait for it
+                restored = await _wait_for_bodega(f"mid-cycle, angle={label}")
+                if not restored:
+                    return ""
+                # Retry preflight after Bodega is back
+                try:
+                    await _asyncio.wait_for(osa.pre_flight(), timeout=15.0)
+                except (_asyncio.TimeoutError, Exception):
+                    osa._preflight_done = True
             parts: list[str] = []
 
             async def _collect() -> str:
@@ -324,7 +394,6 @@ async def research_cycle(
             task_id,
             f"⚠ Cycle {cycle_num} skipped — only {total_words} words "
             f"(minimum {MINIMUM_QUALITY_WORDS}).  "
-            f"{'Bodega was unavailable; ' if not bodega_available else ''}"
             f"Junk output discarded.",
         )
         log.warning(

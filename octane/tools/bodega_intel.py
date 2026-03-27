@@ -89,6 +89,35 @@ class BodegaIntelClient:
             )
         return self._client
 
+    async def _reset_client(self) -> httpx.AsyncClient:
+        """Close stale client and create a fresh one (e.g. after broken pipe)."""
+        try:
+            if self._client and not self._client.is_closed:
+                await self._client.aclose()
+        except Exception:
+            pass
+        self._client = None
+        return await self._get_client()
+
+    # Connection-reset errors that indicate a stale socket (e.g. after Mac sleep)
+    _RETRY_ERRORS = (BrokenPipeError, ConnectionResetError, ConnectionRefusedError,
+                     OSError)
+
+    async def _request(self, method: str, path: str, **kwargs) -> httpx.Response:
+        """HTTP request with one retry on stale-connection errors."""
+        for attempt in range(2):
+            client = await self._get_client()
+            try:
+                response = await getattr(client, method)(path, **kwargs)
+                return response
+            except (*self._RETRY_ERRORS, httpx.ConnectError, httpx.RemoteProtocolError) as e:
+                if attempt == 0:
+                    logger.debug("bodega_intel_retry", path=path, error=str(e))
+                    await self._reset_client()
+                    continue
+                raise
+        raise RuntimeError("unreachable")  # pragma: no cover
+
     async def close(self) -> None:
         if self._client and not self._client.is_closed:
             await self._client.aclose()
@@ -140,10 +169,9 @@ class BodegaIntelClient:
 
         Returns raw Brave search results with web, discussions, etc.
         """
-        client = await self._get_client()
         try:
-            response = await client.get(
-                "/api/v1/beru/search/web",
+            response = await self._request(
+                "get", "/api/v1/beru/search/web",
                 params={"query": query, "count": count},
             )
             response.raise_for_status()
@@ -166,10 +194,9 @@ class BodegaIntelClient:
 
         period: '1d', '3d', '7d', '1m'
         """
-        client = await self._get_client()
         try:
-            response = await client.get(
-                "/api/v1/news/api/v1/news/search",
+            response = await self._request(
+                "get", "/api/v1/news/api/v1/news/search",
                 params={
                     "q": query,
                     "period": period,
@@ -189,9 +216,8 @@ class BodegaIntelClient:
 
     async def news_headlines(self) -> dict[str, Any]:
         """Get top breaking news headlines."""
-        client = await self._get_client()
         try:
-            response = await client.get("/api/v1/news/api/v1/news/headlines")
+            response = await self._request("get", "/api/v1/news/api/v1/news/headlines")
             response.raise_for_status()
             return response.json()
         except httpx.HTTPError as e:
@@ -200,10 +226,9 @@ class BodegaIntelClient:
 
     async def news_by_topic(self, topic: str, period: str = "1d") -> dict[str, Any]:
         """Get news by topic (TECHNOLOGY, BUSINESS, SCIENCE, etc.)."""
-        client = await self._get_client()
         try:
-            response = await client.get(
-                f"/api/v1/news/api/v1/news/topics/{topic}",
+            response = await self._request(
+                "get", f"/api/v1/news/api/v1/news/topics/{topic}",
                 params={"period": period},
             )
             response.raise_for_status()
@@ -216,10 +241,9 @@ class BodegaIntelClient:
 
     async def market_data(self, ticker: str) -> dict[str, Any]:
         """Get real-time market data for a ticker (price, change, volume, etc.)."""
-        client = await self._get_client()
         try:
-            response = await client.get(
-                f"/api/v1/finance/api/v1/finance/market/{ticker.upper()}"
+            response = await self._request(
+                "get", f"/api/v1/finance/api/v1/finance/market/{ticker.upper()}",
             )
             response.raise_for_status()
             result = response.json()
@@ -236,10 +260,9 @@ class BodegaIntelClient:
         interval: str = "1d",
     ) -> dict[str, Any]:
         """Get historical OHLCV time series for a ticker."""
-        client = await self._get_client()
         try:
-            response = await client.get(
-                f"/api/v1/finance/api/v1/finance/timeseries/{ticker.upper()}",
+            response = await self._request(
+                "get", f"/api/v1/finance/api/v1/finance/timeseries/{ticker.upper()}",
                 params={"period": period, "interval": interval},
             )
             response.raise_for_status()
@@ -250,9 +273,9 @@ class BodegaIntelClient:
 
     async def finance_complete(self, ticker: str) -> dict[str, Any]:
         """Get complete financial data: market + statements + timeseries."""
-        client = await self._get_client()
         try:
-            response = await client.get(
+            response = await self._request(
+                "get",
                 f"/api/v1/finance/api/v1/finance/complete/{ticker.upper()}"
             )
             response.raise_for_status()
@@ -263,9 +286,9 @@ class BodegaIntelClient:
 
     async def finance_statements(self, ticker: str) -> dict[str, Any]:
         """Get financial statements (income, balance sheet, cash flow)."""
-        client = await self._get_client()
         try:
-            response = await client.get(
+            response = await self._request(
+                "get",
                 f"/api/v1/finance/api/v1/finance/statements/{ticker.upper()}"
             )
             response.raise_for_status()
@@ -276,9 +299,9 @@ class BodegaIntelClient:
 
     async def finance_options(self, ticker: str) -> dict[str, Any]:
         """Get options chain (calls + puts) for a ticker."""
-        client = await self._get_client()
         try:
-            response = await client.get(
+            response = await self._request(
+                "get",
                 f"/api/v1/finance/api/v1/finance/options/{ticker.upper()}"
             )
             response.raise_for_status()
@@ -291,9 +314,9 @@ class BodegaIntelClient:
 
     async def search_images(self, query: str) -> dict[str, Any]:
         """Image search via Beru/Brave."""
-        client = await self._get_client()
         try:
-            response = await client.get(
+            response = await self._request(
+                "get",
                 "/api/v1/beru/search/images",
                 params={"query": query},
             )
@@ -305,9 +328,9 @@ class BodegaIntelClient:
 
     async def search_videos(self, query: str) -> dict[str, Any]:
         """Video search via Beru/Brave."""
-        client = await self._get_client()
         try:
-            response = await client.get(
+            response = await self._request(
+                "get",
                 "/api/v1/beru/search/videos",
                 params={"query": query},
             )
@@ -319,9 +342,9 @@ class BodegaIntelClient:
 
     async def search_discussions(self, query: str) -> dict[str, Any]:
         """Forum/discussion search (Reddit, forums, etc.) via Beru/Brave."""
-        client = await self._get_client()
         try:
-            response = await client.get(
+            response = await self._request(
+                "get",
                 "/api/v1/beru/search/discussions",
                 params={"query": query},
             )
@@ -333,9 +356,9 @@ class BodegaIntelClient:
 
     async def search_products(self, query: str) -> dict[str, Any]:
         """Product/shopping search via Beru/Brave."""
-        client = await self._get_client()
         try:
-            response = await client.get(
+            response = await self._request(
+                "get",
                 "/api/v1/beru/search/products",
                 params={"query": query},
             )
@@ -347,9 +370,9 @@ class BodegaIntelClient:
 
     async def search_person(self, query: str) -> dict[str, Any]:
         """Person/biography search via Beru/Brave."""
-        client = await self._get_client()
         try:
-            response = await client.get(
+            response = await self._request(
+                "get",
                 "/api/v1/beru/search/person",
                 params={"query": query},
             )
@@ -361,9 +384,9 @@ class BodegaIntelClient:
 
     async def search_locations(self, query: str) -> dict[str, Any]:
         """Location/place search via Beru/Brave."""
-        client = await self._get_client()
         try:
-            response = await client.get(
+            response = await self._request(
+                "get",
                 "/api/v1/beru/search/locations",
                 params={"query": query},
             )
@@ -375,9 +398,9 @@ class BodegaIntelClient:
 
     async def search_combined(self, query: str, count: int = 5) -> dict[str, Any]:
         """Combined multi-type search (web + news + discussions) via Beru/Brave."""
-        client = await self._get_client()
         try:
-            response = await client.get(
+            response = await self._request(
+                "get",
                 "/api/v1/beru/search/combined",
                 params={"query": query, "count": count},
             )
@@ -391,9 +414,9 @@ class BodegaIntelClient:
 
     async def news_trending(self) -> dict[str, Any]:
         """Get trending news topics."""
-        client = await self._get_client()
         try:
-            response = await client.get("/api/v1/news/api/v1/news/trending")
+            response = await self._request(
+                "get","/api/v1/news/api/v1/news/trending")
             response.raise_for_status()
             return response.json()
         except httpx.HTTPError as e:
@@ -402,9 +425,9 @@ class BodegaIntelClient:
 
     async def news_by_location(self, location: str, period: str = "1d") -> dict[str, Any]:
         """Get news filtered by geographic location."""
-        client = await self._get_client()
         try:
-            response = await client.get(
+            response = await self._request(
+                "get",
                 f"/api/v1/news/api/v1/news/locations/{location}",
                 params={"period": period},
             )
@@ -416,9 +439,9 @@ class BodegaIntelClient:
 
     async def news_by_site(self, domain: str, period: str = "7d") -> dict[str, Any]:
         """Get news from a specific publication/domain (e.g. 'reuters.com')."""
-        client = await self._get_client()
         try:
-            response = await client.get(
+            response = await self._request(
+                "get",
                 f"/api/v1/news/api/v1/news/sites/{domain}",
                 params={"period": period},
             )
@@ -432,9 +455,9 @@ class BodegaIntelClient:
 
     async def movies_search(self, query: str) -> dict[str, Any]:
         """Search movies/TV via TMDB."""
-        client = await self._get_client()
         try:
-            response = await client.get(
+            response = await self._request(
+                "get",
                 "/api/v1/entertainment/api/v1/entertainment/movies/search",
                 params={"query": query},
             )
@@ -446,9 +469,9 @@ class BodegaIntelClient:
 
     async def movie_details(self, movie_id: int | str) -> dict[str, Any]:
         """Get detailed info for a TMDB movie by ID."""
-        client = await self._get_client()
         try:
-            response = await client.get(
+            response = await self._request(
+                "get",
                 f"/api/v1/entertainment/api/v1/entertainment/movies/{movie_id}"
             )
             response.raise_for_status()
@@ -459,9 +482,9 @@ class BodegaIntelClient:
 
     async def tv_search(self, query: str) -> dict[str, Any]:
         """Search TV shows via TMDB."""
-        client = await self._get_client()
         try:
-            response = await client.get(
+            response = await self._request(
+                "get",
                 "/api/v1/entertainment/api/v1/entertainment/tv/search",
                 params={"query": query},
             )
@@ -473,9 +496,9 @@ class BodegaIntelClient:
 
     async def movies_popular(self) -> dict[str, Any]:
         """Get currently popular movies from TMDB."""
-        client = await self._get_client()
         try:
-            response = await client.get(
+            response = await self._request(
+                "get",
                 "/api/v1/entertainment/api/v1/entertainment/movies/popular"
             )
             response.raise_for_status()
@@ -488,9 +511,9 @@ class BodegaIntelClient:
 
     async def music_search(self, query: str) -> dict[str, Any]:
         """Search music (artists, albums, songs) via YouTube Music."""
-        client = await self._get_client()
         try:
-            response = await client.get(
+            response = await self._request(
+                "get",
                 "/api/v1/music/search",
                 params={"query": query},
             )
@@ -502,9 +525,9 @@ class BodegaIntelClient:
 
     async def music_artist(self, artist_identifier: str) -> dict[str, Any]:
         """Get artist profile and discography via YouTube Music."""
-        client = await self._get_client()
         try:
-            response = await client.get(
+            response = await self._request(
+                "get",
                 f"/api/v1/music/artist/{artist_identifier}"
             )
             response.raise_for_status()
@@ -515,9 +538,9 @@ class BodegaIntelClient:
 
     async def song_lyrics(self, video_id: str) -> dict[str, Any]:
         """Get song lyrics by YouTube video ID."""
-        client = await self._get_client()
         try:
-            response = await client.get(
+            response = await self._request(
+                "get",
                 f"/api/v1/music/song/{video_id}/lyrics"
             )
             response.raise_for_status()
@@ -530,9 +553,9 @@ class BodegaIntelClient:
 
     async def health(self) -> dict[str, Any]:
         """Check consolidated server health."""
-        client = await self._get_client()
         try:
-            response = await client.get("/health")
+            response = await self._request(
+                "get","/health")
             response.raise_for_status()
             return response.json()
         except httpx.HTTPError as e:

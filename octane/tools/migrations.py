@@ -243,19 +243,39 @@ class MigrationRunner:
             "29A": _MIGRATION_29A,
         }
 
-        # Apply within a single transaction
+        # Apply within a single transaction.
+        # Incremental migrations run BEFORE baseline indexes so that columns
+        # added by migrations (e.g. broker in 29A) exist when the baseline
+        # schema tries to CREATE INDEX on them.
         try:
             async with conn.transaction():
-                # Execute baseline schema statements (idempotent IF NOT EXISTS)
+                # 1. Baseline CREATE TABLE statements (idempotent IF NOT EXISTS)
+                #    Split into table-creation vs indexes: tables first, then
+                #    incrementals, then baseline indexes.
+                table_stmts = []
+                index_stmts = []
                 for stmt in cleaned_stmts:
+                    if stmt.strip().upper().startswith("CREATE INDEX") or \
+                       stmt.strip().upper().startswith("CREATE UNIQUE INDEX"):
+                        index_stmts.append(stmt)
+                    else:
+                        table_stmts.append(stmt)
+
+                for stmt in table_stmts:
                     await conn.execute(stmt)
-                # Execute incremental migrations for pending versions that have SQL
+
+                # 2. Incremental migrations (add columns, etc.)
                 for v in pending:
                     if v in _INCREMENTAL:
                         for stmt in _split_sql(_INCREMENTAL[v]):
                             if stmt.strip():
                                 await conn.execute(stmt)
-                # Record all newly applied versions
+
+                # 3. Baseline indexes (now columns from incrementals exist)
+                for stmt in index_stmts:
+                    await conn.execute(stmt)
+
+                # 4. Record all newly applied versions
                 for v in pending:
                     await conn.execute(
                         "INSERT INTO schema_migrations (version) VALUES ($1) "

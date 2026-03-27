@@ -46,22 +46,34 @@ DEPTH_ANGLES: dict[str, int] = {
 }
 
 _ANGLE_SYSTEM = """\
-You are a financial research analyst and expert query planner.
+You are an expert research analyst and query planner.
 Given a research topic, return a JSON array of search angle objects.
 
 Each object must have:
   - "query":  a focused, specific search string (≤15 words)
-  - "angle":  one of: earnings, market, sentiment, macro, risk, technical, \
-regulatory, competitive, product, insider
+  - "angle":  a short label for the perspective (1-2 words, e.g. "science", \
+"history", "risks", "economics", "technology", "debate")
 
 Rules:
 - Each angle must be meaningfully different — different perspective, not synonyms.
+- Match angles to the DOMAIN of the topic:
+  * Science/space topics → use angles like: physics, engineering, biology, history, debate
+  * Finance topics → use angles like: earnings, market, sentiment, risk, macro
+  * Technology topics → use angles like: architecture, benchmarks, adoption, alternatives
+  * Health topics → use angles like: research, treatment, prevention, statistics
 - Prefer recent, time-bounded queries (include year when relevant).
-- For financial topics always include at least: earnings, market, sentiment.
 - Avoid generic phrases like "latest news about X".
 - Return ONLY valid JSON array. No prose, no markdown fences.
 
-Example output for topic "NVDA earnings outlook":
+Example for topic "Van Allen belt radiation":
+[
+  {"query": "Van Allen radiation belt intensity shielding requirements spacecraft", "angle": "physics"},
+  {"query": "Apollo missions Van Allen belt radiation exposure astronaut dose", "angle": "history"},
+  {"query": "deep space radiation protection technology 2025", "angle": "engineering"},
+  {"query": "interstellar travel radiation barrier feasibility research", "angle": "feasibility"}
+]
+
+Example for topic "NVDA earnings outlook":
 [
   {"query": "NVIDIA Q4 2025 earnings revenue beat miss", "angle": "earnings"},
   {"query": "NVIDIA AI chip demand data center 2025", "angle": "market"},
@@ -123,17 +135,75 @@ class AngleGenerator:
         return _parse_angles(raw)
 
     def _keyword_angles(self, topic: str, n: int) -> list[dict[str, str]]:
-        """Deterministic fallback — expands topic with angle suffixes."""
-        suffixes = [
-            ("earnings revenue outlook {topic}", "earnings"),
-            ("{topic} market analysis 2025", "market"),
-            ("{topic} analyst sentiment forecast", "sentiment"),
-            ("{topic} risk concerns regulatory", "risk"),
-            ("{topic} competitive landscape rivals", "competitive"),
-            ("{topic} product roadmap innovation", "product"),
-            ("{topic} macro economic impact", "macro"),
-            ("{topic} technical analysis price trend", "technical"),
-        ]
+        """Deterministic fallback — expands topic with domain-aware suffixes."""
+        # Detect topic domain via simple keyword heuristics
+        topic_lower = topic.lower()
+        _FINANCE_HINTS = {
+            "stock", "earnings", "revenue", "market", "price", "ticker",
+            "portfolio", "dividend", "valuation", "analyst", "quarterly",
+            "nasdaq", "s&p", "dow", "ipo", "etf", "bond", "forex", "crypto",
+        }
+        _SCIENCE_HINTS = {
+            "radiation", "space", "physics", "biology", "chemistry", "quantum",
+            "planet", "star", "orbit", "dna", "genome", "evolution", "climate",
+            "earth", "solar", "galaxy", "interstellar", "telescope", "particle",
+            "energy", "atom", "molecule", "vaccine", "disease", "asteroid",
+            "gravity", "magnetic", "belt", "cosmos", "universe",
+        }
+        _TECH_HINTS = {
+            "software", "algorithm", "ai", "machine learning", "neural",
+            "database", "cloud", "api", "programming", "framework",
+            "kubernetes", "docker", "llm", "model", "gpu", "cpu",
+        }
+
+        topic_words = set(topic_lower.split())
+
+        if topic_words & _SCIENCE_HINTS:
+            suffixes = [
+                ("{topic} scientific research findings", "research"),
+                ("{topic} physics mechanism explained", "physics"),
+                ("{topic} history discoveries timeline", "history"),
+                ("{topic} current challenges barriers", "challenges"),
+                ("{topic} engineering solutions technology", "engineering"),
+                ("{topic} debate controversy perspectives", "debate"),
+                ("{topic} future prospects feasibility", "feasibility"),
+                ("{topic} safety risks human impact", "safety"),
+            ]
+        elif topic_words & _TECH_HINTS:
+            suffixes = [
+                ("{topic} architecture design overview", "architecture"),
+                ("{topic} benchmark performance comparison", "benchmarks"),
+                ("{topic} adoption use cases 2025", "adoption"),
+                ("{topic} alternatives competitors", "alternatives"),
+                ("{topic} limitations drawbacks concerns", "limitations"),
+                ("{topic} roadmap future development", "roadmap"),
+                ("{topic} security vulnerabilities risks", "security"),
+                ("{topic} best practices recommendations", "practices"),
+            ]
+        elif topic_words & _FINANCE_HINTS:
+            suffixes = [
+                ("earnings revenue outlook {topic}", "earnings"),
+                ("{topic} market analysis 2025", "market"),
+                ("{topic} analyst sentiment forecast", "sentiment"),
+                ("{topic} risk concerns regulatory", "risk"),
+                ("{topic} competitive landscape rivals", "competitive"),
+                ("{topic} product roadmap innovation", "product"),
+                ("{topic} macro economic impact", "macro"),
+                ("{topic} technical analysis price trend", "technical"),
+            ]
+        else:
+            # General-purpose angles
+            suffixes = [
+                ("{topic} overview explanation", "overview"),
+                ("{topic} recent developments 2025", "recent"),
+                ("{topic} analysis perspectives", "analysis"),
+                ("{topic} challenges problems", "challenges"),
+                ("{topic} future outlook predictions", "outlook"),
+                ("{topic} expert opinions debate", "debate"),
+                ("{topic} impact implications", "impact"),
+                ("{topic} history background context", "history"),
+            ]
+
         result = []
         for tmpl, angle in suffixes[:n]:
             q = tmpl.replace("{topic}", topic)

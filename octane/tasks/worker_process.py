@@ -61,9 +61,35 @@ def read_pid() -> int | None:
         return None
 
 
+def _patch_shadow_busygroup() -> None:
+    """Monkey-patch Shadow.__aenter__ to tolerate BUSYGROUP on redis-py >=5.x.
+
+    redis-py 5.x changed repr(ResponseError) to omit the message text, so
+    Shadows' ``"BUSYGROUP" not in repr(e)`` check always re-raises.
+    """
+    try:
+        import redis.exceptions
+        from shadows import Shadow
+
+        _original_aenter = Shadow.__aenter__
+
+        async def _fixed_aenter(self):
+            try:
+                return await _original_aenter(self)
+            except redis.exceptions.RedisError as e:
+                if "BUSYGROUP" in str(e):
+                    return self
+                raise
+
+        Shadow.__aenter__ = _fixed_aenter
+    except ImportError:
+        pass
+
+
 async def _run(shadows_name: str, redis_url: str) -> None:
     from shadows import Shadow, Worker
 
+    _patch_shadow_busygroup()
     _write_pid()
     logger.info("Octane Worker starting (PID=%d)", os.getpid())
 

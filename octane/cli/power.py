@@ -9,7 +9,7 @@ from rich.panel import Panel
 from rich.rule import Rule
 from rich.table import Table
 
-from octane.cli._shared import console
+from octane.cli._shared import console, PowerFlags, parse_deep_flag, parse_sources_flag
 
 
 def register(app: typer.Typer) -> None:
@@ -29,20 +29,43 @@ def investigate(
         max=8,
     ),
     stream: bool = typer.Option(True, "--stream/--no-stream", help="Stream findings as they arrive."),
+    deep: str = typer.Option(
+        None,
+        "--deep",
+        help="Deep mode with N dimensions (e.g. --deep 12). Default: 8 if flag present.",
+    ),
+    sources: str = typer.Option(
+        None,
+        "--sources",
+        "-s",
+        help="Comma-separated source types: arxiv,youtube,web (default: web).",
+    ),
+    cite: bool = typer.Option(False, "--cite", help="Include inline citations and a Sources section."),
+    verify: bool = typer.Option(False, "--verify", help="Add trust-level labels (CONFIRMED/LIKELY/UNVERIFIED)."),
 ):
     """🔍 Investigate a topic across multiple independent research dimensions.
 
     Decomposes your query into parallel research threads, runs each through
-    the full web + memory agent stack, then synthesizes a structured report.
+    the full web + extractor agent stack, then synthesizes a structured report.
 
     Examples:
         octane investigate "impact of tariffs on semiconductor supply chains"
         octane investigate "longevity interventions" --max-dimensions 6
+        octane investigate "attention mechanisms" --deep 12 --sources arxiv,youtube --cite
+        octane investigate "NVDA earnings outlook" --verify --cite
     """
-    asyncio.run(_investigate(query, max_dimensions, stream))
+    flags = PowerFlags(
+        deep=parse_deep_flag(deep),
+        sources=parse_sources_flag(sources),
+        cite=cite,
+        verify=verify,
+    )
+    # --deep overrides --max-dimensions if both set
+    effective_max = flags.max_dimensions or max_dimensions
+    asyncio.run(_investigate(query, effective_max, stream, flags))
 
 
-async def _investigate(query: str, max_dimensions: int | None, stream: bool):
+async def _investigate(query: str, max_dimensions: int | None, stream: bool, flags: PowerFlags):
     from rich.markdown import Markdown
     from rich.progress import BarColumn, Progress, SpinnerColumn, TextColumn
     from octane.osa.investigate import InvestigateOrchestrator
@@ -53,16 +76,29 @@ async def _investigate(query: str, max_dimensions: int | None, stream: bool):
     web_agent = WebAgent(synapse)
     orchestrator = InvestigateOrchestrator(web_agent=web_agent)
 
+    # Build title with flags
+    flag_tags = []
+    if flags.deep is not None:
+        flag_tags.append(f"deep:{flags.deep}")
+    if flags.has_extractors:
+        flag_tags.append(f"sources={','.join(flags.sources)}")
+    if flags.cite:
+        flag_tags.append("cite")
+    if flags.verify:
+        flag_tags.append("verify")
+    tag_str = f"  [dim]({' · '.join(flag_tags)})[/]" if flag_tags else ""
+
     console.print(
         Panel(
-            f"[bold white]{query}[/]",
+            f"[bold white]{query}[/]{tag_str}",
             title="[bold cyan]🔍 Investigating[/]",
             border_style="cyan",
         )
     )
+    source_desc = f"sources={','.join(flags.sources)}" if flags.has_extractors else "Web research"
     console.print(
-        "[dim]⚙  Planning dimensions (~5s) · Web research in parallel · "
-        "Synthesis via 8B model[/]"
+        f"[dim]⚙  Planning dimensions (~5s) · {source_desc} in parallel · "
+        f"Synthesis via 8B model[/]"
     )
     kwargs: dict = {}
     if max_dimensions is not None:
@@ -83,7 +119,13 @@ async def _investigate(query: str, max_dimensions: int | None, stream: bool):
         plan_task = progress.add_task("[cyan]Planning dimensions (8B)…[/]", total=None)
         research_task = None
 
-        async for event in orchestrator.run_stream(query, **kwargs):
+        async for event in orchestrator.run_stream(
+            query,
+            source_types=flags.sources if flags.has_extractors else None,
+            cite=flags.cite,
+            verify=flags.verify,
+            **kwargs,
+        ):
             etype = event.get("type")
 
             if etype == "plan":
@@ -142,6 +184,14 @@ async def _investigate(query: str, max_dimensions: int | None, stream: bool):
 def compare(
     query: str = typer.Argument(..., help="The comparison query, e.g. 'NVDA vs AMD vs INTC'."),
     stream: bool = typer.Option(True, "--stream/--no-stream", help="Stream cells as they complete."),
+    sources: str = typer.Option(
+        None,
+        "--sources",
+        "-s",
+        help="Comma-separated source types: arxiv,youtube,web (default: web).",
+    ),
+    cite: bool = typer.Option(False, "--cite", help="Include inline citations."),
+    verify: bool = typer.Option(False, "--verify", help="Add trust-level labels."),
 ):
     """⚖️  Compare items across multiple dimensions in a structured matrix.
 
@@ -152,12 +202,17 @@ def compare(
     Examples:
         octane compare "NVDA vs AMD vs INTC"
         octane compare "compare React, Vue, and Svelte for a startup"
-        octane compare "Python or Go for a backend API service"
+        octane compare "Python or Go for a backend API service" --cite
     """
-    asyncio.run(_compare(query, stream))
+    flags = PowerFlags(
+        sources=parse_sources_flag(sources),
+        cite=cite,
+        verify=verify,
+    )
+    asyncio.run(_compare(query, stream, flags))
 
 
-async def _compare(query: str, stream: bool):
+async def _compare(query: str, stream: bool, flags: PowerFlags):
     from rich.markdown import Markdown
     from rich.progress import BarColumn, Progress, SpinnerColumn, TextColumn
     from octane.osa.compare import CompareOrchestrator

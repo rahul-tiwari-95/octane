@@ -26,9 +26,11 @@ def extract_run(
     quality: str = typer.Option("auto", help="Extraction quality: fast, deep, or auto."),
     source_type: str | None = typer.Option(None, "--type", help="Override source type: youtube, arxiv, pdf, epub."),
     show_chunks: bool = typer.Option(False, "--chunks", help="Display individual chunks."),
+    output: str | None = typer.Option(None, "--output", "-o", help="Save full text to file (default: ~/.octane/extracts/<title>.md)."),
+    open_folder: bool = typer.Option(False, "--open", help="Open the output folder in Finder after saving."),
 ):
     """Extract content from a source and display results."""
-    asyncio.run(_extract_run(source, quality, source_type, show_chunks))
+    asyncio.run(_extract_run(source, quality, source_type, show_chunks, output, open_folder))
 
 
 @extract_app.command("search-youtube")
@@ -83,7 +85,34 @@ def search_arxiv_cmd(
     console.print(table)
 
 
-async def _extract_run(source: str, quality: str, source_type_str: str | None, show_chunks: bool):
+@extract_app.command("youtube-login")
+def youtube_login_cmd():
+    """🔑 Log in to YouTube — saves cookies for authenticated transcript extraction.
+
+    Opens a browser window. Log in to your Google account, then press Enter.
+    Future transcript fetches will use your session — no more IP blocks.
+    """
+    asyncio.run(_youtube_login())
+
+
+async def _youtube_login():
+    from octane.extractors.youtube.transcript import youtube_login, _YOUTUBE_COOKIE_FILE
+
+    if _YOUTUBE_COOKIE_FILE.exists():
+        console.print("[yellow]⚠  Existing YouTube cookies found. This will overwrite them.[/]")
+
+    success = await youtube_login()
+    if not success:
+        console.print("[red]❌  YouTube login failed. Is Playwright installed?[/]")
+        console.print("[dim]Run: playwright install chromium[/]")
+        raise typer.Exit(1)
+
+
+async def _extract_run(source: str, quality: str, source_type_str: str | None, show_chunks: bool,
+                       output: str | None = None, open_folder: bool = False):
+    import re as _re
+    import subprocess
+    from pathlib import Path
     from rich.markdown import Markdown
     from rich.panel import Panel
     from octane.extractors.pipeline import extract, detect_source_type
@@ -142,3 +171,37 @@ async def _extract_run(source: str, quality: str, source_type_str: str | None, s
             console.print(f"  [dim]#{chunk.index}{ts}{ch}[/] {chunk.text[:100]}...")
         if len(doc.chunks) > 10:
             console.print(f"  [dim]... and {len(doc.chunks) - 10} more chunks[/]")
+
+    # Save full text to file
+    if output or open_folder:
+        extract_dir = Path.home() / ".octane" / "extracts"
+        extract_dir.mkdir(parents=True, exist_ok=True)
+
+        if output:
+            out_path = Path(output)
+        else:
+            # Sanitise title for filename
+            safe = _re.sub(r'[^\w\s-]', '', doc.title or 'untitled')[:80].strip()
+            safe = _re.sub(r'\s+', '_', safe)
+            out_path = extract_dir / f"{safe}.md"
+
+        # Build markdown content
+        lines = [
+            f"# {doc.title}",
+            f"",
+            f"**Author:** {doc.author}",
+            f"**Source:** {doc.source_type.value}  ",
+            f"**Method:** {doc.extraction_method}  ",
+            f"**Words:** {doc.total_words:,}  ",
+            f"**Reliability:** {doc.reliability_score:.2f}  ",
+            f"",
+            f"---",
+            f"",
+        ]
+        if doc.raw_text:
+            lines.append(doc.raw_text)
+        out_path.write_text("\n".join(lines), encoding="utf-8")
+        console.print(f"\n[green]💾 Saved to:[/] {out_path}")
+
+        if open_folder:
+            subprocess.Popen(["open", "-R", str(out_path)])

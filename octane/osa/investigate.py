@@ -38,6 +38,8 @@ from typing import Any
 
 import structlog
 
+import re
+
 from octane.osa.dimension_planner import DimensionPlan, DimensionPlanner, ResearchDimension
 from octane.models.schemas import AgentRequest, AgentResponse
 from octane.tools.topology import ModelTier
@@ -61,11 +63,13 @@ class DimensionFinding:
     """Research result for one dimension.
 
     Attributes:
-        dimension:    The ResearchDimension this finding covers.
-        content:      The raw research text from Web + Memory agents.
-        agent_used:   Which agent produced this (web, memory, fallback).
-        latency_ms:   Time taken to research this dimension.
-        error:        Non-empty if the research failed.
+        dimension:         The ResearchDimension this finding covers.
+        content:           The raw research text from Web + Memory + extractor agents.
+        agent_used:        Which agent produced this (web, memory, extractor, fallback).
+        latency_ms:        Time taken to research this dimension.
+        error:             Non-empty if the research failed.
+        reliability_score: Weighted trust score for this finding (0.0-1.0).
+        sources:           Source URLs/IDs used for this finding.
     """
 
     dimension: ResearchDimension
@@ -73,6 +77,8 @@ class DimensionFinding:
     agent_used: str = "web"
     latency_ms: float = 0.0
     error: str = ""
+    reliability_score: float = 0.5
+    sources: list[str] = field(default_factory=list)
 
     @property
     def success(self) -> bool:
@@ -86,6 +92,8 @@ class DimensionFinding:
             "agent_used": self.agent_used,
             "latency_ms": round(self.latency_ms, 1),
             "success": self.success,
+            "reliability_score": round(self.reliability_score, 3),
+            "sources": self.sources,
         }
 
 
@@ -156,6 +164,41 @@ Research findings per dimension:
 Synthesize into a structured report.
 """
 
+# ── Optional Synthesis Addons ─────────────────────────────────────────────────
+
+_CITATION_INSTRUCTIONS = """
+
+CITATION MODE (--cite): Include inline citations for key claims.
+- After each major claim, add a source reference: [Source: <url_or_title>]
+- At the end of the report, add a ## Sources section listing all references.
+- Prefer arXiv paper titles and YouTube video titles over raw URLs.
+"""
+
+_VERIFICATION_INSTRUCTIONS = """
+
+VERIFICATION MODE (--verify): Add trust-level annotations.
+- Prefix each section with a trust label: **[CONFIRMED]**, **[LIKELY]**, or **[UNVERIFIED]**
+- CONFIRMED: Multiple high-reliability sources agree (arXiv papers, peer-reviewed)
+- LIKELY: Single reliable source or multiple web sources corroborate
+- UNVERIFIED: Based on single web source or low-reliability data
+- In the Overall Assessment, note which findings have the strongest evidence.
+"""
+
+
+# ── Helpers ───────────────────────────────────────────────────────────────
+
+_CONTROL_TOKEN_RE = re.compile(
+    r"<\|(?:im_end|im_start|endoftext|end|eot_id|pad|unk)\|>",
+    re.IGNORECASE,
+)
+
+
+def _clean_llm_output(text: str) -> str:
+    """Strip <think> blocks and leaked model control tokens."""
+    text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
+    text = _CONTROL_TOKEN_RE.sub("", text)
+    return text.strip()
+
 
 # ── InvestigateOrchestrator ───────────────────────────────────────────────────
 
@@ -190,6 +233,9 @@ class InvestigateOrchestrator:
         query: str,
         max_dimensions: int | None = None,
         session_id: str = "cli",
+        source_types: list[str] | None = None,
+        cite: bool = False,
+        verify: bool = False,
     ) -> AsyncIterator[dict[str, Any]]:
         """Run an investigation and yield progress events.
 
@@ -200,6 +246,9 @@ class InvestigateOrchestrator:
             query:          The investigation query.
             max_dimensions: Override DimensionPlanner default.
             session_id:     For tracing.
+            source_types:   Override source types (e.g. ["arxiv", "youtube"]).
+            cite:           If True, include source citations in synthesis.
+            verify:         If True, add trust-level labels to synthesis.
 
         Yields:
             Progress event dicts (see module docstring for schema).
@@ -207,7 +256,11 @@ class InvestigateOrchestrator:
         t0 = time.monotonic()
 
         # ── Phase 1: Plan ──────────────────────────────────────────────────
-        plan = await self._planner.plan(query, max_dimensions=max_dimensions)
+        plan = await self._planner.plan(
+            query,
+            max_dimensions=max_dimensions,
+            source_types=source_types,
+        )
         yield {"type": "plan", "data": plan.to_dict()}
 
         # ── Phase 2: Parallel research (bounded concurrency) ───────────────
@@ -239,7 +292,7 @@ class InvestigateOrchestrator:
         if not successful:
             report = f"Investigation could not retrieve data for any dimension of: {query}"
         else:
-            report = await self._synthesize(query, successful)
+            report = await self._synthesize(query, successful, cite=cite, verify=verify)
 
         word_count = len(report.split())
         total_ms = (time.monotonic() - t0) * 1000
@@ -268,6 +321,9 @@ class InvestigateOrchestrator:
         query: str,
         max_dimensions: int | None = None,
         session_id: str = "cli",
+        source_types: list[str] | None = None,
+        cite: bool = False,
+        verify: bool = False,
     ) -> InvestigationResult:
         """Run investigation and return a complete InvestigationResult.
 
@@ -280,7 +336,12 @@ class InvestigateOrchestrator:
         word_count = 0
 
         async for event in self.run_stream(
-            query, max_dimensions=max_dimensions, session_id=session_id
+            query,
+            max_dimensions=max_dimensions,
+            session_id=session_id,
+            source_types=source_types,
+            cite=cite,
+            verify=verify,
         ):
             if event["type"] == "plan":
                 from octane.osa.dimension_planner import DimensionPlan
@@ -292,6 +353,7 @@ class InvestigateOrchestrator:
                         queries=dim["queries"],
                         priority=dim["priority"],
                         rationale=dim.get("rationale", ""),
+                        source_types=dim.get("source_types", ["web"]),
                     )
                     for dim in d.get("dimensions", [])
                 ]
@@ -337,15 +399,49 @@ class InvestigateOrchestrator:
         dimension: ResearchDimension,
         session_id: str,
     ) -> DimensionFinding:
-        """Research a single dimension using Web + optional Memory agents."""
+        """Research a single dimension using Web + extractors + optional Memory agents."""
         t0 = time.monotonic()
 
         # Use the dimension's primary query for web research
         research_query = dimension.primary_query()
-        content = ""
+        content_parts: list[str] = []
+        agents_used: list[str] = []
+        sources: list[str] = []
+        reliability_scores: list[float] = []
+
+        # ── Extractor sources (arxiv, youtube) ─────────────────────────────
+        extractor_types = [
+            st for st in dimension.source_types
+            if st in ("arxiv", "youtube")
+        ]
+        if extractor_types:
+            try:
+                from octane.extractors.pipeline import search_and_extract
+                docs = await search_and_extract(
+                    research_query,
+                    source_types=extractor_types,
+                    max_results=2,
+                )
+                for doc in docs:
+                    # Use first 2000 chars of raw_text as a concise summary
+                    text = doc.raw_text[:2000] if doc.raw_text else ""
+                    if text:
+                        source_label = f"[{doc.source_type.value}: {doc.title}]"
+                        content_parts.append(f"{source_label}\n{text}")
+                        agents_used.append(f"extractor:{doc.source_type.value}")
+                        sources.append(doc.source_url)
+                        reliability_scores.append(doc.reliability_score)
+            except Exception as exc:
+                logger.warning(
+                    "investigate_extractor_failed",
+                    dimension=dimension.id,
+                    source_types=extractor_types,
+                    error=str(exc),
+                )
 
         # ── Web research ───────────────────────────────────────────────────
-        if self._web_agent is not None:
+        has_web = "web" in dimension.source_types
+        if has_web and self._web_agent is not None:
             try:
                 request = AgentRequest(
                     query=research_query,
@@ -355,15 +451,23 @@ class InvestigateOrchestrator:
                 )
                 response: AgentResponse = await self._web_agent.execute(request)
                 if response.success and response.output:
-                    content = response.output
+                    content_parts.append(response.output)
+                    agents_used.append("web")
+                    reliability_scores.append(0.4)  # web baseline
                 elif response.data:
-                    content = str(response.data.get("summary", ""))
+                    summary = str(response.data.get("summary", ""))
+                    if summary:
+                        content_parts.append(summary)
+                        agents_used.append("web")
+                        reliability_scores.append(0.4)
             except Exception as exc:
                 logger.warning(
                     "investigate_web_failed",
                     dimension=dimension.id,
                     error=str(exc),
                 )
+
+        content = "\n\n".join(content_parts)
 
         # ── Memory augmentation ────────────────────────────────────────────
         if self._memory_agent is not None and content:
@@ -380,8 +484,13 @@ class InvestigateOrchestrator:
             except Exception as exc:
                 logger.debug("investigate_memory_failed", dimension=dimension.id, error=str(exc))
 
-        # ── Fallback: if no agent available, return empty finding ──────────
-        agent_used = "web" if self._web_agent else "fallback"
+        # ── Compute aggregate reliability ──────────────────────────────────
+        if reliability_scores:
+            avg_reliability = sum(reliability_scores) / len(reliability_scores)
+        else:
+            avg_reliability = 0.5
+
+        agent_label = "+".join(agents_used) if agents_used else "fallback"
         latency_ms = (time.monotonic() - t0) * 1000
 
         logger.info(
@@ -389,19 +498,25 @@ class InvestigateOrchestrator:
             dimension=dimension.id,
             content_len=len(content),
             latency_ms=round(latency_ms, 1),
+            agents=agent_label,
+            n_sources=len(sources),
         )
 
         return DimensionFinding(
             dimension=dimension,
             content=content,
-            agent_used=agent_used,
+            agent_used=agent_label,
             latency_ms=latency_ms,
+            reliability_score=avg_reliability,
+            sources=sources,
         )
 
     async def _synthesize(
         self,
         query: str,
         findings: list[DimensionFinding],
+        cite: bool = False,
+        verify: bool = False,
     ) -> str:
         """Synthesize all findings into a structured report using REASON tier."""
         if not self._bodega:
@@ -409,10 +524,26 @@ class InvestigateOrchestrator:
             parts = [f"## {f.dimension.label}\n\n{f.content}" for f in findings]
             return f"# Investigation: {query}\n\n" + "\n\n".join(parts)
 
-        # Build the findings text
-        findings_text = "\n\n".join(
-            f"### {f.dimension.label}\n{f.content}" for f in findings
-        )
+        # Build the findings text with source annotations
+        findings_parts = []
+        for f in findings:
+            header = f"### {f.dimension.label}"
+            if cite and f.sources:
+                source_list = ", ".join(f.sources[:5])
+                header += f" [Sources: {source_list}]"
+            if verify:
+                trust = "HIGH" if f.reliability_score >= 0.8 else "MEDIUM" if f.reliability_score >= 0.5 else "LOW"
+                header += f" [Trust: {trust} ({f.reliability_score:.2f})]"
+            findings_parts.append(f"{header}\n{f.content}")
+
+        findings_text = "\n\n".join(findings_parts)
+
+        # Build synthesis system prompt with optional cite/verify instructions
+        system = _INVESTIGATE_SYNTHESIS_SYSTEM
+        if cite:
+            system += _CITATION_INSTRUCTIONS
+        if verify:
+            system += _VERIFICATION_INSTRUCTIONS
 
         user_prompt = _INVESTIGATE_SYNTHESIS_USER.format(
             query=query,
@@ -422,28 +553,25 @@ class InvestigateOrchestrator:
         try:
             report = await self._bodega.chat_simple(
                 user_prompt,
-                system=_INVESTIGATE_SYNTHESIS_SYSTEM,
+                system=system,
                 tier=ModelTier.REASON,
                 max_tokens=3000,
                 temperature=0.1,
             )
-            # Strip <think> blocks
-            import re
-            report = re.sub(r"<think>.*?</think>", "", report, flags=re.DOTALL).strip()
+            report = _clean_llm_output(report)
             return report
         except Exception as exc:
             logger.warning("investigate_synthesis_reason_failed", error=str(exc))
             # Fallback: try MID tier (lightweight loaded model)
             try:
-                import re
                 report = await self._bodega.chat_simple(
                     user_prompt,
-                    system=_INVESTIGATE_SYNTHESIS_SYSTEM,
+                    system=system,
                     tier=ModelTier.MID,
                     max_tokens=3000,
                     temperature=0.1,
                 )
-                return re.sub(r"<think>.*?</think>", "", report, flags=re.DOTALL).strip()
+                return _clean_llm_output(report)
             except Exception as exc2:
                 logger.warning("investigate_synthesis_mid_failed", error=str(exc2))
                 # Last resort: concatenate findings

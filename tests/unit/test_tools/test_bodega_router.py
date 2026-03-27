@@ -21,6 +21,8 @@ Covers:
 
 from __future__ import annotations
 
+import time
+
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -33,7 +35,7 @@ from octane.tools.topology import (
     detect_topology,
     get_topology,
 )
-from octane.tools.bodega_router import BodegaRouter
+from octane.tools.bodega_router import BodegaRouter, LoadedModel
 from octane.agents.sysstat.model_manager import ModelManager
 
 
@@ -469,7 +471,11 @@ async def test_router_chat_passes_model_id_to_client():
     # Pre-populate loaded model cache so we don't hit real Bodega in unit tests.
     # The topology model_id is the canonical short alias used when Bodega loads
     # models with an explicit model_id param.  Direct-match path is tested here.
-    router._loaded_models = {"bodega-raptor-90M": "lm", "bodega-raptor-8b": "lm"}
+    router._loaded_models = {
+        "bodega-raptor-90M": LoadedModel(model_id="bodega-raptor-90M", model_type="lm", context_length=4096),
+        "bodega-raptor-8b": LoadedModel(model_id="bodega-raptor-8b", model_type="lm", context_length=32768),
+    }
+    router._loaded_models_ts = time.monotonic()
     expected_model = "bodega-raptor-90M"
 
     mock_response = {
@@ -489,7 +495,10 @@ async def test_router_chat_passes_model_id_to_client():
 async def test_router_chat_simple_returns_text():
     router = _make_router("balanced")
     # Pre-populate loaded model cache — avoids network call to Bodega
-    router._loaded_models = {"bodega-raptor-90M": "lm"}
+    router._loaded_models = {
+        "bodega-raptor-90M": LoadedModel(model_id="bodega-raptor-90M", model_type="lm", context_length=4096),
+    }
+    router._loaded_models_ts = time.monotonic()
     mock_response = {"choices": [{"message": {"content": "NVDA"}}], "usage": {}}
     router._client.chat = AsyncMock(return_value=mock_response)
 
@@ -501,7 +510,11 @@ async def test_router_chat_simple_returns_text():
 async def test_router_chat_simple_uses_reason_tier_by_default():
     router = _make_router("balanced")
     # Pre-populate loaded model cache — avoids network call to Bodega
-    router._loaded_models = {"bodega-raptor-90M": "lm", "bodega-raptor-8b": "lm"}
+    router._loaded_models = {
+        "bodega-raptor-90M": LoadedModel(model_id="bodega-raptor-90M", model_type="lm", context_length=4096),
+        "bodega-raptor-8b": LoadedModel(model_id="bodega-raptor-8b", model_type="lm", context_length=32768),
+    }
+    router._loaded_models_ts = time.monotonic()
     mock_response = {"choices": [{"message": {"content": "ok"}}], "usage": {}}
     router._client.chat = AsyncMock(return_value=mock_response)
 

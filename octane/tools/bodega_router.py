@@ -39,7 +39,9 @@ from __future__ import annotations
 import asyncio
 import json
 import sys
+import time
 from collections.abc import AsyncIterator
+from dataclasses import dataclass
 from typing import Any
 
 import httpx
@@ -51,12 +53,32 @@ from octane.tools.topology import ModelConfig, ModelTier, Topology, get_topology
 logger = structlog.get_logger().bind(component="bodega_router")
 
 
+# ── Loaded model info ─────────────────────────────────────────────────────────
+
+@dataclass
+class LoadedModel:
+    """Runtime info about a model loaded in Bodega."""
+    model_id: str
+    model_type: str          # "lm" or "multimodal"
+    context_length: int      # max context window
+    status: str = "running"
+    memory_mb: float = 0.0   # total memory usage
+
+
+# How long to cache the loaded-models list before re-querying.
+_MODEL_CACHE_TTL_S = 60.0
+
+
 class BodegaRouter:
     """Tier-aware routing wrapper around :class:`BodegaInferenceClient`.
 
     Dynamically queries Bodega for loaded models and falls back gracefully
     if the preferred tier model isn't available.  Can auto-load models on
     demand and waits for the Bodega server to come online if it is offline.
+
+    Model discovery uses ``/v1/admin/loaded-models`` with a TTL cache
+    (default 60 s) so that runtime model swaps (load/unload via external
+    scripts) are detected without manual intervention.
 
     Args:
         topology: Topology name (``'auto'``, ``'compact'``, ``'balanced'``,
@@ -77,8 +99,9 @@ class BodegaRouter:
         self._topology: Topology = (
             topology if isinstance(topology, Topology) else get_topology(topology)
         )
-        # Cache of loaded models: {model_id: model_type}
-        self._loaded_models: dict[str, str] | None = None
+        # Cache — {model_id: LoadedModel}.  Invalidated on TTL expiry or manual call.
+        self._loaded_models: dict[str, LoadedModel] | None = None
+        self._loaded_models_ts: float = 0.0  # monotonic timestamp of last fetch
         logger.debug("bodega_router_init", topology=self._topology.name)
 
     # ── Server health & wait ──────────────────────────────────────────────────
@@ -134,49 +157,90 @@ class BodegaRouter:
 
     # ── Dynamic model discovery ───────────────────────────────────────────────
 
-    async def _fetch_loaded_models(self, *, wait_if_down: bool = False) -> dict[str, str]:
-        """Fetch currently loaded models from Bodega. Cached per instance.
+    def _cache_is_valid(self) -> bool:
+        """Return True if cached model list is still within TTL."""
+        if self._loaded_models is None:
+            return False
+        return (time.monotonic() - self._loaded_models_ts) < _MODEL_CACHE_TTL_S
+
+    async def _fetch_loaded_models(self, *, wait_if_down: bool = False) -> dict[str, LoadedModel]:
+        """Fetch currently loaded models from ``/v1/admin/loaded-models``.
+
+        Uses a TTL cache (default 60 s) so runtime model swaps are detected
+        automatically without manual invalidation.
 
         Args:
             wait_if_down: If True and Bodega is unreachable, call
                           wait_for_server() before giving up.
         """
-        if self._loaded_models is not None:
-            return self._loaded_models
+        if self._cache_is_valid():
+            return self._loaded_models  # type: ignore[return-value]
+
+        async def _do_fetch() -> dict[str, LoadedModel]:
+            client = await self._client._get_client()
+            response = await client.get("/v1/admin/loaded-models")
+            response.raise_for_status()
+            data = response.json()
+            models = data.get("data", [])
+            result: dict[str, LoadedModel] = {}
+            for m in models:
+                if m.get("status") != "running":
+                    continue
+                mem = m.get("memory", {})
+                result[m["id"]] = LoadedModel(
+                    model_id=m["id"],
+                    model_type=m.get("type", "lm"),
+                    context_length=m.get("context_length", 4096),
+                    status=m.get("status", "running"),
+                    memory_mb=mem.get("total_mb", 0.0),
+                )
+            return result
 
         try:
-            resp = await self._client.health()
-            if resp.get("status") != "ok" and wait_if_down:
-                await self.wait_for_server()
-                resp = await self._client.health()
-            models_detail = resp.get("models_detail", [])
-            self._loaded_models = {
-                m["id"]: m.get("type", "lm")
-                for m in models_detail
-                if m.get("status") == "running"
-            }
-            logger.debug("bodega_models_discovered", models=list(self._loaded_models.keys()))
+            self._loaded_models = await _do_fetch()
+            self._loaded_models_ts = time.monotonic()
+            logger.debug(
+                "bodega_models_discovered",
+                models=[
+                    {"id": m.model_id, "type": m.model_type, "ctx": m.context_length}
+                    for m in self._loaded_models.values()
+                ],
+            )
             return self._loaded_models
         except Exception as exc:
             if wait_if_down:
                 await self.wait_for_server()
                 try:
-                    resp = await self._client.health()
-                    models_detail = resp.get("models_detail", [])
-                    self._loaded_models = {
-                        m["id"]: m.get("type", "lm")
-                        for m in models_detail
-                        if m.get("status") == "running"
-                    }
+                    self._loaded_models = await _do_fetch()
+                    self._loaded_models_ts = time.monotonic()
                     return self._loaded_models
                 except Exception:
                     pass
+            # Fall back to /health models_detail as last resort
+            try:
+                resp = await self._client.health()
+                if resp.get("status") == "ok":
+                    models_detail = resp.get("models_detail", [])
+                    self._loaded_models = {
+                        m["id"]: LoadedModel(
+                            model_id=m["id"],
+                            model_type=m.get("type", "lm"),
+                            context_length=m.get("context_length", 4096),
+                        )
+                        for m in models_detail
+                        if m.get("status") == "running"
+                    }
+                    self._loaded_models_ts = time.monotonic()
+                    return self._loaded_models
+            except Exception:
+                pass
             logger.warning("bodega_model_discovery_failed", error=str(exc))
             return {}
 
     def invalidate_model_cache(self) -> None:
         """Clear cached model list — call after load/unload operations."""
         self._loaded_models = None
+        self._loaded_models_ts = 0.0
 
     # ── Auto-load ─────────────────────────────────────────────────────────────
 
@@ -277,13 +341,14 @@ class BodegaRouter:
         # (the primary use-case for REASON) equally well.
         if tier == ModelTier.REASON:
             for model_type_pref in ("lm", "multimodal"):
-                for loaded_id, model_type in loaded.items():
-                    if model_type == model_type_pref:
+                for loaded_id, info in loaded.items():
+                    if info.model_type == model_type_pref:
                         logger.info(
                             "bodega_tier_fallback",
                             tier=tier.value,
                             preferred=preferred_id,
                             using=loaded_id,
+                            ctx=info.context_length,
                             reason=f"type={model_type_pref} fallback",
                         )
                         return loaded_id
@@ -311,13 +376,14 @@ class BodegaRouter:
                 )
 
             for model_type_pref in ("lm", "multimodal"):
-                for loaded_id, model_type in loaded.items():
-                    if model_type == model_type_pref:
+                for loaded_id, info in loaded.items():
+                    if info.model_type == model_type_pref:
                         logger.info(
                             "bodega_tier_fallback",
                             tier=tier.value,
                             preferred=preferred_id,
                             using=loaded_id,
+                            ctx=info.context_length,
                             reason=f"type={model_type_pref} fallback",
                         )
                         return loaded_id
@@ -325,7 +391,9 @@ class BodegaRouter:
         # 4. Auto-load: model not found and no type-based fallback found.
         #    Skip auto-load for REASON if ANY lm model is loaded — we never want
         #    to trigger a large model download when a capable lm is available.
-        if tier == ModelTier.REASON and any(t == "lm" for t in loaded.values()):
+        if tier == ModelTier.REASON and any(
+            i.model_type == "lm" for i in loaded.values()
+        ):
             return None
         if auto_load and tier != ModelTier.MID:
             loaded_ok = await self._auto_load_tier(tier)
@@ -355,6 +423,27 @@ class BodegaRouter:
         """The active :class:`Topology`."""
         return self._topology
 
+    # ── Model introspection ───────────────────────────────────────────────────
+
+    async def get_model_context_length(self, model_id: str) -> int:
+        """Return the context_length for a loaded model, or 4096 as fallback."""
+        loaded = await self._fetch_loaded_models()
+        info = loaded.get(model_id)
+        return info.context_length if info else 4096
+
+    async def loaded_models_summary(self) -> list[dict[str, Any]]:
+        """Return a summary of all currently loaded models (for CLI / status)."""
+        loaded = await self._fetch_loaded_models()
+        return [
+            {
+                "id": info.model_id,
+                "type": info.model_type,
+                "context_length": info.context_length,
+                "memory_mb": info.memory_mb,
+            }
+            for info in loaded.values()
+        ]
+
     # ── Inference ─────────────────────────────────────────────────────────────
 
     async def chat(
@@ -369,6 +458,9 @@ class BodegaRouter:
         Dynamically resolves the tier to an actually-loaded model.
         Falls back to any available model if the preferred one isn't loaded.
         Auto-loads the model if it isn't present.
+
+        If the resolved model has a smaller context window than the request
+        needs, ``max_tokens`` is clamped to fit.
 
         Args:
             messages:    OpenAI-format message list.
@@ -390,13 +482,44 @@ class BodegaRouter:
                 "Ensure Bodega is running: curl http://localhost:44468/health"
             )
 
+        # Clamp max_tokens to model's context window (leave room for input)
+        ctx = await self.get_model_context_length(model_id)
+        input_estimate = sum(len(m.get("content", "")) // 4 for m in messages)
+        available_tokens = max(ctx - input_estimate - 128, 256)
+        if max_tokens > available_tokens:
+            logger.debug(
+                "router_clamp_max_tokens",
+                model=model_id,
+                ctx=ctx,
+                input_est=input_estimate,
+                requested=max_tokens,
+                clamped=available_tokens,
+            )
+            max_tokens = available_tokens
+
         logger.debug("router_chat", tier=tier.value, model_id=model_id)
-        return await self._client.chat(
-            messages=messages,
-            temperature=temperature,
-            max_tokens=max_tokens,
-            model=model_id,
-        )
+        try:
+            return await self._client.chat(
+                messages=messages,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                model=model_id,
+            )
+        except (httpx.HTTPStatusError,) as exc:
+            # Model may have been unloaded between resolve and request.
+            # Invalidate cache and retry once with fresh discovery.
+            if getattr(exc, 'response', None) is not None and exc.response.status_code in (404, 400):
+                logger.info("router_model_gone_retrying", model=model_id, tier=tier.value)
+                self.invalidate_model_cache()
+                retry_model = await self._resolve_available_model(tier)
+                if retry_model and retry_model != model_id:
+                    return await self._client.chat(
+                        messages=messages,
+                        temperature=temperature,
+                        max_tokens=max_tokens,
+                        model=retry_model,
+                    )
+            raise
 
     async def chat_simple(
         self,
@@ -467,6 +590,13 @@ class BodegaRouter:
         if system:
             messages.append({"role": "system", "content": system})
         messages.append({"role": "user", "content": prompt})
+
+        # Clamp max_tokens to model context window
+        ctx = await self.get_model_context_length(model_id)
+        input_estimate = sum(len(m.get("content", "")) // 4 for m in messages)
+        available_tokens = max(ctx - input_estimate - 128, 256)
+        if max_tokens > available_tokens:
+            max_tokens = available_tokens
 
         logger.debug("router_chat_stream", tier=tier.value, model_id=model_id)
 

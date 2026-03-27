@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 import sys
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
@@ -13,6 +14,68 @@ from rich.table import Table
 
 # Pre-compiled ANSI escape code stripper — used when writing to log files.
 _ANSI_RE = re.compile(r"\x1b\[[0-9;]*[mGKHF]")
+
+
+# ── PowerFlags — unified config for power commands ────────────────────────────
+
+@dataclass
+class PowerFlags:
+    """Parsed power flags for investigate/compare/ask commands.
+
+    Attributes:
+        deep:         Depth level (None=normal, int=deep with N dimensions).
+        sources:      Source types to query (e.g. ["arxiv", "youtube", "web"]).
+        cite:         Include inline citations and a Sources section.
+        verify:       Add trust-level labels (CONFIRMED/LIKELY/UNVERIFIED).
+    """
+    deep: int | None = None
+    sources: list[str] = field(default_factory=lambda: ["web"])
+    cite: bool = False
+    verify: bool = False
+
+    @property
+    def max_dimensions(self) -> int | None:
+        """Return max_dimensions from deep level, or None for default."""
+        if self.deep is not None:
+            # --deep:N means N dimensions, clamped to 2-16
+            return max(2, min(16, self.deep))
+        return None
+
+    @property
+    def has_extractors(self) -> bool:
+        """True if any non-web source is requested."""
+        return any(s != "web" for s in self.sources)
+
+
+def parse_deep_flag(raw: str | None) -> int | None:
+    """Parse --deep flag value.
+
+    Accepts: None, "", "8", "12", ":8", ":12"
+    Returns: None (not deep) or int (depth level).
+    """
+    if raw is None:
+        return None
+    raw = raw.strip().lstrip(":")
+    if not raw:
+        return 8  # default deep level
+    try:
+        return int(raw)
+    except ValueError:
+        return 8
+
+
+def parse_sources_flag(raw: str | None) -> list[str]:
+    """Parse --sources flag value.
+
+    Accepts: None, "arxiv", "arxiv,youtube", "arxiv,youtube,web"
+    Returns: List of source type strings.
+    """
+    if not raw:
+        return ["web"]
+    sources = [s.strip().lower() for s in raw.split(",") if s.strip()]
+    valid = {"web", "arxiv", "youtube"}
+    filtered = [s for s in sources if s in valid]
+    return filtered if filtered else ["web"]
 
 
 # ── test_runs tee ─────────────────────────────────────────────────────────────
@@ -106,7 +169,14 @@ def _get_shadow_config() -> tuple[str, str]:
 
 
 async def _ensure_shadow_group(shadow_name: str, redis_url: str) -> None:
-    """Pre-create the Shadows consumer group, silently ignoring BUSYGROUP."""
+    """Pre-create the Shadows consumer group, silently ignoring BUSYGROUP.
+
+    Also monkey-patches Shadow.__aenter__ to fix the broken BUSYGROUP check
+    in the Shadows library.  In recent redis-py builds, repr(ResponseError)
+    returns 'server:ResponseError' (no message text), so the Shadows check
+    ``"BUSYGROUP" not in repr(e)`` always re-raises.  We patch it to use
+    str(e) instead.
+    """
     import redis.asyncio as aioredis
     client = aioredis.from_url(redis_url, decode_responses=True)
     try:
@@ -120,6 +190,46 @@ async def _ensure_shadow_group(shadow_name: str, redis_url: str) -> None:
         pass  # BUSYGROUP or any other error — group already exists
     finally:
         await client.aclose()
+
+    # Patch Shadows' broken BUSYGROUP check (repr → str)
+    _patch_shadow_busygroup()
+
+
+_shadow_patched = False
+
+
+def _patch_shadow_busygroup() -> None:
+    """Monkey-patch Shadow.__aenter__ to use str(e) instead of repr(e).
+
+    In recent redis-py (>=5.x), repr(ResponseError) returns
+    'server:ResponseError' without the message text, so Shadows'
+    ``"BUSYGROUP" not in repr(e)`` check always re-raises.
+    This patch replaces repr(e) with str(e) so BUSYGROUP is detected.
+    """
+    global _shadow_patched
+    if _shadow_patched:
+        return
+    _shadow_patched = True
+
+    try:
+        import asyncio
+        import redis.exceptions
+        from shadows import Shadow
+
+        _original_aenter = Shadow.__aenter__
+
+        async def _fixed_aenter(self):
+            try:
+                return await _original_aenter(self)
+            except redis.exceptions.RedisError as e:
+                if "BUSYGROUP" in str(e):
+                    # Group already exists — safe to ignore
+                    return self
+                raise
+
+        Shadow.__aenter__ = _fixed_aenter
+    except ImportError:
+        pass  # shadows not installed
 
 
 def _print_dag_trace(trace, events, dag_nodes, dag_reason: str) -> None:

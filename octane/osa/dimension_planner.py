@@ -97,11 +97,13 @@ class ResearchDimension:
     """A single independent research dimension.
 
     Attributes:
-        id:        Short slug identifier (e.g. "valuation_metrics").
-        label:     Human-readable label (e.g. "Valuation Metrics").
-        queries:   1-3 specific search queries for this dimension.
-        priority:  Importance ranking (1=highest, lower = research first).
-        rationale: Why this dimension matters for the original query.
+        id:           Short slug identifier (e.g. "valuation_metrics").
+        label:        Human-readable label (e.g. "Valuation Metrics").
+        queries:      1-3 specific search queries for this dimension.
+        priority:     Importance ranking (1=highest, lower = research first).
+        rationale:    Why this dimension matters for the original query.
+        source_types: Which sources to query — e.g. ["web"], ["arxiv", "web"],
+                      ["youtube"]. Defaults to ["web"].
     """
 
     id: str
@@ -109,6 +111,7 @@ class ResearchDimension:
     queries: list[str]
     priority: int = 1
     rationale: str = ""
+    source_types: list[str] = field(default_factory=lambda: ["web"])
 
     def primary_query(self) -> str:
         """Return the highest-priority search query for this dimension."""
@@ -145,6 +148,7 @@ class DimensionPlan:
                     "queries": d.queries,
                     "priority": d.priority,
                     "rationale": d.rationale,
+                    "source_types": d.source_types,
                 }
                 for d in self.sorted_dimensions
             ],
@@ -181,21 +185,29 @@ class DimensionPlanner:
         self,
         query: str,
         max_dimensions: int | None = None,
+        source_types: list[str] | None = None,
     ) -> DimensionPlan:
         """Decompose a query into research dimensions.
 
         Args:
             query:          The investigation query.
             max_dimensions: Override instance default.
+            source_types:   If set (e.g. ["arxiv", "youtube"]), the planner
+                            assigns these as the default source_types for each
+                            dimension instead of just ["web"].
 
         Returns:
             DimensionPlan with sorted dimensions.
         """
         limit = max_dimensions or self.max_dimensions
 
+        # Hierarchical decomposition for deep investigations (> 8 dimensions)
+        if limit > _MAX_DIMENSIONS:
+            return await self._plan_hierarchical(query, limit, source_types=source_types)
+
         if not self._bodega:
             logger.debug("dimension_planner_fallback_no_bodega", query=query[:60])
-            return self._keyword_fallback(query, limit)
+            return self._keyword_fallback(query, limit, source_types=source_types)
 
         try:
             raw = await self._bodega.chat_simple(
@@ -205,17 +217,18 @@ class DimensionPlanner:
                 max_tokens=800,
                 temperature=0.0,
             )
-            return self._parse_response(query, raw, limit)
+            return self._parse_response(query, raw, limit, source_types=source_types)
 
         except Exception as exc:
             logger.warning("dimension_planner_llm_failed", error=str(exc))
-            return self._keyword_fallback(query, limit)
+            return self._keyword_fallback(query, limit, source_types=source_types)
 
     def _parse_response(
         self,
         query: str,
         raw: str,
         limit: int,
+        source_types: list[str] | None = None,
     ) -> DimensionPlan:
         """Parse LLM JSON response into a DimensionPlan.
 
@@ -234,13 +247,13 @@ class DimensionPlanner:
         end = cleaned.rfind("}") + 1
         if start == -1 or end == 0:
             logger.warning("dimension_planner_no_json", raw=raw[:200])
-            return self._keyword_fallback(query, limit)
+            return self._keyword_fallback(query, limit, source_types=source_types)
 
         try:
             data = json.loads(cleaned[start:end])
         except json.JSONDecodeError as exc:
             logger.warning("dimension_planner_json_error", error=str(exc), raw=raw[:200])
-            return self._keyword_fallback(query, limit)
+            return self._keyword_fallback(query, limit, source_types=source_types)
 
         raw_dims = data.get("dimensions", [])
         if not isinstance(raw_dims, list) or len(raw_dims) < _MIN_DIMENSIONS:
@@ -249,7 +262,7 @@ class DimensionPlanner:
                 count=len(raw_dims),
                 min=_MIN_DIMENSIONS,
             )
-            return self._keyword_fallback(query, limit)
+            return self._keyword_fallback(query, limit, source_types=source_types)
 
         dimensions: list[ResearchDimension] = []
         for i, dim in enumerate(raw_dims[:limit]):
@@ -266,6 +279,14 @@ class DimensionPlanner:
                 queries = [label]
             priority = int(dim.get("priority", i + 1))
             rationale = str(dim.get("rationale", "")).strip()
+            # Use per-dimension source_types from LLM, or caller override, or default
+            dim_sources = dim.get("source_types")
+            if isinstance(dim_sources, list) and dim_sources:
+                dim_sources = [str(s).lower().strip() for s in dim_sources]
+            elif source_types:
+                dim_sources = source_types
+            else:
+                dim_sources = ["web"]
             dimensions.append(
                 ResearchDimension(
                     id=dim_id,
@@ -273,6 +294,7 @@ class DimensionPlanner:
                     queries=queries,
                     priority=priority,
                     rationale=rationale,
+                    source_types=dim_sources,
                 )
             )
 
@@ -287,7 +309,103 @@ class DimensionPlanner:
         )
         return DimensionPlan(query=query, dimensions=dimensions, from_llm=True)
 
-    def _keyword_fallback(self, query: str, limit: int) -> DimensionPlan:
+    async def _plan_hierarchical(
+        self,
+        query: str,
+        target_dimensions: int,
+        source_types: list[str] | None = None,
+    ) -> DimensionPlan:
+        """Two-phase hierarchical planning for deep investigations (> 8 dims).
+
+        Phase 1: Generate 4-6 core research dimensions (standard plan).
+        Phase 2: For each core dimension, generate 2-3 sub-dimensions.
+        Result:  Flat list of 8-18 dimensions, each with a unique priority.
+
+        Falls back to standard planning (capped at 8) on any failure.
+        """
+        # Phase 1: Get core dimensions (4-6)
+        core_limit = min(6, target_dimensions // 2)
+        if not self._bodega:
+            return self._keyword_fallback(query, min(target_dimensions, _MAX_DIMENSIONS), source_types=source_types)
+
+        try:
+            raw = await self._bodega.chat_simple(
+                f"Query to investigate: {query}",
+                system=_DIMENSION_PLANNER_SYSTEM,
+                tier=ModelTier.MID,
+                max_tokens=800,
+                temperature=0.0,
+            )
+            core_plan = self._parse_response(query, raw, core_limit, source_types=source_types)
+        except Exception as exc:
+            logger.warning("hierarchical_phase1_failed", error=str(exc))
+            return self._keyword_fallback(query, min(target_dimensions, _MAX_DIMENSIONS), source_types=source_types)
+
+        if not core_plan.dimensions:
+            return core_plan
+
+        # Phase 2: Expand each core dimension into sub-dimensions
+        all_dims: list[ResearchDimension] = []
+        priority_counter = 1
+        subs_per_core = max(2, (target_dimensions - len(core_plan.dimensions)) // len(core_plan.dimensions))
+
+        for core_dim in core_plan.sorted_dimensions:
+            # Add the core dimension itself
+            core_dim.priority = priority_counter
+            all_dims.append(core_dim)
+            priority_counter += 1
+
+            # Generate sub-dimensions
+            try:
+                existing_queries = [q for d in all_dims for q in d.queries]
+                sub_prompt = (
+                    f'Original query: "{query}"\n'
+                    f'Core dimension: "{core_dim.label}"\n'
+                    f"Core rationale: {core_dim.rationale}\n\n"
+                    f"Generate {subs_per_core} specific sub-dimensions that drill deeper "
+                    f"into this core dimension. Each sub-dimension should explore a "
+                    f"distinct angle within {core_dim.label}.\n\n"
+                    f"IMPORTANT: Do NOT reuse these existing queries — each sub-dimension "
+                    f"must have unique, non-overlapping search queries:\n"
+                    f"{existing_queries[:10]}"
+                )
+                sub_raw = await self._bodega.chat_simple(
+                    sub_prompt,
+                    system=_DIMENSION_PLANNER_SYSTEM,
+                    tier=ModelTier.FAST,
+                    max_tokens=600,
+                    temperature=0.1,
+                )
+                sub_plan = self._parse_response(
+                    query, sub_raw, subs_per_core, source_types=source_types,
+                )
+                for sub_dim in sub_plan.dimensions:
+                    sub_dim.id = f"{core_dim.id}_{sub_dim.id}"
+                    sub_dim.priority = priority_counter
+                    all_dims.append(sub_dim)
+                    priority_counter += 1
+            except Exception as exc:
+                logger.debug(
+                    "hierarchical_subdim_failed",
+                    core_dim=core_dim.id,
+                    error=str(exc),
+                )
+
+            if len(all_dims) >= target_dimensions:
+                break
+
+        all_dims = all_dims[:target_dimensions]
+
+        logger.info(
+            "hierarchical_plan_built",
+            query=query[:60],
+            n_core=len(core_plan.dimensions),
+            n_total=len(all_dims),
+            target=target_dimensions,
+        )
+        return DimensionPlan(query=query, dimensions=all_dims, from_llm=True)
+
+    def _keyword_fallback(self, query: str, limit: int, source_types: list[str] | None = None) -> DimensionPlan:
         """Produce a sensible set of research dimensions from keywords.
 
         This runs without any LLM call.  It provides enough structure
@@ -417,6 +535,10 @@ class DimensionPlanner:
             ]
 
         dims = dims[:limit]
+        # Apply caller-specified source_types to all dimensions
+        if source_types:
+            for d in dims:
+                d.source_types = source_types
         logger.info(
             "dimension_plan_keyword_fallback",
             query=query[:60],

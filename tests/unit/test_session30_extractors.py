@@ -618,6 +618,7 @@ class TestE2EExtraction:
         assert "title" in results[0]
         assert "url" in results[0]
 
+    @pytest.mark.timeout(60)
     def test_arxiv_search_live(self):
         from octane.extractors.academic.arxiv_search import search_arxiv
         results = search_arxiv("transformer neural network", max_results=3)

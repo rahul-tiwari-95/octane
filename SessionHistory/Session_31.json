@@ -1,0 +1,149 @@
+{
+  "session": 31,
+  "title": "Extractor Wiring, PowerFlags, DepthController, Hierarchical Decomposition",
+  "date": "2025-07-15",
+  "summary": "Wired the Session 30 extraction pipeline (YouTube, arXiv, PDF, EPUB) into the investigate/compare commands. Added PowerFlags (--deep:N, --sources, --cite, --verify), DepthController with n-gram convergence detection, hierarchical decomposition for deep investigations (>8 dimensions), and trust-weighted synthesis with citation/verification modes.",
+  "target_command": "octane investigate \"attention mechanisms\" --deep 12 --sources arxiv,youtube --cite",
+  "parts_completed": {
+    "A": "Wire extractors into investigate — search_and_extract(), source_types on ResearchDimension, extractor dispatch in _research_one()",
+    "B1": "PowerFlags dataclass + parse_deep_flag + parse_sources_flag + CLI wiring for investigate/compare",
+    "C_lite": "Trust-weighted evaluator — _CITATION_INSTRUCTIONS and _VERIFICATION_INSTRUCTIONS injected into synthesis prompt when --cite/--verify set",
+    "D": "DepthController — n-gram novelty tracking with convergence-based stopping (novelty_threshold, max_rounds, declining trend detection)",
+    "E": "Hierarchical decomposition — _plan_hierarchical() for --deep:N > 8; two-phase: core dims via MID tier → sub-dims via FAST tier"
+  },
+  "parts_deferred_to_session_32": {
+    "B2": "--watch flag for background monitors",
+    "C_full": "Full CrossReferencer with inter-source verification",
+    "F": "Output templates (markdown, brief, detailed)",
+    "G": "octane recall command — infer from stored data only",
+    "H": "Export to PDF/DOCX",
+    "I": "Command consolidation (health/sysstat, chat/session)"
+  },
+  "files_created": [
+    "octane/agents/web/depth_controller.py",
+    "tests/unit/test_session31_extractor_wiring.py"
+  ],
+  "files_modified": [
+    "octane/extractors/pipeline.py",
+    "octane/osa/dimension_planner.py",
+    "octane/osa/investigate.py",
+    "octane/cli/_shared.py",
+    "octane/cli/power.py"
+  ],
+  "new_classes": [
+    {
+      "name": "PowerFlags",
+      "file": "octane/cli/_shared.py",
+      "purpose": "Unified config dataclass for power command flags (deep, sources, cite, verify)"
+    },
+    {
+      "name": "DepthController",
+      "file": "octane/agents/web/depth_controller.py",
+      "purpose": "N-gram novelty tracking with convergence-based stopping for iterative deepening"
+    }
+  ],
+  "new_functions": [
+    {
+      "name": "search_and_extract",
+      "file": "octane/extractors/pipeline.py",
+      "purpose": "Query-based search across source types (arxiv, youtube) → extract content from top results"
+    },
+    {
+      "name": "parse_deep_flag",
+      "file": "octane/cli/_shared.py",
+      "purpose": "Parse --deep flag value (None, '', '8', ':12') into int | None"
+    },
+    {
+      "name": "parse_sources_flag",
+      "file": "octane/cli/_shared.py",
+      "purpose": "Parse --sources flag value ('arxiv,youtube,web') into list[str]"
+    },
+    {
+      "name": "_plan_hierarchical",
+      "file": "octane/osa/dimension_planner.py",
+      "purpose": "Two-phase hierarchical planning for deep investigations (> 8 dimensions)"
+    },
+    {
+      "name": "_search_extract_arxiv",
+      "file": "octane/extractors/pipeline.py",
+      "purpose": "Search arXiv by query, download top papers, extract text"
+    },
+    {
+      "name": "_search_extract_youtube",
+      "file": "octane/extractors/pipeline.py",
+      "purpose": "Search YouTube by query, get transcripts from top videos"
+    }
+  ],
+  "dataclass_changes": [
+    {
+      "class": "ResearchDimension",
+      "change": "Added source_types: list[str] field (default ['web'])"
+    },
+    {
+      "class": "DimensionFinding",
+      "change": "Added reliability_score: float and sources: list[str] fields"
+    },
+    {
+      "class": "DimensionPlan.to_dict()",
+      "change": "Now includes source_types in serialized dimensions"
+    }
+  ],
+  "method_signature_changes": [
+    {
+      "method": "DimensionPlanner.plan()",
+      "change": "Added source_types: list[str] | None parameter"
+    },
+    {
+      "method": "InvestigateOrchestrator.run_stream()",
+      "change": "Added source_types, cite, verify parameters"
+    },
+    {
+      "method": "InvestigateOrchestrator.run()",
+      "change": "Added source_types, cite, verify parameters"
+    },
+    {
+      "method": "InvestigateOrchestrator._synthesize()",
+      "change": "Added cite, verify parameters; injects citation/verification instructions"
+    },
+    {
+      "method": "InvestigateOrchestrator._research_one()",
+      "change": "Now dispatches to search_and_extract() for arxiv/youtube source_types"
+    }
+  ],
+  "cli_changes": [
+    {
+      "command": "octane investigate",
+      "new_flags": ["--deep N", "--sources arxiv,youtube,web", "--cite", "--verify"]
+    },
+    {
+      "command": "octane compare",
+      "new_flags": ["--sources arxiv,youtube,web", "--cite", "--verify"]
+    }
+  ],
+  "tests": {
+    "new_tests": 63,
+    "total_passed": 1016,
+    "total_skipped": 32,
+    "total_failed": 0,
+    "test_file": "tests/unit/test_session31_extractor_wiring.py",
+    "test_classes": [
+      "TestParseDeepFlag (6)",
+      "TestParseSourcesFlag (8)",
+      "TestPowerFlags (9)",
+      "TestResearchDimensionSourceTypes (4)",
+      "TestDimensionPlannerSourceTypesPassthrough (2)",
+      "TestDepthController (10)",
+      "TestDimensionFindingNewFields (6)",
+      "TestSearchAndExtract (6)",
+      "TestInvestigateOrchestratorExtractorDispatch (1)",
+      "TestInvestigateOrchestratorRunStream (2)",
+      "TestSynthesisPromptAddons (3)",
+      "TestHierarchicalDecomposition (3)",
+      "TestPowerCommandSignatures (2)"
+    ]
+  },
+  "architecture_flow": {
+    "before_s31": "octane investigate → DimensionPlanner → WebAgent only → Evaluator synthesis",
+    "after_s31": "octane investigate --sources arxiv,youtube --cite → DimensionPlanner (with source_types) → WebAgent + ExtractorPipeline (search_and_extract) → Trust-weighted synthesis with citations"
+  }
+}
