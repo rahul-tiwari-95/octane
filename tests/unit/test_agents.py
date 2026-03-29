@@ -1224,7 +1224,7 @@ async def test_monitor_ticker_stores_quote_to_redis():
     mock_intel_ctx = AsyncMock()
     mock_intel_ctx.__aenter__ = AsyncMock(return_value=mock_intel_ctx)
     mock_intel_ctx.__aexit__ = AsyncMock(return_value=False)
-    mock_intel_ctx.finance = AsyncMock(return_value=fake_quote)
+    mock_intel_ctx.market_data = AsyncMock(return_value=fake_quote)
 
     stored: dict = {}
 
@@ -1256,7 +1256,7 @@ async def test_monitor_ticker_stores_quote_to_redis():
             log=fake_log,
         )
 
-    mock_intel_ctx.finance.assert_awaited_once_with("AAPL")
+    mock_intel_ctx.market_data.assert_awaited_once_with("AAPL")
     mock_pipe.set.assert_called_once()
     key_arg = mock_pipe.set.call_args[0][0]
     assert key_arg == "watch:AAPL:latest"

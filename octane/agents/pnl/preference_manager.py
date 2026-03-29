@@ -2,10 +2,12 @@
 
 Key scheme: pnl:{user_id}:pref:{key}
 Examples:
-    pnl:default:pref:verbosity      → "concise" | "detailed"
-    pnl:default:pref:expertise      → "beginner" | "intermediate" | "advanced"
-    pnl:default:pref:domains        → "technology,finance,science"
-    pnl:default:pref:response_style → "bullets" | "prose" | "code-first"
+    pnl:default:pref:verbosity            → "concise" | "detailed"
+    pnl:default:pref:expertise            → "beginner" | "intermediate" | "advanced"
+    pnl:default:pref:domains              → "technology,finance,science"
+    pnl:default:pref:response_style       → "bullets" | "prose" | "code-first"
+    pnl:default:pref:assistant_name       → "octane" | any name
+    pnl:default:pref:assistant_personality → "helpful, concise" | free text
 
 Preferences persist in Redis (no TTL — they're permanent until changed).
 """
@@ -24,6 +26,8 @@ DEFAULTS: dict[str, str] = {
     "expertise": "advanced",
     "domains": "technology,finance",
     "response_style": "prose",
+    "assistant_name": "octane",
+    "assistant_personality": "helpful, direct, and knowledgeable",
 }
 
 PREF_TTL = 0  # No expiry — preferences are permanent

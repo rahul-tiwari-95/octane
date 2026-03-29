@@ -24,9 +24,12 @@ def register_all(app: typer.Typer) -> None:
         power,
         pref,
         project,
+        recall,
         research,
+        stats,
         store,
         trace,
+        ui,
         vault,
         watch,
         workflow,
@@ -40,6 +43,7 @@ def register_all(app: typer.Typer) -> None:
     dag.register(app)
     agents.register(app)
     power.register(app)
+    stats.register(app)
 
     # ── Sub-apps ──────────────────────────────────────────────
     app.add_typer(watch.watch_app,    name="watch")
@@ -56,4 +60,6 @@ def register_all(app: typer.Typer) -> None:
     app.add_typer(store.store_app,       name="store")
     app.add_typer(portfolio.portfolio_app, name="portfolio")
     app.add_typer(extract.extract_app,   name="extract")
+    app.add_typer(recall.recall_app,     name="recall")
+    app.add_typer(ui.ui_app,             name="ui")
     audit.register(app)

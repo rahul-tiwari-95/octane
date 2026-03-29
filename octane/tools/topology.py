@@ -306,13 +306,13 @@ TOPOLOGIES: dict[str, Topology] = {
     #            structured extraction, richer mid-depth reasoning.
     #            Speculative decoding ON (Qwen3-0.6B draft, same tokenizer).
     #
-    #   REASON — bodega-raptor-8b  (lm, ~5 GB mxfp4) — final synthesis,
-    #            comparison reports, memory notes, deep analysis.
-    #            Same model as MID — both route to one resident 8b instance.
-    #            CB handles concurrent MID+REASON calls automatically.
-    #            Speculative decoding + CB = fast single-user AND multi-agent.
-    #            From sweep data: (concurrency=32, prefill_batch=16) yields
-    #            best mixed-query throughput at ~600 tok/s system.
+    #   REASON — axe-stealth-37b  (multimodal, ~22 GB 4-bit) — final synthesis,
+    #            comparison reports, memory notes, deep analysis, chat.
+    #            The 37b is the highest-quality model available.  Chat mode
+    #            unloads all other models and loads REASON exclusively for
+    #            maximum context and reasoning depth.
+    #            No speculative decoding (no shared-tokenizer draft model yet).
+    #            CB enabled for concurrent ANALYSIS + CHAT requests.
     "power": Topology(
         name="power",
         models={
@@ -347,20 +347,19 @@ TOPOLOGIES: dict[str, Topology] = {
                 cb_completion_batch_size=32, # sweep: (32,16) best mixed throughput
             ),
             ModelTier.REASON: ModelConfig(
-                model_id="bodega-raptor-8b",
-                model_path="srswti/bodega-raptor-8b-mxfp4",
-                model_type="lm",
-                context_length=32768,
-                max_concurrency=6,          # same instance as MID — CB shares slots
-                prompt_cache_size=25,
+                model_id="axe-stealth-37b",
+                model_path="srswti/axe-stealth-37b-4bit",
+                model_type="multimodal",
+                context_length=131072,      # 128K context window
+                max_concurrency=2,          # 37b is heavy — limit concurrency
+                prompt_cache_size=10,
                 reasoning_parser="qwen3",
                 tool_call_parser="qwen3",
-                draft_model_path=_DRAFT_MODEL,  # speculative decoding ON
-                num_draft_tokens=5,             # power: more aggresive speculation (32GB+ headroom)
+                # No speculative decoding — no shared-tokenizer draft model yet
                 continuous_batching=True,
-                cb_max_num_seqs=256,
-                cb_prefill_batch_size=16,
-                cb_completion_batch_size=32,
+                cb_max_num_seqs=32,
+                cb_prefill_batch_size=4,
+                cb_completion_batch_size=8,
             ),
             # CLASSIFY — daemon-exclusive control plane.  On power topology,
             # vertex-4b handles all classification/routing/judging with 4

@@ -108,6 +108,73 @@ CREATE INDEX IF NOT EXISTS idx_positions_project ON portfolio_positions (project
 CREATE INDEX IF NOT EXISTS idx_positions_ticker  ON portfolio_positions (ticker);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_positions_upsert ON portfolio_positions (ticker, broker, account_id);
 
+-- ── tax_lots ─────────────────────────────────────────────────────────────────
+-- Individual purchase lots for FIFO/LIFO/SpecID cost basis accounting.
+CREATE TABLE IF NOT EXISTS tax_lots (
+    id              SERIAL      PRIMARY KEY,
+    position_id     INTEGER     REFERENCES portfolio_positions(id) ON DELETE CASCADE,
+    ticker          TEXT        NOT NULL,
+    shares          REAL        NOT NULL DEFAULT 0,
+    cost_per_share  REAL        NOT NULL DEFAULT 0,
+    purchase_date   DATE        NOT NULL DEFAULT CURRENT_DATE,
+    broker          TEXT        NOT NULL DEFAULT '',
+    account_id      TEXT        NOT NULL DEFAULT '',
+    sold_shares     REAL        NOT NULL DEFAULT 0,
+    notes           TEXT        NOT NULL DEFAULT '',
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_tax_lots_position ON tax_lots (position_id);
+CREATE INDEX IF NOT EXISTS idx_tax_lots_ticker   ON tax_lots (ticker);
+
+-- ── dividends ───────────────────────────────────────────────────────────────
+-- Dividend history and schedule tracking.
+CREATE TABLE IF NOT EXISTS dividends (
+    id              SERIAL      PRIMARY KEY,
+    ticker          TEXT        NOT NULL,
+    amount          REAL        NOT NULL DEFAULT 0,
+    ex_date         DATE,
+    pay_date        DATE,
+    frequency       TEXT        NOT NULL DEFAULT 'quarterly',   -- monthly|quarterly|semi-annual|annual
+    div_yield       REAL        NOT NULL DEFAULT 0,
+    payout_ratio    REAL        NOT NULL DEFAULT 0,
+    growth_rate     REAL        NOT NULL DEFAULT 0,             -- YoY dividend growth %
+    source          TEXT        NOT NULL DEFAULT 'yfinance',
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_dividends_ticker  ON dividends (ticker);
+CREATE INDEX IF NOT EXISTS idx_dividends_ex_date ON dividends (ex_date);
+
+-- ── net_worth_snapshots ─────────────────────────────────────────────────────
+-- Daily point-in-time snapshots for net worth timeline.
+CREATE TABLE IF NOT EXISTS net_worth_snapshots (
+    id              SERIAL      PRIMARY KEY,
+    snapshot_date   DATE        NOT NULL DEFAULT CURRENT_DATE,
+    total_value     REAL        NOT NULL DEFAULT 0,
+    equities_value  REAL        NOT NULL DEFAULT 0,
+    crypto_value    REAL        NOT NULL DEFAULT 0,
+    cash_value      REAL        NOT NULL DEFAULT 0,
+    position_count  INTEGER     NOT NULL DEFAULT 0,
+    notes           TEXT        NOT NULL DEFAULT '',
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_nw_snapshots_date ON net_worth_snapshots (snapshot_date);
+
+-- ── crypto_positions ────────────────────────────────────────────────────────
+-- Crypto holdings, separate from equity positions.
+CREATE TABLE IF NOT EXISTS crypto_positions (
+    id              SERIAL      PRIMARY KEY,
+    coin            TEXT        NOT NULL,
+    quantity        REAL        NOT NULL DEFAULT 0,
+    cost_per_coin   REAL        NOT NULL DEFAULT 0,
+    exchange        TEXT        NOT NULL DEFAULT '',
+    wallet_address  TEXT        NOT NULL DEFAULT '',
+    notes           TEXT        NOT NULL DEFAULT '',
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_crypto_coin ON crypto_positions (coin);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_crypto_upsert ON crypto_positions (coin, exchange);
+
 -- ── tracked_jobs ──────────────────────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS tracked_jobs (
     id              SERIAL      PRIMARY KEY,
@@ -162,3 +229,31 @@ CREATE INDEX IF NOT EXISTS idx_embeddings_source ON embeddings (source_type, sou
 CREATE INDEX IF NOT EXISTS idx_embeddings_vec
     ON embeddings USING ivfflat (embedding vector_cosine_ops)
     WITH (lists = 100);
+
+-- ── extracted_documents (Session 36) ─────────────────────────────────────────
+-- Rich extraction persistence: YouTube, arXiv, PDF, EPUB, web.
+-- Stores full text, chunks (JSONB), content hash for dedup, local file path.
+CREATE TABLE IF NOT EXISTS extracted_documents (
+    id                  SERIAL      PRIMARY KEY,
+    project_id          INTEGER     REFERENCES projects(id) ON DELETE CASCADE,
+    source_type         TEXT        NOT NULL DEFAULT 'web',   -- youtube | arxiv | pdf | epub | web
+    source_url          TEXT        NOT NULL,
+    content_hash        TEXT        NOT NULL DEFAULT '',       -- SHA-256 of raw_text (dedup key)
+    title               TEXT        NOT NULL DEFAULT '',
+    author              TEXT        NOT NULL DEFAULT '',
+    raw_text            TEXT        NOT NULL DEFAULT '',
+    chunks              JSONB       NOT NULL DEFAULT '[]',    -- [{index, text, word_count, metadata}]
+    total_words         INTEGER     NOT NULL DEFAULT 0,
+    total_chunks        INTEGER     NOT NULL DEFAULT 0,
+    extraction_method   TEXT        NOT NULL DEFAULT '',
+    reliability_score   REAL        NOT NULL DEFAULT 0.5,
+    metadata            JSONB       NOT NULL DEFAULT '{}',
+    local_path          TEXT        NOT NULL DEFAULT '',       -- ~/.octane/extractions/<hash>.md
+    extracted_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_extracted_docs_hash ON extracted_documents (content_hash) WHERE content_hash != '';
+CREATE INDEX IF NOT EXISTS idx_extracted_docs_source   ON extracted_documents (source_type);
+CREATE INDEX IF NOT EXISTS idx_extracted_docs_url      ON extracted_documents (source_url);
+CREATE INDEX IF NOT EXISTS idx_extracted_docs_project  ON extracted_documents (project_id);
+CREATE INDEX IF NOT EXISTS idx_extracted_docs_created  ON extracted_documents (extracted_at DESC);

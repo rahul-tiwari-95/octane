@@ -1,0 +1,100 @@
+/* ── App Shell ── */
+.app-shell {
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+  width: 100vw;
+  overflow: hidden;
+  background: var(--bg-primary);
+}
+
+.app-main {
+  flex: 1;
+  overflow: auto;
+  padding: 12px;
+}
+
+/* ── Dashboard Grid ── */
+.dashboard-grid {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 12px;
+  height: 100%;
+  min-height: 0;
+}
+
+.cell {
+  min-height: 0;
+  overflow: hidden;
+}
+
+/* ── Hero row: Globe centered with side panels ── */
+.hero-row {
+  display: grid;
+  grid-template-columns: 1fr minmax(420px, 520px) 1fr;
+  gap: 12px;
+  align-items: start;
+}
+
+.cell-globe {
+  grid-column: 2;
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  min-height: 460px;
+}
+
+.cell-vitals {
+  grid-column: 1;
+}
+
+.cell-models {
+  grid-column: 3;
+}
+
+/* ── Bottom row: events + timeline ── */
+.bottom-row {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+}
+
+.cell-events {
+  max-height: 400px;
+}
+
+.cell-timeline {
+}
+
+/* ── Responsive ── */
+@media (max-width: 1100px) {
+  .hero-row {
+    grid-template-columns: 1fr;
+  }
+
+  .cell-globe,
+  .cell-vitals,
+  .cell-models {
+    grid-column: 1;
+  }
+
+  .cell-globe {
+    min-height: 350px;
+  }
+
+  .bottom-row {
+    grid-template-columns: 1fr;
+  }
+}
+
+/* ── Scrollbar in main ── */
+.app-main::-webkit-scrollbar {
+  width: 6px;
+}
+.app-main::-webkit-scrollbar-track {
+  background: var(--bg-primary);
+}
+.app-main::-webkit-scrollbar-thumb {
+  background: var(--border);
+  border-radius: 3px;
+}

@@ -8,7 +8,7 @@ import typer
 from rich.panel import Panel
 from rich.table import Table
 
-from octane.cli._shared import console, _get_shadow_config, _ensure_shadow_group
+from octane.cli._shared import console, _get_shadow_config, _ensure_shadow_group, _patch_shadow_busygroup
 
 watch_app = typer.Typer(
     name="watch",
@@ -124,8 +124,9 @@ def watch_status():
 async def _watch_status():
     from shadows import Shadow
     from octane.tasks.worker_process import read_pid
-    from octane.tasks.monitor import monitor_ticker
+    from octane.tasks import octane_tasks
 
+    _patch_shadow_busygroup()
     shadow_name, redis_url = _get_shadow_config()
 
     pid = read_pid()
@@ -136,7 +137,8 @@ async def _watch_status():
 
     try:
         async with Shadow(name=shadow_name, url=redis_url) as shadow:
-            shadow.register(monitor_ticker)
+            for task in octane_tasks:
+                shadow.register(task)
             snapshot = await shadow.snapshot()
 
         table = Table(title="Scheduled / Running Tasks", show_lines=False)
@@ -220,6 +222,7 @@ def watch_cancel(
 async def _watch_cancel(ticker: str):
     from shadows import Shadow
 
+    _patch_shadow_busygroup()
     shadow_name, redis_url = _get_shadow_config()
 
     try:

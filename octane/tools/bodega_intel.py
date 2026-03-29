@@ -17,26 +17,26 @@ Route map (mount prefix + flow path):
     Combined:          GET /api/v1/beru/search/combined?query=...
 
     ── News ────────────────────────────────────────────────────────────────
-    Search:            GET /api/v1/news/api/v1/news/search?q=...&period=...&max_results=...
-    Headlines:         GET /api/v1/news/api/v1/news/headlines
-    By topic:          GET /api/v1/news/api/v1/news/topics/{topic}
-    By location:       GET /api/v1/news/api/v1/news/locations/{location}
-    By site:           GET /api/v1/news/api/v1/news/sites/{domain}
-    Trending:          GET /api/v1/news/api/v1/news/trending
+    Search:            GET /api/v1/news/search?q=...&period=...&max_results=...
+    Headlines:         GET /api/v1/news/headlines
+    By topic:          GET /api/v1/news/topics/{topic}
+    By location:       GET /api/v1/news/locations/{location}
+    By site:           GET /api/v1/news/sites/{domain}
+    Trending:          GET /api/v1/news/trending
 
     ── Finance ─────────────────────────────────────────────────────────────
-    Market data:       GET /api/v1/finance/api/v1/finance/market/{symbol}
-    Complete:          GET /api/v1/finance/api/v1/finance/complete?symbol=...
-    Timeseries:        GET /api/v1/finance/api/v1/finance/timeseries/{symbol}?period=...
-    Statements:        GET /api/v1/finance/api/v1/finance/statements/{symbol}
-    Options chain:     GET /api/v1/finance/api/v1/finance/options/{symbol}
+    Market data:       GET /api/v1/finance/market/{symbol}
+    Complete:          GET /api/v1/finance/complete?symbol=...
+    Timeseries:        GET /api/v1/finance/timeseries/{symbol}?period=...
+    Statements:        GET /api/v1/finance/statements/{symbol}
+    Options chain:     GET /api/v1/finance/options/{symbol}
 
     ── Entertainment (TMDB) ────────────────────────────────────────────────
-    Movie search:      GET /api/v1/entertainment/api/v1/entertainment/movies/search?query=...
-    Movie details:     GET /api/v1/entertainment/api/v1/entertainment/movies/{movie_id}
-    TV search:         GET /api/v1/entertainment/api/v1/entertainment/tv/search?query=...
-    Popular movies:    GET /api/v1/entertainment/api/v1/entertainment/movies/popular
-    Top-rated movies:  GET /api/v1/entertainment/api/v1/entertainment/movies/top-rated
+    Movie search:      GET /api/v1/entertainment/movies/search?query=...
+    Movie details:     GET /api/v1/entertainment/movies/{movie_id}
+    TV search:         GET /api/v1/entertainment/tv/search?query=...
+    Popular movies:    GET /api/v1/entertainment/movies/popular
+    Top-rated movies:  GET /api/v1/entertainment/movies/top-rated
 
     ── Music (YouTube Music) ───────────────────────────────────────────────
     Search:            GET /api/v1/music/search?query=...
@@ -196,7 +196,7 @@ class BodegaIntelClient:
         """
         try:
             response = await self._request(
-                "get", "/api/v1/news/api/v1/news/search",
+                "get", "/api/v1/news/search",
                 params={
                     "q": query,
                     "period": period,
@@ -217,7 +217,7 @@ class BodegaIntelClient:
     async def news_headlines(self) -> dict[str, Any]:
         """Get top breaking news headlines."""
         try:
-            response = await self._request("get", "/api/v1/news/api/v1/news/headlines")
+            response = await self._request("get", "/api/v1/news/headlines")
             response.raise_for_status()
             return response.json()
         except httpx.HTTPError as e:
@@ -228,7 +228,7 @@ class BodegaIntelClient:
         """Get news by topic (TECHNOLOGY, BUSINESS, SCIENCE, etc.)."""
         try:
             response = await self._request(
-                "get", f"/api/v1/news/api/v1/news/topics/{topic}",
+                "get", f"/api/v1/news/topics/{topic}",
                 params={"period": period},
             )
             response.raise_for_status()
@@ -243,7 +243,7 @@ class BodegaIntelClient:
         """Get real-time market data for a ticker (price, change, volume, etc.)."""
         try:
             response = await self._request(
-                "get", f"/api/v1/finance/api/v1/finance/market/{ticker.upper()}",
+                "get", f"/api/v1/finance/market/{ticker.upper()}",
             )
             response.raise_for_status()
             result = response.json()
@@ -262,7 +262,7 @@ class BodegaIntelClient:
         """Get historical OHLCV time series for a ticker."""
         try:
             response = await self._request(
-                "get", f"/api/v1/finance/api/v1/finance/timeseries/{ticker.upper()}",
+                "get", f"/api/v1/finance/timeseries/{ticker.upper()}",
                 params={"period": period, "interval": interval},
             )
             response.raise_for_status()
@@ -276,7 +276,7 @@ class BodegaIntelClient:
         try:
             response = await self._request(
                 "get",
-                f"/api/v1/finance/api/v1/finance/complete/{ticker.upper()}"
+                f"/api/v1/finance/complete/{ticker.upper()}"
             )
             response.raise_for_status()
             return response.json()
@@ -289,7 +289,7 @@ class BodegaIntelClient:
         try:
             response = await self._request(
                 "get",
-                f"/api/v1/finance/api/v1/finance/statements/{ticker.upper()}"
+                f"/api/v1/finance/statements/{ticker.upper()}"
             )
             response.raise_for_status()
             return response.json()
@@ -302,7 +302,7 @@ class BodegaIntelClient:
         try:
             response = await self._request(
                 "get",
-                f"/api/v1/finance/api/v1/finance/options/{ticker.upper()}"
+                f"/api/v1/finance/options/{ticker.upper()}"
             )
             response.raise_for_status()
             return response.json()
@@ -416,7 +416,7 @@ class BodegaIntelClient:
         """Get trending news topics."""
         try:
             response = await self._request(
-                "get","/api/v1/news/api/v1/news/trending")
+                "get","/api/v1/news/trending")
             response.raise_for_status()
             return response.json()
         except httpx.HTTPError as e:
@@ -428,7 +428,7 @@ class BodegaIntelClient:
         try:
             response = await self._request(
                 "get",
-                f"/api/v1/news/api/v1/news/locations/{location}",
+                f"/api/v1/news/locations/{location}",
                 params={"period": period},
             )
             response.raise_for_status()
@@ -442,7 +442,7 @@ class BodegaIntelClient:
         try:
             response = await self._request(
                 "get",
-                f"/api/v1/news/api/v1/news/sites/{domain}",
+                f"/api/v1/news/sites/{domain}",
                 params={"period": period},
             )
             response.raise_for_status()
@@ -458,7 +458,7 @@ class BodegaIntelClient:
         try:
             response = await self._request(
                 "get",
-                "/api/v1/entertainment/api/v1/entertainment/movies/search",
+                "/api/v1/entertainment/movies/search",
                 params={"query": query},
             )
             response.raise_for_status()
@@ -472,7 +472,7 @@ class BodegaIntelClient:
         try:
             response = await self._request(
                 "get",
-                f"/api/v1/entertainment/api/v1/entertainment/movies/{movie_id}"
+                f"/api/v1/entertainment/movies/{movie_id}"
             )
             response.raise_for_status()
             return response.json()
@@ -485,7 +485,7 @@ class BodegaIntelClient:
         try:
             response = await self._request(
                 "get",
-                "/api/v1/entertainment/api/v1/entertainment/tv/search",
+                "/api/v1/entertainment/tv/search",
                 params={"query": query},
             )
             response.raise_for_status()
@@ -499,7 +499,7 @@ class BodegaIntelClient:
         try:
             response = await self._request(
                 "get",
-                "/api/v1/entertainment/api/v1/entertainment/movies/popular"
+                "/api/v1/entertainment/movies/popular"
             )
             response.raise_for_status()
             return response.json()

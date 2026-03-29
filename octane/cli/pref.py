@@ -15,10 +15,12 @@ pref_app = typer.Typer(
 )
 
 _PREF_CHOICES: dict[str, list[str]] = {
-    "verbosity":      ["concise", "detailed"],
-    "expertise":      ["beginner", "intermediate", "advanced"],
-    "response_style": ["prose", "bullets", "code-first"],
-    "domains":        [],
+    "verbosity":              ["concise", "detailed"],
+    "expertise":              ["beginner", "intermediate", "advanced"],
+    "response_style":         ["prose", "bullets", "code-first"],
+    "domains":                [],
+    "assistant_name":         [],
+    "assistant_personality":  [],
 }
 
 

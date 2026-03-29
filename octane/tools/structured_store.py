@@ -565,3 +565,238 @@ class EmbeddingEngine:
             *params,
         )
         return [dict(r) for r in rows]
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ExtractionStore  (Session 36)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class ExtractionStore:
+    """Persist and query extracted documents (YouTube, arXiv, PDF, EPUB, web).
+
+    Dedup-aware via ``content_hash``.  Also writes a local Markdown mirror
+    to ``~/.octane/extractions/<hash>.md``.
+    """
+
+    _EXTRACTIONS_DIR = Path.home() / ".octane" / "extractions"
+
+    def __init__(self, pg) -> None:
+        self._pg = pg
+
+    async def store(
+        self,
+        source_type: str,
+        source_url: str,
+        title: str = "",
+        author: str = "",
+        raw_text: str = "",
+        chunks: list[dict] | None = None,
+        extraction_method: str = "",
+        reliability_score: float = 0.5,
+        metadata: dict | None = None,
+        content_hash: str = "",
+        project_id: int | None = None,
+    ) -> dict | None:
+        """Insert an extracted document (upsert on content_hash)."""
+        import json as _json
+
+        if not content_hash and raw_text:
+            content_hash = hashlib.sha256(raw_text.encode()).hexdigest()[:16]
+
+        total_words = len(raw_text.split()) if raw_text else 0
+        chunks_list = chunks or []
+        chunks_json = _json.dumps(chunks_list)
+        meta_json = _json.dumps(metadata or {})
+
+        # Write local file mirror
+        local_path = self._write_local_mirror(
+            content_hash, title, source_type, source_url, raw_text, author,
+        )
+
+        row = await self._pg.fetchrow(
+            """
+            INSERT INTO extracted_documents
+                (project_id, source_type, source_url, content_hash, title,
+                 author, raw_text, chunks, total_words, total_chunks,
+                 extraction_method, reliability_score, metadata, local_path)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9, $10,
+                    $11, $12, $13::jsonb, $14)
+            ON CONFLICT (content_hash) WHERE content_hash != ''
+            DO UPDATE SET
+                title             = EXCLUDED.title,
+                raw_text          = EXCLUDED.raw_text,
+                chunks            = EXCLUDED.chunks,
+                total_words       = EXCLUDED.total_words,
+                total_chunks      = EXCLUDED.total_chunks,
+                extraction_method = EXCLUDED.extraction_method,
+                reliability_score = EXCLUDED.reliability_score,
+                metadata          = EXCLUDED.metadata,
+                local_path        = EXCLUDED.local_path,
+                extracted_at      = NOW()
+            RETURNING *
+            """,
+            project_id, source_type, source_url, content_hash, title,
+            author, raw_text, chunks_json, total_words, len(chunks_list),
+            extraction_method, reliability_score, meta_json, local_path,
+        )
+        if row:
+            logger.info(
+                "extraction_stored",
+                source_type=source_type,
+                url=source_url[:80],
+                words=total_words,
+                chunks=len(chunks_list),
+            )
+        return row
+
+    async def seen(self, content_hash: str) -> bool:
+        """Return True if this content hash is already stored."""
+        if not content_hash:
+            return False
+        row = await self._pg.fetchrow(
+            "SELECT id FROM extracted_documents WHERE content_hash = $1",
+            content_hash,
+        )
+        return row is not None
+
+    async def get_by_hash(self, content_hash: str) -> dict | None:
+        """Fetch an extraction by its content hash."""
+        return await self._pg.fetchrow(
+            "SELECT * FROM extracted_documents WHERE content_hash = $1",
+            content_hash,
+        )
+
+    async def get_by_url(self, source_url: str) -> dict | None:
+        """Fetch most recent extraction for a given URL."""
+        return await self._pg.fetchrow(
+            "SELECT * FROM extracted_documents WHERE source_url = $1 "
+            "ORDER BY extracted_at DESC LIMIT 1",
+            source_url,
+        )
+
+    async def search(
+        self,
+        query: str,
+        source_type: str | None = None,
+        limit: int = 20,
+    ) -> list[dict]:
+        """Full-text search across title, author, and raw_text."""
+        clauses = ["(raw_text ILIKE $1 OR title ILIKE $1 OR author ILIKE $1)"]
+        params: list[Any] = [f"%{query}%"]
+        if source_type:
+            params.append(source_type)
+            clauses.append(f"source_type = ${len(params)}")
+        params.append(limit)
+        where = " AND ".join(clauses)
+        return await self._pg.fetch(
+            f"""
+            SELECT id, source_type, source_url, title, author,
+                   total_words, total_chunks, content_hash,
+                   reliability_score, extracted_at,
+                   LEFT(raw_text, 500) AS preview
+            FROM extracted_documents
+            WHERE {where}
+            ORDER BY extracted_at DESC
+            LIMIT ${len(params)}
+            """,
+            *params,
+        )
+
+    async def recent(
+        self,
+        source_type: str | None = None,
+        limit: int = 20,
+    ) -> list[dict]:
+        """Return most recently extracted documents."""
+        if source_type:
+            return await self._pg.fetch(
+                """
+                SELECT id, source_type, source_url, title, author,
+                       total_words, total_chunks, content_hash,
+                       reliability_score, extracted_at,
+                       LEFT(raw_text, 500) AS preview
+                FROM extracted_documents
+                WHERE source_type = $1
+                ORDER BY extracted_at DESC LIMIT $2
+                """,
+                source_type, limit,
+            )
+        return await self._pg.fetch(
+            """
+            SELECT id, source_type, source_url, title, author,
+                   total_words, total_chunks, content_hash,
+                   reliability_score, extracted_at,
+                   LEFT(raw_text, 500) AS preview
+            FROM extracted_documents
+            ORDER BY extracted_at DESC LIMIT $1
+            """,
+            limit,
+        )
+
+    async def count(self, source_type: str | None = None) -> int:
+        """Total count, optionally filtered by source_type."""
+        if source_type:
+            val = await self._pg.fetchval(
+                "SELECT COUNT(*) FROM extracted_documents WHERE source_type = $1",
+                source_type,
+            )
+        else:
+            val = await self._pg.fetchval(
+                "SELECT COUNT(*) FROM extracted_documents"
+            )
+        return int(val or 0)
+
+    async def stats(self) -> dict:
+        """Aggregate stats across all extractions."""
+        rows = await self._pg.fetch(
+            """
+            SELECT source_type,
+                   COUNT(*)            AS doc_count,
+                   COALESCE(SUM(total_words), 0)  AS total_words,
+                   COALESCE(SUM(total_chunks), 0) AS total_chunks
+            FROM extracted_documents
+            GROUP BY source_type
+            ORDER BY doc_count DESC
+            """
+        )
+        total_docs = sum(r["doc_count"] for r in rows) if rows else 0
+        total_words = sum(r["total_words"] for r in rows) if rows else 0
+        return {
+            "total_docs": total_docs,
+            "total_words": total_words,
+            "by_source": rows or [],
+        }
+
+    def _write_local_mirror(
+        self,
+        content_hash: str,
+        title: str,
+        source_type: str,
+        source_url: str,
+        raw_text: str,
+        author: str,
+    ) -> str:
+        """Write a Markdown file to ~/.octane/extractions/. Returns the path."""
+        if not content_hash or not raw_text:
+            return ""
+        try:
+            self._EXTRACTIONS_DIR.mkdir(parents=True, exist_ok=True)
+            fname = f"{content_hash}.md"
+            path = self._EXTRACTIONS_DIR / fname
+            lines = [
+                f"# {title or 'Untitled'}",
+                "",
+                f"**Source:** {source_type}  ",
+                f"**URL:** {source_url}  ",
+                f"**Author:** {author}  ",
+                f"**Hash:** {content_hash}  ",
+                "",
+                "---",
+                "",
+                raw_text,
+            ]
+            path.write_text("\n".join(lines), encoding="utf-8")
+            return str(path)
+        except Exception as exc:
+            logger.warning("local_mirror_write_failed", error=str(exc))
+            return ""

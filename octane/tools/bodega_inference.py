@@ -505,3 +505,14 @@ class BodegaInferenceClient:
         response = await client.post("/v1/admin/unload-model")
         response.raise_for_status()
         return response.json()
+
+    async def unload_model_by_id(self, model_id: str) -> dict[str, Any]:
+        """Unload a specific model by ID.
+
+        Uses the per-model ``DELETE /v1/admin/unload-model/{model_id}``
+        endpoint.
+        """
+        client = await self._get_client()
+        response = await client.request("DELETE", f"/v1/admin/unload-model/{model_id}")
+        response.raise_for_status()
+        return response.json()

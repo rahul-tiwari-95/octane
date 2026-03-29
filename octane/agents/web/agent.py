@@ -363,6 +363,8 @@ class WebAgent(BaseAgent):
         ambiguity and may ask the user 1-3 multiple-choice questions before deepening.
         """
         cid = request.correlation_id
+        import time as _time
+        _t0 = _time.monotonic()
         strategies = await self._strategist.strategize(
             query, context={"sub_agent": "news"}
         )
@@ -567,10 +569,13 @@ class WebAgent(BaseAgent):
 
         # ── Synthesis ─────────────────────────────────────────────────────────
         if all_usable:
+            total_bytes = sum(len(a.text.encode()) for a in all_usable if a.text)
             self._emit(cid, "web_synthesis", {
                 "n_articles": len(all_usable),
                 "deep": deep,
                 "mode": "REASON+3000tok" if deep else "MID+768tok",
+                "bytes_extracted": total_bytes,
+                "wall_ms": round((_time.monotonic() - _t0) * 1000),
             })
             summary = await self._synthesizer.synthesize_with_content(query, all_usable, deep=deep)
             return AgentResponse(
@@ -750,6 +755,8 @@ class WebAgent(BaseAgent):
         request.context — asks the user 1-3 MCQ questions to steer deepening.
         """
         cid = request.correlation_id
+        import time as _time
+        _t0 = _time.monotonic()
 
         # Generate 2-3 search variations
         strategies = await self._strategist.strategize(query)
@@ -944,10 +951,13 @@ class WebAgent(BaseAgent):
 
         # ── Synthesis ─────────────────────────────────────────────────────────
         if all_usable:
+            total_bytes = sum(len(a.text.encode()) for a in all_usable if a.text)
             self._emit(cid, "web_synthesis", {
                 "n_articles": len(all_usable),
                 "deep": deep,
                 "mode": "REASON+3000tok" if deep else "MID+768tok",
+                "bytes_extracted": total_bytes,
+                "wall_ms": round((_time.monotonic() - _t0) * 1000),
             })
             summary = await self._synthesizer.synthesize_with_content(query, all_usable, deep=deep)
             return AgentResponse(

@@ -17,6 +17,8 @@ _CHAT_HELP = """[bold]Slash commands:[/]
   [cyan]/trace [id][/]    — show Synapse trace for last response (or a specific id)
   [cyan]/history[/]       — print current conversation history
   [cyan]/clear[/]         — clear conversation history and start fresh
+  [cyan]/persona[/]       — show current persona settings
+  [cyan]/name <name>[/]   — set your assistant's name
   [cyan]/exit[/]          — end the session (also: exit, quit, q)
 """
 
@@ -31,7 +33,12 @@ def chat(
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Enable debug logging"),
 ):
     """💬 Interactive multi-turn chat session with Octane."""
-    if verbose:
+    if not verbose:
+        # Chat mode suppresses info-level logs for a clean UX.
+        # Only warnings/errors will appear.
+        from octane.utils import setup_logging
+        setup_logging(level_override="warning")
+    else:
         from octane.utils import setup_logging
         setup_logging(level_override="debug")
     asyncio.run(_chat())
@@ -39,7 +46,9 @@ def chat(
 
 async def _chat():
     from octane.osa.orchestrator import Orchestrator
+    from octane.osa.chat_engine import ChatEngine
     from octane.tools.topology import detect_topology, get_topology, ModelTier
+    from octane.agents.pnl.preference_manager import PreferenceManager
 
     synapse = _get_synapse()
     osa = Orchestrator(synapse, hil_interactive=True)
@@ -49,30 +58,78 @@ async def _chat():
     last_correlation_id: str | None = None
     deep_mode = False
 
+    # ── Load persona from prefs ──────────────────────────────────────────
+    pm = PreferenceManager()
+    persona = {}
+    try:
+        persona = await pm.get_all("default")
+    except Exception:
+        pass
+
+    assistant_name = persona.get("assistant_name", "octane")
+    display_name = assistant_name.capitalize()
+
+    # ── Premium mode banner ──────────────────────────────────────────────
+    topo_name = detect_topology()
+    topo = get_topology(topo_name)
+    reason_cfg = topo.resolve_config(ModelTier.REASON)
+
     console.print(Panel(
-        "[bold green]Octane Chat[/]\n"
-        "[dim]Type your message and press Enter. "
+        f"[bold green]{display_name} Chat[/]\n"
+        "[dim]Chat is Octane's premium mode — natural conversation that\n"
+        "spawns commands, searches, and analysis behind the scenes.\n\n"
+        f"[yellow]⚡ Will load [bold]{reason_cfg.model_id}[/bold] exclusively.\n"
+        "   Other models will be unloaded to free memory.\n"
+        "   May require more RAM and energy on battery.[/]\n\n"
+        "Type your message and press Enter. "
         "Use [bold cyan]/help[/bold cyan] for slash commands, "
-        "[bold cyan]/deep[/bold cyan] to toggle deep mode, "
-        "[bold]exit[/bold] or [bold]quit[/bold] to end.[/]",
+        f"[bold]exit[/bold] or [bold]quit[/bold] to end.[/]",
         border_style="green",
     ))
 
-    with console.status("[dim]Starting up...[/]", spinner="dots"):
+    # ── Pre-flight: wait for Bodega ──────────────────────────────────────
+    with console.status("[dim]Connecting to Bodega...[/]", spinner="dots"):
         status = await osa.pre_flight(wait_for_bodega=True)
 
-    if status["bodega_reachable"] and status["model_loaded"]:
-        try:
-            topo_name = detect_topology()
-            topo = get_topology(topo_name)
-            reason_model = topo.resolve(ModelTier.REASON)
-            console.print(f"[dim]🧠 {reason_model} ready · topology: {topo_name}[/]\n")
-        except Exception:
-            model_display = (status.get("model") or "").split("/")[-1] or "model loaded"
-            console.print(f"[dim]🧠 {model_display} ready[/]\n")
+    # ── Prepare inference engine: unload all, load REASON ────────────────
+    if status["bodega_reachable"] and hasattr(osa.bodega, 'prepare_for_chat'):
+        with console.status(
+            f"[dim]Preparing {reason_cfg.model_id} for chat...[/]",
+            spinner="dots",
+        ):
+            prep = await osa.bodega.prepare_for_chat(
+                on_status=lambda msg: None,  # silent — spinner handles UI
+            )
+
+        if prep.get("already_ready"):
+            console.print(f"[dim]🧠 {reason_cfg.model_id} ready · topology: {topo_name}[/]")
+        else:
+            unloaded = prep.get("unloaded", [])
+            if unloaded:
+                console.print(f"[dim]  ⏏ Unloaded: {', '.join(unloaded)}[/]")
+            loaded = prep.get("loaded_model")
+            if loaded:
+                console.print(f"[dim]🧠 {loaded} loaded · topology: {topo_name}[/]")
+            else:
+                console.print(
+                    f"[yellow]⚠ Could not load {reason_cfg.model_id}. "
+                    "Chat will use the best available model.[/]"
+                )
+    elif status["bodega_reachable"] and status["model_loaded"]:
+        model_display = (status.get("model") or "").split("/")[-1] or "model loaded"
+        console.print(f"[dim]🧠 {model_display} ready · topology: {topo_name}[/]")
     else:
         note = status.get("note", "Bodega offline")
-        console.print(f"[yellow]⚠ {note}[/]\n")
+        console.print(f"[yellow]⚠ {note}[/]")
+
+    console.print()  # blank line before first prompt
+
+    # ── Create the ChatEngine ────────────────────────────────────────────
+    engine = ChatEngine(
+        bodega=osa.bodega,
+        orchestrator=osa,
+        persona=persona,
+    )
 
     turn = 0
     while True:
@@ -110,7 +167,7 @@ async def _chat():
                     console.print("[dim]No history yet.[/]\n")
                 else:
                     for i, msg in enumerate(conversation_history, 1):
-                        role_tag = "[bold cyan]You:[/]" if msg["role"] == "user" else "[bold green]Octane:[/]"
+                        role_tag = "[bold cyan]You:[/]" if msg["role"] == "user" else f"[bold green]{display_name}:[/]"
                         preview = msg["content"][:120].replace("\n", " ")
                         console.print(f"  {i}. {role_tag} {preview}")
                     console.print()
@@ -124,8 +181,36 @@ async def _chat():
                     console.print("[yellow]No trace available yet — ask something first.[/]\n")
                 continue
 
+            elif cmd == "/persona":
+                console.print(
+                    f"  [cyan]Name:[/] [bold]{display_name}[/]\n"
+                    f"  [cyan]Personality:[/] {engine.personality}\n"
+                    f"  [dim]Change with: /name <new_name> or octane pref set assistant_personality \"...\"[/]\n"
+                )
+                continue
+
+            elif cmd == "/name":
+                if len(parts) > 1:
+                    new_name = parts[1].strip()
+                    try:
+                        await pm.set("default", "assistant_name", new_name)
+                        persona["assistant_name"] = new_name
+                        engine.update_persona(persona)
+                        assistant_name = new_name
+                        display_name = new_name.capitalize()
+                        console.print(f"[green]✅ Assistant name set to [bold]{display_name}[/][/]\n")
+                    except Exception:
+                        console.print(f"[yellow]Name updated for this session: [bold]{new_name.capitalize()}[/][/]\n")
+                        persona["assistant_name"] = new_name
+                        engine.update_persona(persona)
+                        assistant_name = new_name
+                        display_name = new_name.capitalize()
+                else:
+                    console.print(f"[yellow]Usage: /name <new_name>  (currently: {display_name})[/]\n")
+                continue
+
             elif cmd in ("/exit", "/quit"):
-                console.print("[dim]Goodbye.[/]")
+                console.print(f"[dim]{display_name}: Goodbye.[/]")
                 break
 
             else:
@@ -133,7 +218,7 @@ async def _chat():
                 continue
 
         if query.lower() in ("exit", "quit", "bye", "q"):
-            console.print("[dim]Goodbye.[/]")
+            console.print(f"[dim]{display_name}: Goodbye.[/]")
             break
 
         turn += 1
@@ -145,20 +230,34 @@ async def _chat():
         _first = True
         t0 = time.monotonic()
 
-        extra_metadata = {"deep": True} if deep_mode else None
-
-        async for chunk in osa.run_stream(
-            query,
-            session_id=session_id,
-            conversation_history=conversation_history,
-            extra_metadata=extra_metadata,
-        ):
-            if _first:
-                _status.stop()
-                console.print(f"\n[bold green]Octane:[/] ", end="")
-                _first = False
-            console.print(chunk, end="")
-            response_parts.append(chunk)
+        # ── Deep mode goes through OSA directly ──────────────────────────
+        if deep_mode:
+            extra_metadata = {"deep": True}
+            async for chunk in osa.run_stream(
+                query,
+                session_id=session_id,
+                conversation_history=conversation_history,
+                extra_metadata=extra_metadata,
+            ):
+                if _first:
+                    _status.stop()
+                    console.print(f"\n[bold green]{display_name}:[/] ", end="")
+                    _first = False
+                console.print(chunk, end="")
+                response_parts.append(chunk)
+        else:
+            # ── ChatEngine handles intent routing ────────────────────────
+            async for chunk in engine.respond(
+                query,
+                session_id=session_id,
+                conversation_history=conversation_history,
+            ):
+                if _first:
+                    _status.stop()
+                    console.print(f"\n[bold green]{display_name}:[/] ", end="")
+                    _first = False
+                console.print(chunk, end="")
+                response_parts.append(chunk)
 
         if _first:
             _status.stop()

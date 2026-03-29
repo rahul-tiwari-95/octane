@@ -88,8 +88,10 @@ class TestRecallNoData:
             patch("octane.tools.bodega_router.BodegaRouter"),
             patch("redis.asyncio.from_url", return_value=mock_r),
             patch("octane.cli.ask.console") as mock_console,
+            patch("octane.cli.ask.err_console") as mock_err_console,
         ):
             mock_console.print = lambda *a, **kw: output_lines.append(str(a))
+            mock_err_console.print = lambda *a, **kw: output_lines.append(str(a))
             mock_console.status = MagicMock().__enter__ = MagicMock(return_value=MagicMock())
             _run(_ask_recall("NVDA earnings"))
 

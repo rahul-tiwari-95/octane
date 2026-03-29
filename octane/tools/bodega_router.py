@@ -408,6 +408,90 @@ class BodegaRouter:
 
         return None
 
+    # ── Chat premium mode ─────────────────────────────────────────────────────
+
+    async def prepare_for_chat(
+        self,
+        *,
+        on_status: Any | None = None,
+    ) -> dict[str, Any]:
+        """Prepare the inference engine for chat premium mode.
+
+        Unloads all models except REASON, then ensures the REASON-tier
+        model is loaded.  Returns a status dict with details.
+
+        Args:
+            on_status: Optional callable(msg: str) for progress messages.
+        """
+        def _emit(msg: str) -> None:
+            if on_status:
+                on_status(msg)
+
+        result: dict[str, Any] = {
+            "unloaded": [],
+            "loaded_model": None,
+            "already_ready": False,
+        }
+
+        reason_cfg = self._topology.resolve_config(ModelTier.REASON)
+        reason_id = reason_cfg.model_id
+        reason_path = reason_cfg.model_path
+
+        loaded = await self._fetch_loaded_models()
+        if not loaded:
+            _emit("No models currently loaded")
+
+        # Check if REASON is already the only model loaded
+        loaded_ids = set(loaded.keys())
+        reason_already = reason_id in loaded_ids or any(
+            lid.lower() == reason_path.lower() for lid in loaded_ids
+        )
+
+        non_reason = [
+            mid for mid in loaded_ids
+            if mid != reason_id and mid.lower() != reason_path.lower()
+        ]
+
+        if reason_already and not non_reason:
+            result["already_ready"] = True
+            result["loaded_model"] = reason_id
+            _emit(f"{reason_id} already loaded exclusively")
+            return result
+
+        # Unload all non-REASON models
+        for model_id in non_reason:
+            _emit(f"Unloading {model_id}...")
+            try:
+                await self._client.unload_model_by_id(model_id)
+                result["unloaded"].append(model_id)
+                logger.info("chat_unloaded_model", model_id=model_id)
+            except Exception as exc:
+                logger.warning("chat_unload_failed", model_id=model_id, error=str(exc))
+
+        self.invalidate_model_cache()
+
+        # Load REASON if not already loaded
+        if not reason_already:
+            _emit(f"Loading {reason_id}...")
+            try:
+                params = reason_cfg.to_load_params()
+                client = await self._client._get_client()
+                resp = await client.post("/v1/admin/load-model", json=params)
+                resp.raise_for_status()
+                load_result = resp.json()
+                if load_result.get("status") == "loaded":
+                    self.invalidate_model_cache()
+                    result["loaded_model"] = reason_id
+                    _emit(f"{reason_id} loaded")
+                else:
+                    logger.warning("chat_reason_load_unexpected", result=load_result)
+            except Exception as exc:
+                logger.warning("chat_reason_load_failed", error=str(exc))
+        else:
+            result["loaded_model"] = reason_id
+
+        return result
+
     # ── Topology helpers ──────────────────────────────────────────────────────
 
     def resolve_config(self, tier: ModelTier) -> ModelConfig:

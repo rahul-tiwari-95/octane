@@ -123,6 +123,9 @@ def _build_console() -> Console:
 
 console = _build_console()
 
+# stderr console for diagnostic / banner text — keeps stdout clean for piping.
+err_console = Console(stderr=True, highlight=False)
+
 
 def _get_synapse():
     """Get or create the global SynapseEventBus."""

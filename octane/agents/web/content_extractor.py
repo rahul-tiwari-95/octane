@@ -98,6 +98,12 @@ class ContentExtractor:
         self.max_chars_per_source = max_chars_per_source
         self.timeout = timeout
         self.available = _TRAFILATURA_AVAILABLE
+        # Serialize trafilatura calls — lxml/libxml2 has thread-unsafe
+        # global state that corrupts the heap when >1 thread parses
+        # HTML concurrently (manifests as malloc "pointer being freed
+        # was not allocated").  Allow 2 concurrent extractions which
+        # is safe on macOS/CPython GIL and keeps throughput reasonable.
+        self._extract_sem: asyncio.Semaphore | None = None
 
     # ── public helpers ────────────────────────────────────────────────────
 
@@ -113,6 +119,12 @@ class ContentExtractor:
         if last_space > max_chars // 2:
             return truncated[:last_space]
         return truncated
+
+    def _sem(self) -> asyncio.Semaphore:
+        """Lazy-init semaphore (must be created inside a running loop)."""
+        if self._extract_sem is None:
+            self._extract_sem = asyncio.Semaphore(1)
+        return self._extract_sem
 
     async def extract_url(
         self,
@@ -135,11 +147,8 @@ class ContentExtractor:
             logger.debug("trafilatura_unavailable", url=url)
             return ExtractedContent(url=url, text="", word_count=0, method="unavailable")
 
-        try:
-            # Wrap both synchronous trafilatura calls in threads so the event loop
-            # is not blocked (trafilatura uses urllib3 internally).
-            # Also enforce self.timeout so a slow/hung URL can't stall the whole
-            # extraction batch indefinitely.
+        async with self._sem():
+          try:
             html: str | None = await asyncio.wait_for(
                 asyncio.to_thread(trafilatura.fetch_url, url),
                 timeout=self.timeout,
@@ -171,7 +180,6 @@ class ContentExtractor:
                     method="failed", error="extracted text too short",
                 )
 
-            # Extract page title from metadata (fast, CPU-only, no extra fetch)
             page_title = ""
             try:
                 meta = trafilatura.extract_metadata(html, default_url=url)
@@ -188,7 +196,7 @@ class ContentExtractor:
                 title=page_title,
             )
 
-        except Exception as exc:
+          except Exception as exc:
             logger.warning("trafilatura_error", url=url, error=str(exc))
             return ExtractedContent(
                 url=url, text="", word_count=0, method="failed", error=str(exc),

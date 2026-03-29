@@ -10,7 +10,7 @@ from rich.rule import Rule
 from rich.table import Table
 from rich.text import Text
 
-from octane.cli._shared import console, _get_synapse, _try_daemon_route, _print_dag_trace
+from octane.cli._shared import console, err_console, _get_synapse, _try_daemon_route, _print_dag_trace
 
 
 def register(app: typer.Typer) -> None:
@@ -368,8 +368,8 @@ async def _ask_recall(query: str) -> None:
     from octane.tools.topology import ModelTier, detect_topology, get_topology
     from octane.config import settings
 
-    console.print(f"\n[bold cyan]📚 Recall mode[/] — querying stored data only\n")
-    console.print(f"[dim]Query: {query}[/]\n")
+    err_console.print(f"\n[bold cyan]📚 Recall mode[/] — querying stored data only\n")
+    err_console.print(f"[dim]Query: {query}[/]\n")
 
     # ── 1. Pull context from Postgres ─────────────────────────────────────────
     pg = PgClient()
@@ -421,7 +421,7 @@ async def _ask_recall(query: str) -> None:
                 + str(row["content"] or "")[:2000]
             )
     else:
-        console.print("[yellow]⚠ Postgres unavailable — recall context will be empty[/]")
+        err_console.print("[yellow]⚠ Postgres unavailable — recall context will be empty[/]")
 
     await pg.close()
 
@@ -448,7 +448,7 @@ async def _ask_recall(query: str) -> None:
     # ── 3. Build context block ────────────────────────────────────────────────
     total_sources = len(findings_chunks) + len(pages_chunks)
     if total_sources == 0 and not redis_tasks:
-        console.print(
+        err_console.print(
             "[yellow]No stored data matches your query.[/]\n"
             "[dim]  Run [bold]octane research start \"<topic>\"[/bold] to build a research corpus.\n"
             "  Run [bold]octane ask \"<query>\"[/bold] to run a live query (stores pages automatically).[/]"
@@ -479,7 +479,7 @@ async def _ask_recall(query: str) -> None:
     prompt = f"## Stored Context\n\n{context}\n\n---\n\n## Question\n\n{query}"
 
     # ── 4. Print recall summary ───────────────────────────────────────────────
-    console.print(
+    err_console.print(
         f"[dim]Sources: [bold]{len(findings_chunks)}[/bold] research findings  ·  "
         f"[bold]{len(pages_chunks)}[/bold] web pages  ·  "
         f"[bold]{len(redis_tasks)}[/bold] active tasks  ·  "
@@ -490,10 +490,10 @@ async def _ask_recall(query: str) -> None:
     topo = get_topology(detect_topology())
     router = BodegaRouter(topology=topo)
 
-    with console.status("[dim]Connecting to inference engine...[/]", spinner="dots"):
+    with err_console.status("[dim]Connecting to inference engine...[/]", spinner="dots"):
         health = await router._client.health()
         if health.get("status") != "ok":
-            console.print("[red]Bodega inference engine is offline. Start it first.[/]")
+            err_console.print("[red]Bodega inference engine is offline. Start it first.[/]")
             return
 
     console.print("[bold green]🔥 Octane (recall):[/] ", end="")
@@ -512,7 +512,7 @@ async def _ask_recall(query: str) -> None:
         return
 
     console.print("\n")
-    console.print(
+    err_console.print(
         Rule(
             Text(
                 f"  recall   {len(findings_chunks)}f·{len(pages_chunks)}p   ~{word_count}w  ",
@@ -521,7 +521,7 @@ async def _ask_recall(query: str) -> None:
             style="dim",
         )
     )
-    console.print(
+    err_console.print(
         "[dim]  Run [bold]octane store findings[/bold] to browse research findings\n"
         "  Run [bold]octane store pages[/bold] to browse stored web pages\n"
         "  Run [bold]octane store stats[/bold] to see all Postgres/Redis data[/]"

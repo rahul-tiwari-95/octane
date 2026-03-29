@@ -1,0 +1,542 @@
+"""Chat Engine — the brain behind octane chat.
+
+Session 37: Crown Jewel Chat.
+
+Handles all five intent paths:
+    CONVERSATION → direct LLM with persona (sub-second, no agents)
+    COMMAND      → CommandMapper → execute → synthesize
+    RECALL       → memory search → synthesize
+    ANALYSIS     → full OSA pipeline (existing)
+    WEB          → full OSA pipeline (existing)
+
+Key features:
+    - Persona-aware system prompts (name, personality from prefs)
+    - Reasoning stream: shows plan in readable bullet points before execution
+    - Steering window: 10-second pause after reasoning for user course-correction
+"""
+
+from __future__ import annotations
+
+import asyncio
+import re
+import time
+from collections.abc import AsyncIterator
+
+import structlog
+
+from octane.osa.intent_gate import Intent, IntentGate
+from octane.osa.command_mapper import CommandMapper, CommandPlan, MappedCommand
+from octane.tools.topology import ModelTier
+
+logger = structlog.get_logger().bind(component="chat_engine")
+
+
+def build_persona_prompt(
+    assistant_name: str = "octane",
+    personality: str = "helpful, direct, and knowledgeable",
+    user_name: str | None = None,
+) -> str:
+    """Build a persona-aware system prompt for conversational mode."""
+    name = assistant_name.capitalize()
+    lines = [
+        f"You are {name}, a personal AI assistant.",
+        f"Your personality: {personality}.",
+        "",
+        "You have access to a powerful knowledge system called Octane that can:",
+        "- Search the web, fetch stock prices, get news",
+        "- Research topics in depth, compare items side-by-side",
+        "- Remember and recall past conversations and stored knowledge",
+        "- Manage a financial portfolio, extract articles, generate code",
+        "",
+        "But right now you're in conversational mode — just be yourself.",
+        "Be natural, warm, and conversational. Keep responses concise unless",
+        "the user wants to go deeper. Don't be robotic.",
+        "",
+        "If the user asks you to do something that requires tools or data,",
+        "tell them naturally that you'll look into it (the system will handle routing).",
+    ]
+    if user_name:
+        lines.append(f"\nThe user's name is {user_name}.")
+
+    return "\n".join(lines)
+
+
+def build_command_synthesis_prompt(
+    assistant_name: str = "octane",
+    personality: str = "helpful, direct, and knowledgeable",
+) -> str:
+    """System prompt for synthesizing command results conversationally."""
+    name = assistant_name.capitalize()
+    return (
+        f"You are {name}, a personal AI assistant. "
+        f"Your personality: {personality}.\n\n"
+        "You just executed some operations on behalf of the user. "
+        "Present the results naturally and conversationally — don't just dump data.\n"
+        "Highlight what matters. If there are numbers, give context.\n"
+        "Be concise but insightful. If something looks notable (big gain, unusual data), "
+        "call it out."
+    )
+
+
+class ChatEngine:
+    """Core chat engine with intent-based routing and persona support."""
+
+    def __init__(
+        self,
+        bodega=None,
+        orchestrator=None,
+        persona: dict | None = None,
+    ) -> None:
+        self._bodega = bodega
+        self._orchestrator = orchestrator
+        self._gate = IntentGate(bodega=bodega)
+        self._mapper = CommandMapper(bodega=bodega)
+        self._persona = persona or {}
+
+    @property
+    def assistant_name(self) -> str:
+        return self._persona.get("assistant_name", "octane")
+
+    @property
+    def personality(self) -> str:
+        return self._persona.get("assistant_personality", "helpful, direct, and knowledgeable")
+
+    def update_persona(self, persona: dict) -> None:
+        self._persona = persona
+
+    # ── Main entry point ─────────────────────────────────────────────────────
+
+    async def respond(
+        self,
+        query: str,
+        session_id: str,
+        conversation_history: list[dict[str, str]],
+    ) -> AsyncIterator[str]:
+        """Route and respond to a user message. Yields streaming chunks."""
+
+        intent, reasoning = await self._gate.classify(query, conversation_history)
+
+        logger.info(
+            "intent_classified",
+            intent=intent.value,
+            reasoning=reasoning,
+            query=query[:80],
+        )
+
+        if intent == Intent.CONVERSATION:
+            async for chunk in self._handle_conversation(query, conversation_history):
+                yield chunk
+
+        elif intent == Intent.COMMAND:
+            async for chunk in self._handle_command(query, session_id, conversation_history):
+                yield chunk
+
+        elif intent == Intent.RECALL:
+            async for chunk in self._handle_recall(query, session_id, conversation_history):
+                yield chunk
+
+        elif intent in (Intent.ANALYSIS, Intent.WEB):
+            async for chunk in self._handle_osa(query, session_id, conversation_history, intent):
+                yield chunk
+
+    # ── CONVERSATION path ────────────────────────────────────────────────────
+    # Direct LLM call with persona. No agents, no web search.
+
+    async def _handle_conversation(
+        self,
+        query: str,
+        conversation_history: list[dict[str, str]],
+    ) -> AsyncIterator[str]:
+        """Fast conversational response — direct LLM, no agents."""
+        system = build_persona_prompt(
+            assistant_name=self.assistant_name,
+            personality=self.personality,
+        )
+
+        # Build messages with conversation history
+        messages: list[dict[str, str]] = [{"role": "system", "content": system}]
+        # Include last 8 turns for continuity
+        for entry in conversation_history[-8:]:
+            messages.append({"role": entry["role"], "content": entry["content"]})
+        messages.append({"role": "user", "content": query})
+
+        if self._bodega is None:
+            yield "I'm having trouble connecting to my language model. Try again in a moment."
+            return
+
+        try:
+            async for chunk in self._bodega.chat_stream(
+                prompt=query,
+                system=system,
+                tier=ModelTier.REASON,
+                temperature=0.7,
+                max_tokens=512,
+            ):
+                # Strip thinking tags in streaming
+                if "<think>" in chunk or "</think>" in chunk:
+                    chunk = re.sub(r"<think>.*?</think>", "", chunk, flags=re.DOTALL)
+                    chunk = re.sub(r"<think>.*$", "", chunk, flags=re.DOTALL)
+                if chunk:
+                    yield chunk
+        except Exception as exc:
+            logger.warning("conversation_llm_failed", error=str(exc))
+            yield "Hmm, I had trouble generating a response. Let me try again."
+
+    # ── COMMAND path ─────────────────────────────────────────────────────────
+    # NL → CommandMapper → reasoning stream → execution → synthesis
+
+    async def _handle_command(
+        self,
+        query: str,
+        session_id: str,
+        conversation_history: list[dict[str, str]],
+    ) -> AsyncIterator[str]:
+        """Map NL to commands, show reasoning, execute, synthesize."""
+
+        # Step 1: Map to commands
+        plan = await self._mapper.map(query, conversation_history)
+
+        # Step 2: Stream reasoning bullets
+        for bullet in plan.reasoning:
+            yield f"  • {bullet}\n"
+
+        if plan.commands:
+            cmd_summary = ", ".join(c.operation for c in plan.commands)
+            yield f"\n  [running: {cmd_summary}]\n\n"
+
+        # Step 3: Execute commands
+        results = await self._execute_commands(plan, session_id)
+
+        # Step 4: Synthesize results conversationally
+        if results:
+            async for chunk in self._synthesize_results(query, results, conversation_history):
+                yield chunk
+        else:
+            yield "I tried to run that but didn't get any results. Could you rephrase?"
+
+    async def _execute_commands(
+        self,
+        plan: CommandPlan,
+        session_id: str,
+    ) -> list[dict]:
+        """Execute mapped commands and return their results."""
+        results = []
+
+        for cmd in plan.commands:
+            try:
+                result = await self._execute_single(cmd, session_id)
+                results.append({
+                    "operation": cmd.operation,
+                    "description": cmd.description,
+                    "success": True,
+                    "output": result,
+                })
+            except Exception as exc:
+                logger.warning(
+                    "command_execution_failed",
+                    operation=cmd.operation,
+                    error=str(exc),
+                )
+                results.append({
+                    "operation": cmd.operation,
+                    "description": cmd.description,
+                    "success": False,
+                    "error": str(exc),
+                })
+
+        return results
+
+    async def _execute_single(self, cmd: MappedCommand, session_id: str) -> str:
+        """Execute a single mapped command and return its output as text.
+
+        For operations that map to existing OSA agent capabilities, we delegate
+        to the Orchestrator. For simpler operations, we call the underlying
+        functions directly.
+        """
+        op = cmd.operation
+        params = cmd.parameters
+
+        # Operations that go through OSA agents (web search, news, finance, code)
+        osa_mapping = {
+            "web.search":       ("web", "search"),
+            "web.news":         ("web", "news"),
+            "web.finance":      ("web", "finance"),
+            "code.generate":    ("code", "full_pipeline"),
+            "system.health":    ("sysstat", "monitor"),
+        }
+
+        if op in osa_mapping and self._orchestrator:
+            agent_name, sub_agent = osa_mapping[op]
+            query = params.get("query", params.get("topic", cmd.description))
+
+            from octane.models.dag import TaskDAG, TaskNode
+            dag = TaskDAG(
+                original_query=query,
+                reasoning=f"Command mapper: {cmd.description}",
+                nodes=[TaskNode(
+                    agent=agent_name,
+                    instruction=query,
+                    metadata={"sub_agent": sub_agent, "template": f"{agent_name}_{sub_agent}"},
+                )],
+            )
+
+            parts = []
+            async for chunk in self._orchestrator.run_from_dag(
+                dag, query, session_id=session_id,
+            ):
+                parts.append(chunk)
+            return "".join(parts)
+
+        # Research operations
+        if op == "research.start":
+            topic = params.get("topic", cmd.description)
+            query = f"research {topic}"
+            if self._orchestrator:
+                from octane.models.dag import TaskDAG, TaskNode
+                dag = TaskDAG(
+                    original_query=query,
+                    reasoning=f"Research: {topic}",
+                    nodes=[TaskNode(
+                        agent="web",
+                        instruction=f"Deep research on: {topic}",
+                        metadata={"sub_agent": "search", "template": "web_search", "deep": True},
+                    )],
+                )
+                parts = []
+                async for chunk in self._orchestrator.run_from_dag(dag, query, session_id=session_id):
+                    parts.append(chunk)
+                return "".join(parts)
+            return f"Research on '{topic}' requires the search pipeline."
+
+        if op == "research.compare":
+            items = params.get("items", [])
+            criteria = params.get("criteria", "")
+            if isinstance(items, list) and len(items) >= 2:
+                query = f"compare {' vs '.join(items)}"
+                if criteria:
+                    query += f" in terms of {criteria}"
+            else:
+                query = cmd.description
+            if self._orchestrator:
+                from octane.models.dag import TaskDAG, TaskNode
+                dag = TaskDAG(
+                    original_query=query,
+                    reasoning=f"Comparison: {query}",
+                    nodes=[TaskNode(
+                        agent="web",
+                        instruction=query,
+                        metadata={"sub_agent": "search", "template": "web_search"},
+                    )],
+                )
+                parts = []
+                async for chunk in self._orchestrator.run_from_dag(dag, query, session_id=session_id):
+                    parts.append(chunk)
+                return "".join(parts)
+
+        # Portfolio operations
+        if op == "portfolio.show":
+            try:
+                from octane.cli.portfolio import _portfolio_show_core
+                return await _portfolio_show_core(prices=params.get("prices", True))
+            except ImportError:
+                return "Portfolio module not available."
+            except Exception as exc:
+                return f"Could not fetch portfolio: {exc}"
+
+        # Recall operations
+        if op in ("recall.search", "recall.stats"):
+            if self._orchestrator:
+                memory_agent = self._orchestrator._get_memory_agent()
+                if memory_agent and op == "recall.search":
+                    result = await memory_agent.recall(session_id, params.get("query", ""))
+                    return result or "No matching memories found."
+            return "Memory search requires a connected session."
+
+        # Stats/status operations
+        if op == "system.stats":
+            return "Use the full `octane stats` command for the stats dashboard."
+
+        if op == "watch.status":
+            return "Use the full `octane watch status` command for monitoring details."
+
+        if op == "model.list":
+            if self._bodega:
+                try:
+                    models = await self._bodega.loaded_models_summary()
+                    if models:
+                        lines = ["Loaded models:"]
+                        for m in models:
+                            lines.append(f"  • {m['id']} ({m['type']}, ctx: {m['context_length']})")
+                        return "\n".join(lines)
+                    return "No models currently loaded."
+                except Exception:
+                    return "Could not fetch model info."
+            return "Bodega not connected."
+
+        if op == "pref.show":
+            return "I'll show your preferences — use `/pref` in chat or `octane pref show`."
+
+        # Extract operations
+        if op == "extract.url":
+            url = params.get("url", "")
+            return f"To extract content from a URL, use: octane extract url \"{url}\""
+
+        if op == "extract.arxiv":
+            q = params.get("query", "")
+            return f"To search arXiv, use: octane extract search-arxiv \"{q}\""
+
+        # Vault operations
+        if op in ("vault.encrypt", "vault.decrypt"):
+            return f"Vault operations require the CLI: octane vault {op.split('.')[1]} <file>"
+
+        return f"Operation {op} acknowledged but not yet wired for chat execution."
+
+    async def _synthesize_results(
+        self,
+        query: str,
+        results: list[dict],
+        conversation_history: list[dict[str, str]],
+    ) -> AsyncIterator[str]:
+        """Synthesize command results into a natural response."""
+        if self._bodega is None:
+            # No LLM — just dump results
+            for r in results:
+                if r["success"]:
+                    yield r["output"]
+                else:
+                    yield f"⚠ {r['operation']} failed: {r.get('error', 'unknown')}"
+            return
+
+        system = build_command_synthesis_prompt(
+            assistant_name=self.assistant_name,
+            personality=self.personality,
+        )
+
+        result_text = "\n\n".join(
+            f"[{r['operation']}] {'SUCCESS' if r['success'] else 'FAILED'}\n"
+            + (r.get("output", "") if r["success"] else f"Error: {r.get('error', '')}")
+            for r in results
+        )
+
+        prompt = (
+            f'User asked: "{query}"\n\n'
+            f"Results:\n{result_text}\n\n"
+            f"Present these results naturally to the user."
+        )
+
+        try:
+            async for chunk in self._bodega.chat_stream(
+                prompt=prompt,
+                system=system,
+                tier=ModelTier.REASON,
+                temperature=0.4,
+                max_tokens=1024,
+            ):
+                if "<think>" in chunk or "</think>" in chunk:
+                    chunk = re.sub(r"<think>.*?</think>", "", chunk, flags=re.DOTALL)
+                    chunk = re.sub(r"<think>.*$", "", chunk, flags=re.DOTALL)
+                if chunk:
+                    yield chunk
+        except Exception as exc:
+            logger.warning("synthesis_failed", error=str(exc))
+            for r in results:
+                if r["success"]:
+                    yield r["output"]
+
+    # ── RECALL path ──────────────────────────────────────────────────────────
+
+    async def _handle_recall(
+        self,
+        query: str,
+        session_id: str,
+        conversation_history: list[dict[str, str]],
+    ) -> AsyncIterator[str]:
+        """Search memory and synthesize results with persona."""
+        yield f"  • Searching my memory...\n\n"
+
+        prior_context = None
+        if self._orchestrator:
+            memory_agent = self._orchestrator._get_memory_agent()
+            if memory_agent:
+                prior_context = await memory_agent.recall(session_id, query)
+
+        if not prior_context:
+            yield (
+                f"I don't have anything stored about that yet. "
+                f"As we chat and you explore topics, I'll build up knowledge about your interests."
+            )
+            return
+
+        # Synthesize recall results with persona
+        if self._bodega:
+            system = build_persona_prompt(
+                assistant_name=self.assistant_name,
+                personality=self.personality,
+            )
+            prompt = (
+                f'User asked: "{query}"\n\n'
+                f"Here's what I found in memory:\n{prior_context}\n\n"
+                f"Share this with the user naturally, as if you're recalling a conversation."
+            )
+            try:
+                async for chunk in self._bodega.chat_stream(
+                    prompt=prompt,
+                    system=system,
+                    tier=ModelTier.REASON,
+                    temperature=0.4,
+                    max_tokens=800,
+                ):
+                    if "<think>" in chunk or "</think>" in chunk:
+                        chunk = re.sub(r"<think>.*?</think>", "", chunk, flags=re.DOTALL)
+                        chunk = re.sub(r"<think>.*$", "", chunk, flags=re.DOTALL)
+                    if chunk:
+                        yield chunk
+            except Exception:
+                yield prior_context
+        else:
+            yield prior_context
+
+    # ── OSA path (analysis + web) ────────────────────────────────────────────
+
+    async def _handle_osa(
+        self,
+        query: str,
+        session_id: str,
+        conversation_history: list[dict[str, str]],
+        intent: Intent,
+    ) -> AsyncIterator[str]:
+        """Delegate to the full OSA pipeline with visible DAG plan."""
+        if self._orchestrator is None:
+            yield "The search pipeline isn't available right now. Try again in a moment."
+            return
+
+        # Decompose first so we can show the plan
+        try:
+            dag = await self._orchestrator.decomposer.decompose(query)
+        except Exception as exc:
+            logger.warning("osa_decompose_failed", error=str(exc))
+            yield "I had trouble planning that. Could you rephrase?"
+            return
+
+        # Show the plan as readable bullets
+        if intent == Intent.ANALYSIS:
+            yield "  • Deep analysis mode\n"
+        else:
+            yield "  • Looking that up\n"
+
+        agents_used = list({n.agent for n in dag.nodes})
+        if agents_used:
+            yield f"  • Agents: {', '.join(agents_used)}\n"
+        if len(dag.nodes) > 1:
+            yield f"  • {len(dag.nodes)} tasks in pipeline\n"
+
+        yield "\n"
+
+        # Execute via run_from_dag (bypasses re-decomposition)
+        async for chunk in self._orchestrator.run_from_dag(
+            dag,
+            query,
+            session_id=session_id,
+            conversation_history=conversation_history,
+        ):
+            yield chunk

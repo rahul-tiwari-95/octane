@@ -168,11 +168,25 @@ def _print_trace_detail(t, verbose: bool) -> None:
         console.print()
         _print_waterfall(real_events, t0, total_ms)
 
+    # ── Summary footer with totals ───────────────────────────────────────
+    total_bytes = 0
+    total_pages = 0
+    for ev in real_events:
+        p = ev.payload or {}
+        if ev.event_type == "web_synthesis":
+            total_bytes += p.get("bytes_extracted", 0)
+        if ev.event_type == "web_search_round":
+            total_pages += p.get("pages_extracted", 0)
+
     console.print()
-    console.print(
-        f"  [dim]{len(real_events)} events  ·  {total_ms:.0f}ms total[/]  "
-        "[dim]  octane trace <id> -v  — expand URL lists[/]"
-    )
+    parts = [f"{len(real_events)} events", f"{total_ms:.0f}ms total"]
+    if total_pages:
+        parts.append(f"{total_pages} pages extracted")
+    if total_bytes:
+        kb = total_bytes / 1024
+        parts.append(f"{kb:.1f} KB extracted")
+    console.print(f"  [dim]{'  ·  '.join(parts)}[/]")
+    console.print("  [dim]octane trace <id> -v  — expand URL lists[/]")
     console.print()
 
 
@@ -278,7 +292,14 @@ def _print_payload(event_type: str, payload: dict, *, verbose: bool) -> None:
         mode     = payload.get("mode", "")
         tok      = payload.get("tokens_approx") or payload.get("tokens") or ""
         tok_part = f"   [dim]tokens:[/] ~{tok}" if tok else ""
-        console.print(f"{ind}  [dim]articles:[/] {n_art}   [dim]mode:[/] {mode}{tok_part}")
+        bytes_ex = payload.get("bytes_extracted")
+        wall     = payload.get("wall_ms")
+        extra    = ""
+        if bytes_ex is not None:
+            extra += f"   [dim]bytes:[/] {bytes_ex:,}"
+        if wall is not None:
+            extra += f"   [dim]wall:[/] {wall:,}ms"
+        console.print(f"{ind}  [dim]articles:[/] {n_art}   [dim]mode:[/] {mode}{tok_part}{extra}")
         preview = payload.get("output_preview") or payload.get("output") or ""
         if preview:
             console.print(f"{ind}  [dim]output:[/] {str(preview)[:400]}")

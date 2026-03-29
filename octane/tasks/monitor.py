@@ -71,7 +71,7 @@ async def monitor_ticker(
     quote: dict = {}
     try:
         async with BodegaIntelClient(settings.bodega_intel_url) as intel:
-            result = await intel.finance(ticker)
+            result = await intel.market_data(ticker)
             # BodegaIntelClient returns a dict or raises on failure
             quote = result if isinstance(result, dict) else {"raw": str(result)}
     except Exception as exc:
