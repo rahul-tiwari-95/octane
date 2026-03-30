@@ -539,7 +539,8 @@ class InvestigateOrchestrator:
         findings_text = "\n\n".join(findings_parts)
 
         # Build synthesis system prompt with optional cite/verify instructions
-        system = _INVESTIGATE_SYNTHESIS_SYSTEM
+        from octane.utils.response_templates import apply_template
+        system = apply_template(_INVESTIGATE_SYNTHESIS_SYSTEM, "investigate")
         if cite:
             system += _CITATION_INSTRUCTIONS
         if verify:

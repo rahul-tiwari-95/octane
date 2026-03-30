@@ -74,14 +74,19 @@ async def _health():
     finally:
         await bodega.close()
 
+    # Reflect actual vLLM status (e.g. "unhealthy" = server up, no models)
+    if bodega_status == "ok" and server_health.get("status") not in ("ok", None):
+        bodega_status = "no_models"
+
     bodega_table = Table(show_header=False, box=None, padding=(0, 2))
     bodega_table.add_column("Metric", style="magenta")
     bodega_table.add_column("Value", style="white")
 
     _STATUS_DISPLAY = {
-        "ok":      "✅ running",
-        "busy":    "⏳ busy (inference running)",
-        "offline": "🔴 offline",
+        "ok":         "✅ running",
+        "no_models":  "🟡 online (no models loaded)",
+        "busy":       "⏳ busy (inference running)",
+        "offline":    "🔴 offline",
     }
     bodega_table.add_row("Server", _STATUS_DISPLAY.get(bodega_status, bodega_status))
 

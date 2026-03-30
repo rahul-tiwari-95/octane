@@ -98,19 +98,20 @@ class WebAgent(BaseAgent):
         sub_agent = request.metadata.get("sub_agent", "search")
         query = request.query
         deep: bool = bool(request.metadata.get("deep", False))
+        deep_rounds: int = int(request.metadata.get("deep_rounds", 3) or 3)
 
         # Accept both short forms ("finance") and template-prefixed forms ("web_finance")
         if sub_agent in ("finance", "web_finance"):
             return await self._fetch_finance(query, request)
         elif sub_agent in ("news", "web_news"):
-            return await self._fetch_news(query, request, deep=deep)
+            return await self._fetch_news(query, request, deep=deep, deep_rounds=deep_rounds)
         elif sub_agent in ("entertainment", "web_entertainment"):
             return await self._fetch_entertainment(query, request)
         elif sub_agent in ("music", "web_music"):
             return await self._fetch_music(query, request)
         else:
             # "search", "web_search", or any unknown → general Brave search
-            return await self._fetch_search(query, request, deep=deep)
+            return await self._fetch_search(query, request, deep=deep, deep_rounds=deep_rounds)
 
     # ── Finance ───────────────────────────────────────────────────────────
 
@@ -342,7 +343,7 @@ class WebAgent(BaseAgent):
                     )
         return result
 
-    async def _fetch_news(self, query: str, request: AgentRequest, deep: bool = False) -> AgentResponse:
+    async def _fetch_news(self, query: str, request: AgentRequest, deep: bool = False, deep_rounds: int = 3) -> AgentResponse:
         """Fetch news for the query using two parallel sources, then synthesize.
 
         Sources:
@@ -470,7 +471,7 @@ class WebAgent(BaseAgent):
 
         # ── Round 2+: iterative deepening (always on for news; more on --deep) ─
         all_usable = list(r1_usable)
-        r2_rounds = 2 if deep else 1
+        r2_rounds = max(1, min(deep_rounds, 10)) if deep else 1
         for round_num in range(r2_rounds):
             if not all_usable:
                 break  # nothing to analyse — skip deepening
@@ -738,7 +739,7 @@ class WebAgent(BaseAgent):
 
     # ── Web Search ────────────────────────────────────────────────────────
 
-    async def _fetch_search(self, query: str, request: AgentRequest, deep: bool = False) -> AgentResponse:
+    async def _fetch_search(self, query: str, request: AgentRequest, deep: bool = False, deep_rounds: int = 3) -> AgentResponse:
         """General web search via Beru/Brave, with multi-variation strategy + LLM synthesis.
 
         Extraction cascade:
@@ -867,20 +868,28 @@ class WebAgent(BaseAgent):
                     except Exception as exc:
                         logger.warning("msr_hook_failed", error=str(exc))
 
-        # ── Round 2: iterative deepening (--deep flag) ───────────────────────
+        # ── Round 2+: iterative deepening (--deep flag) ──────────────────────
         all_usable = list(r1_usable)
         if deep and all_usable:
-            findings = [a.text[:200] for a in all_usable[:6] if a.text]
-            followups = await self._depth_analyzer.generate_followups(
-                original_query=query,
-                findings=findings,
-                max_followups=5,
-                user_context=user_context,
-            )
-            if followups:
+            n_rounds = max(1, min(deep_rounds, 10))
+            for round_num in range(n_rounds):
+                if not all_usable:
+                    break
+                findings = [a.text[:200] for a in all_usable[:6] if a.text]
+                max_fups = 5 if deep_rounds > 3 else 3
+                followups = await self._depth_analyzer.generate_followups(
+                    original_query=query,
+                    findings=findings,
+                    max_followups=max_fups,
+                    user_context=user_context,
+                )
+                if not followups:
+                    break
+
+                current_round = round_num + 2
                 # ── Emit depth-analysis event ─────────────────────────────────
                 self._emit(cid, "web_depth_analysis", {
-                    "round": 2,
+                    "round": current_round,
                     "sub_agent": "search",
                     "n_followups": len(followups),
                     "followup_queries": [
@@ -891,7 +900,8 @@ class WebAgent(BaseAgent):
                 })
 
                 logger.info(
-                    "search_deepening_round2",
+                    "search_deepening_round",
+                    round=current_round,
                     n_followups=len(followups),
                     queries=[f["query"][:60] for f in followups],
                 )
@@ -926,7 +936,7 @@ class WebAgent(BaseAgent):
                         all_usable.extend(r2_usable)
 
                         self._emit(cid, "web_search_round", {
-                            "round": 2,
+                            "round": current_round,
                             "sub_agent": "search",
                             "queries": [f["query"] for f in followups],
                             "urls_found": len(new_urls),
@@ -945,6 +955,7 @@ class WebAgent(BaseAgent):
 
                         logger.info(
                             "search_deepening_extracted",
+                            round=current_round,
                             new_pages=len(r2_usable),
                             total=len(all_usable),
                         )

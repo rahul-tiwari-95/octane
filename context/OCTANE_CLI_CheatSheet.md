@@ -1,5 +1,5 @@
 # OCTANE CLI — Complete Cheat Sheet
-### SRSWTI Research Labs | Session 36 | 2026-03-30
+### SRSWTI Research Labs | Session 39 | 2026-03-27
 
 > **~90 commands** across 16 top-level + 16 sub-apps.  
 > Activate venv first: `source .venv/bin/activate`
@@ -50,14 +50,18 @@ octane agents                  # List all 5 agents and capabilities
 ```bash
 octane ask "What is the current price of AAPL?"
 octane ask "Explain transformers" --verbose       # Show full DAG trace after answer
-octane ask "Latest AI papers on reasoning" --deep  # Multi-round iterative web search
+octane ask "Latest AI papers on reasoning" --deep  # Multi-round iterative web search (8 rounds default)
+octane ask "Latest AI papers" --deep 20            # Deep with 20 dimensions (clamped to 10 max)
+octane ask "Latest AI papers" --deep 3             # Deep with 3 rounds
 octane ask "What did I research yesterday?" --recall  # Infer from stored data only (Postgres/Redis)
 octane ask "NVDA analysis" --monitor               # Live RAM/CPU overlay during query
 ```
 
 ### Deep mode explained
 `--deep` triggers multi-round search with iterative query expansion.  
-The agent keeps searching until novelty drops (n-gram convergence detection).
+Without a number, defaults to 8 rounds. Specify a number for exact control (clamped 1–10).  
+Each round generates follow-up queries from previous findings, searches, and accumulates results.  
+The agent keeps searching until novelty drops (n-gram convergence detection) or rounds exhausted.
 
 ### Interactive chat
 ```bash
@@ -493,6 +497,20 @@ octane pref set domains "finance, machine learning"
 octane pref reset verbosity                        # Reset one
 octane pref reset --yes                            # Reset all
 ```
+
+### Response templates — customizable output formats
+```bash
+octane pref template                               # List all 7 template slots with status
+octane pref template compare                       # Show current compare template content
+octane pref template-set ask "Use bullet points, max 5, with emoji headers"
+octane pref template-set news "Group by topic, lead with the most impactful story"
+octane pref template-set chat "Be concise, use code blocks for any code"
+octane pref template-reset ask                     # Reset ask to default
+octane pref template-reset                         # Reset ALL templates
+```
+
+**Template slots:** `compare` · `investigate` · `news` · `search` · `ask` · `evaluate` · `chat`  
+Templates are plain `.txt` files in `~/.octane/templates/`. Instructions are appended to the synthesis prompt.
 
 ---
 

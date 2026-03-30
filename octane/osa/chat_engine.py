@@ -560,9 +560,13 @@ class ChatEngine:
                     yield f"⚠ {r['operation']} failed: {r.get('error', 'unknown')}"
             return
 
-        system = build_command_synthesis_prompt(
-            assistant_name=self.assistant_name,
-            personality=self.personality,
+        from octane.utils.response_templates import apply_template
+        system = apply_template(
+            build_command_synthesis_prompt(
+                assistant_name=self.assistant_name,
+                personality=self.personality,
+            ),
+            "chat",
         )
 
         result_text = "\n\n".join(

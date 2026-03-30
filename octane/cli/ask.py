@@ -20,7 +20,11 @@ def register(app: typer.Typer) -> None:
 def ask(
     query: str = typer.Argument(..., help="Your question or instruction"),
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Show DAG trace after response"),
-    deep: bool = typer.Option(False, "--deep", help="Deep mode: multi-round search with iterative query expansion"),
+    deep: str = typer.Option(
+        None,
+        "--deep",
+        help="Deep mode with optional N rounds (e.g. --deep, --deep 5, --deep 20). Default: 3 rounds.",
+    ),
     monitor: bool = typer.Option(False, "--monitor", help="Show live RAM/CPU/model metrics during query"),
     recall: bool = typer.Option(False, "--recall", "-r", help="Infer exclusively on stored Postgres/Redis data — no web search"),
 ):
@@ -28,10 +32,12 @@ def ask(
     if recall:
         asyncio.run(_ask_recall(query))
         return
-    asyncio.run(_ask(query, verbose=verbose, deep=deep, monitor=monitor))
+    from octane.cli._shared import parse_deep_flag
+    deep_val = parse_deep_flag(deep)
+    asyncio.run(_ask(query, verbose=verbose, deep_rounds=deep_val, monitor=monitor))
 
 
-async def _ask(query: str, verbose: bool = False, deep: bool = False, monitor: bool = False):
+async def _ask(query: str, verbose: bool = False, deep_rounds: int | None = None, monitor: bool = False):
     if verbose:
         from octane.utils import setup_logging
         setup_logging(level_override="debug")
@@ -39,6 +45,7 @@ async def _ask(query: str, verbose: bool = False, deep: bool = False, monitor: b
     from octane.daemon.client import is_daemon_running
 
     # ── Try daemon routing first ──────────────────────────────────────────────
+    deep = deep_rounds is not None
     if is_daemon_running() and not deep and not monitor:
         console.print("[dim]📡 Routing through daemon...[/]")
         chunks_received = False
@@ -74,7 +81,7 @@ async def _ask(query: str, verbose: bool = False, deep: bool = False, monitor: b
         fast_model = mid_model = reason_model = "?"
 
     if status["bodega_reachable"] and status["model_loaded"]:
-        deep_tag = " | [bold cyan]⬇ deep mode[/]" if deep else ""
+        deep_tag = f" | [bold cyan]⬇ deep mode ({deep_rounds} rounds)[/]" if deep else ""
         monitor_tag = " | [bold yellow]📊 monitor[/]" if monitor else ""
         console.print(
             f"[dim]🧠 topology:[bold]{topo_name}[/bold] "
@@ -156,7 +163,7 @@ async def _ask(query: str, verbose: bool = False, deep: bool = False, monitor: b
 
     full_output_parts = []
     first_token = True
-    extra_meta = {"deep": True} if deep else {}
+    extra_meta = {"deep": True, "deep_rounds": deep_rounds} if deep else {}
     hook = clarification_hook if deep else None
 
     # ── --monitor: live metrics task ──────────────────────────────────────────
@@ -493,15 +500,20 @@ async def _ask_recall(query: str) -> None:
     with err_console.status("[dim]Connecting to inference engine...[/]", spinner="dots"):
         health = await router._client.health()
         if health.get("status") != "ok":
-            err_console.print("[red]Bodega inference engine is offline. Start it first.[/]")
+            if health.get("status") == "unhealthy":
+                err_console.print("[red]Bodega is online but no models are loaded. Run 'octane model load' first.[/]")
+            else:
+                err_console.print("[red]Bodega inference engine is offline. Start it first.[/]")
             return
 
+    from octane.utils.response_templates import apply_template
+    _recall_sys = apply_template(_RECALL_SYSTEM, "ask")
     console.print("[bold green]🔥 Octane (recall):[/] ", end="")
     word_count = 0
     try:
         async for chunk in router.chat_stream(
             prompt=prompt,
-            system=_RECALL_SYSTEM,
+            system=_recall_sys,
             tier=ModelTier.REASON,
             max_tokens=2048,
         ):

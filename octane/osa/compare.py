@@ -423,13 +423,15 @@ class CompareOrchestrator:
         import re
         import sys
         import time
+        from octane.utils.response_templates import apply_template
+        _synth_system = apply_template(_COMPARE_SYNTHESIS_SYSTEM, "compare")
         try:
             _t0 = time.monotonic()
             print("[octane] Synthesis: sending to bodega-raptor-8b (REASON tier)...", file=sys.stderr, flush=True)
             report = await asyncio.wait_for(
                 self._bodega.chat_simple(
                     user_prompt,
-                    system=_COMPARE_SYNTHESIS_SYSTEM,
+                    system=_synth_system,
                     tier=ModelTier.REASON,
                     max_tokens=2500,
                     temperature=0.1,
@@ -438,6 +440,7 @@ class CompareOrchestrator:
             )
             print(f"[octane] Synthesis done in {time.monotonic() - _t0:.1f}s", file=sys.stderr, flush=True)
             report = re.sub(r"<think>.*?</think>", "", report, flags=re.DOTALL).strip()
+            report = re.sub(r"<\|[^|]*\|>", "", report).strip()
             return report
         except asyncio.TimeoutError:
             print("[octane] Synthesis timed out after 90s — using matrix text fallback", file=sys.stderr, flush=True)
@@ -451,14 +454,14 @@ class CompareOrchestrator:
                 report = await asyncio.wait_for(
                     self._bodega.chat_simple(
                         user_prompt,
-                        system=_COMPARE_SYNTHESIS_SYSTEM,
+                        system=_synth_system,
                         tier=ModelTier.MID,
                         max_tokens=2500,
                         temperature=0.1,
                     ),
                     timeout=90.0,
                 )
-                return re.sub(r"<think>.*?</think>", "", report, flags=re.DOTALL).strip()
+                return re.sub(r"<\|[^|]*\|>", "", re.sub(r"<think>.*?</think>", "", report, flags=re.DOTALL)).strip()
             except Exception as exc2:
                 logger.warning("compare_synthesis_mid_failed", error=str(exc2))
                 return matrix_text

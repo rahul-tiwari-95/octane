@@ -106,12 +106,18 @@ def _build_system_prompt(
     """Build a personalized system prompt from the user's preference profile."""
     # Always ground the LLM in the current wall-clock date so it can flag
     # stale data (e.g. a stock price from 4 months ago) accurately.
+    from octane.utils.response_templates import apply_template
     lines = [_EVALUATOR_SYSTEM_BASE, f"\nToday's date: {today_human()}."]
 
     # Adaptive length hint based on query complexity
     hint = _length_hint(query, is_deep=is_deep)
     if hint:
         lines.append(hint)
+
+    # Check for user-defined response template
+    _eval_template = apply_template("", "evaluate", quiet=True)
+    if _eval_template:
+        lines.append(_eval_template)
 
     if user_profile:
         verbosity = user_profile.get("verbosity", "concise")

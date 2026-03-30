@@ -280,7 +280,7 @@ class TestWebAgentDeepMode:
             query="israel iran news", source="test",
             metadata={"sub_agent": "search", "deep": True},
         )
-        response = await agent._fetch_search("israel iran news", request, deep=True)
+        response = await agent._fetch_search("israel iran news", request, deep=True, deep_rounds=1)
         assert response.success is True
         agent._depth_analyzer.generate_followups.assert_called_once()
 
@@ -334,7 +334,7 @@ class TestWebAgentDeepMode:
         })
 
         request = AgentRequest(query="israel iran news", source="test", metadata={"sub_agent": "news", "deep": True})
-        await agent._fetch_news("israel iran news", request, deep=True)
+        await agent._fetch_news("israel iran news", request, deep=True, deep_rounds=2)
         # deep=True → 2 rounds
         assert agent._depth_analyzer.generate_followups.call_count == 2
 
@@ -432,12 +432,12 @@ class TestDeepFlagWiring:
         assert "--deep" in src, "octane ask must define a --deep option"
 
     def test_ask_async_accepts_deep_param(self):
-        """_ask() must accept a 'deep' keyword argument."""
+        """_ask() must accept a 'deep_rounds' keyword argument."""
         import inspect
         import octane.main as main_mod
 
         sig = inspect.signature(main_mod._ask)
-        assert "deep" in sig.parameters, "_ask() must have a 'deep' parameter"
+        assert "deep_rounds" in sig.parameters, "_ask() must have a 'deep_rounds' parameter"
 
     def test_run_stream_accepts_extra_metadata(self):
         """Orchestrator.run_stream must accept extra_metadata parameter."""

@@ -189,11 +189,12 @@ class Synthesizer:
         prompt = f'Query: "{query}"\n\nArticles:\n{raw_text}'
 
         if self._bodega is not None:
+            from octane.utils.response_templates import apply_template
             try:
                 result = await asyncio.wait_for(
                     self._bodega.chat_simple(
                         prompt=prompt,
-                        system=_news_system(),
+                        system=apply_template(_news_system(), "news"),
                         tier=ModelTier.MID,
                         temperature=0.2,
                         max_tokens=512,
@@ -331,7 +332,9 @@ class Synthesizer:
         max_chars_direct = self._MAX_CHARS_DIRECT_DEEP if deep else self._MAX_CHARS_DIRECT
         synthesis_tokens = 3000 if deep else 768
         synthesis_tier = ModelTier.REASON if deep else ModelTier.MID
-        synthesis_system = _deep_synthesis_system() if deep else _full_text_system()
+        from octane.utils.response_templates import apply_template
+        _raw_system = _deep_synthesis_system() if deep else _full_text_system()
+        synthesis_system = apply_template(_raw_system, "search")
         synthesis_timeout = 120.0 if deep else 60.0  # REASON model is slower
 
         logger.info(
