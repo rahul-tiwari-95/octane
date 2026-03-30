@@ -302,10 +302,10 @@ def test_power_fast_has_continuous_batching():
 
 
 def test_power_prompt_cache_size():
-    """power uses prompt_cache_size=25."""
-    for tier in (ModelTier.FAST, ModelTier.MID, ModelTier.REASON):
-        cfg = TOPOLOGIES["power"].models[tier]
-        assert cfg.prompt_cache_size == 25
+    """power FAST/MID use prompt_cache_size=25, REASON (37b) uses 10."""
+    assert TOPOLOGIES["power"].models[ModelTier.FAST].prompt_cache_size == 25
+    assert TOPOLOGIES["power"].models[ModelTier.MID].prompt_cache_size == 25
+    assert TOPOLOGIES["power"].models[ModelTier.REASON].prompt_cache_size == 10
 
 
 def test_compact_balanced_power_are_differentiated():

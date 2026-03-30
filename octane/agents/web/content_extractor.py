@@ -196,10 +196,15 @@ class ContentExtractor:
                 title=page_title,
             )
 
-          except Exception as exc:
-            logger.warning("trafilatura_error", url=url, error=str(exc))
+          except asyncio.TimeoutError:
+            logger.warning("trafilatura_error", url=url, error=f"fetch timeout ({self.timeout}s)")
             return ExtractedContent(
-                url=url, text="", word_count=0, method="failed", error=str(exc),
+                url=url, text="", word_count=0, method="failed", error=f"fetch timeout ({self.timeout}s)",
+            )
+          except Exception as exc:
+            logger.warning("trafilatura_error", url=url, error=str(exc) or type(exc).__name__)
+            return ExtractedContent(
+                url=url, text="", word_count=0, method="failed", error=str(exc) or type(exc).__name__,
             )
 
     async def extract_batch(

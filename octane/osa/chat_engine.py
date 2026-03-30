@@ -31,6 +31,52 @@ from octane.tools.topology import ModelTier
 logger = structlog.get_logger().bind(component="chat_engine")
 
 
+import re as _re
+
+_CONTROL_TOKEN_RE = _re.compile(r"<\|[^|]*\|>")
+
+
+async def _strip_think_stream(stream: AsyncIterator[str]) -> AsyncIterator[str]:
+    """Filter out <think>…</think> blocks and model control tokens from a streaming async iterator.
+
+    Stateful: tracks whether we're inside a thinking block so that chunks
+    arriving between split <think> and </think> tags are suppressed.
+    Also strips leaked control tokens like <|im_end|>, <|endoftext|>, etc.
+    """
+    inside_think = False
+    async for chunk in stream:
+        if inside_think:
+            # Look for the closing tag in this chunk
+            if "</think>" in chunk:
+                # Take only the text after </think>
+                _, _, after = chunk.partition("</think>")
+                inside_think = False
+                after = _CONTROL_TOKEN_RE.sub("", after)
+                if after:
+                    yield after
+            # else: still inside thinking block, suppress entire chunk
+            continue
+
+        # Not inside a think block
+        if "<think>" in chunk:
+            before, _, rest = chunk.partition("<think>")
+            before = _CONTROL_TOKEN_RE.sub("", before)
+            if before:
+                yield before
+            # Check if </think> also appears in the same chunk
+            if "</think>" in rest:
+                _, _, after = rest.partition("</think>")
+                after = _CONTROL_TOKEN_RE.sub("", after)
+                if after:
+                    yield after
+            else:
+                inside_think = True
+        else:
+            chunk = _CONTROL_TOKEN_RE.sub("", chunk)
+            if chunk:
+                yield chunk
+
+
 def build_persona_prompt(
     assistant_name: str = "octane",
     personality: str = "helpful, direct, and knowledgeable",
@@ -104,6 +150,95 @@ class ChatEngine:
     def update_persona(self, persona: dict) -> None:
         self._persona = persona
 
+    # ── Follow-up query rewriter ─────────────────────────────────────────────
+
+    # Patterns that indicate the query references previous context.
+    _FOLLOWUP_SIGNALS = re.compile(
+        r"^(yes|yeah|yep|yup|sure|ok|okay|do it|go ahead|try again|"
+        r"yes .{1,30}|yeah .{1,30})\s*$|"
+        r"\b(that|this|those|it|them|the same)\b",
+        re.IGNORECASE,
+    )
+
+    async def _rewrite_followup(
+        self,
+        query: str,
+        conversation_history: list[dict[str, str]],
+    ) -> str:
+        """Rewrite a follow-up query into a self-contained query using
+        conversation history.  Returns the original query unchanged if
+        rewriting is not needed or not possible.
+
+        Example:
+            History: "what's the latest on Iran Israel war?"
+            Query:   "yes find latest real time info"
+            Result:  "find the latest real time info about the Iran Israel war"
+        """
+        # Only rewrite if there's history to reference and query is short
+        if not conversation_history or len(query.split()) > 15:
+            return query
+
+        # Only rewrite if the query has follow-up signals
+        if not self._FOLLOWUP_SIGNALS.search(query):
+            return query
+
+        # No LLM available — can't rewrite
+        if self._bodega is None:
+            return query
+
+        # Build context from recent turns
+        recent = conversation_history[-4:]
+        context_parts = []
+        for entry in recent:
+            role = "User" if entry["role"] == "user" else "Assistant"
+            context_parts.append(f"{role}: {entry['content'][:200]}")
+        context = "\n".join(context_parts)
+
+        system = (
+            "You are a query rewriter. Given a conversation and a follow-up message, "
+            "rewrite the follow-up into a self-contained query that makes sense without "
+            "the conversation context.\n\n"
+            "Rules:\n"
+            "- Keep the rewritten query concise and natural\n"
+            "- Preserve the user's intent (search, research, find news, etc.)\n"
+            "- Replace pronouns (it, that, this) with the actual subject from context\n"
+            "- If the follow-up is already self-contained, return it unchanged\n"
+            "- Output ONLY the rewritten query, nothing else"
+        )
+        prompt = (
+            f"Conversation:\n{context}\n\n"
+            f"Follow-up message: \"{query}\"\n\n"
+            f"Rewritten query:"
+        )
+
+        try:
+            rewritten = await asyncio.wait_for(
+                self._bodega.chat_simple(
+                    prompt=prompt,
+                    system=system,
+                    tier=ModelTier.REASON,
+                    temperature=0.1,
+                    max_tokens=100,
+                ),
+                timeout=5.0,
+            )
+            # Strip thinking tags
+            if "</think>" in rewritten:
+                _, _, rewritten = rewritten.partition("</think>")
+            rewritten = rewritten.strip().strip('"').strip()
+
+            if rewritten and len(rewritten) > 3:
+                logger.info(
+                    "query_rewritten",
+                    original=query[:60],
+                    rewritten=rewritten[:80],
+                )
+                return rewritten
+        except Exception as exc:
+            logger.debug("query_rewrite_failed", error=str(exc))
+
+        return query
+
     # ── Main entry point ─────────────────────────────────────────────────────
 
     async def respond(
@@ -122,6 +257,11 @@ class ChatEngine:
             reasoning=reasoning,
             query=query[:80],
         )
+
+        # For action intents, rewrite follow-up queries so they are
+        # self-contained (e.g. "yes do it" → "find latest news on Iran war").
+        if intent in (Intent.COMMAND, Intent.WEB, Intent.ANALYSIS):
+            query = await self._rewrite_followup(query, conversation_history)
 
         if intent == Intent.CONVERSATION:
             async for chunk in self._handle_conversation(query, conversation_history):
@@ -165,19 +305,15 @@ class ChatEngine:
             return
 
         try:
-            async for chunk in self._bodega.chat_stream(
+            raw = self._bodega.chat_stream(
                 prompt=query,
                 system=system,
                 tier=ModelTier.REASON,
                 temperature=0.7,
                 max_tokens=512,
-            ):
-                # Strip thinking tags in streaming
-                if "<think>" in chunk or "</think>" in chunk:
-                    chunk = re.sub(r"<think>.*?</think>", "", chunk, flags=re.DOTALL)
-                    chunk = re.sub(r"<think>.*$", "", chunk, flags=re.DOTALL)
-                if chunk:
-                    yield chunk
+            )
+            async for chunk in _strip_think_stream(raw):
+                yield chunk
         except Exception as exc:
             logger.warning("conversation_llm_failed", error=str(exc))
             yield "Hmm, I had trouble generating a response. Let me try again."
@@ -205,12 +341,20 @@ class ChatEngine:
             yield f"\n  [running: {cmd_summary}]\n\n"
 
         # Step 3: Execute commands
-        results = await self._execute_commands(plan, session_id)
+        results = await self._execute_commands(plan, session_id, original_query=query)
 
-        # Step 4: Synthesize results conversationally
+        # Step 4: Synthesize results conversationally.
+        # If ALL results are pre-synthesized (came from OSA evaluator),
+        # skip the redundant second LLM synthesis — just stream them.
         if results:
-            async for chunk in self._synthesize_results(query, results, conversation_history):
-                yield chunk
+            all_pre_synth = all(r.get("pre_synthesized") for r in results if r["success"])
+            if all_pre_synth:
+                for r in results:
+                    if r["success"] and r.get("output"):
+                        yield r["output"]
+            else:
+                async for chunk in self._synthesize_results(query, results, conversation_history):
+                    yield chunk
         else:
             yield "I tried to run that but didn't get any results. Could you rephrase?"
 
@@ -218,18 +362,23 @@ class ChatEngine:
         self,
         plan: CommandPlan,
         session_id: str,
+        original_query: str = "",
     ) -> list[dict]:
         """Execute mapped commands and return their results."""
         results = []
 
         for cmd in plan.commands:
             try:
-                result = await self._execute_single(cmd, session_id)
+                result = await self._execute_single(cmd, session_id, original_query=original_query)
+                # OSA-mapped operations return evaluator-synthesized text;
+                # mark them so _handle_command skips redundant synthesis.
+                osa_ops = {"web.search", "web.news", "web.finance", "code.generate", "system.health"}
                 results.append({
                     "operation": cmd.operation,
                     "description": cmd.description,
                     "success": True,
                     "output": result,
+                    "pre_synthesized": cmd.operation in osa_ops,
                 })
             except Exception as exc:
                 logger.warning(
@@ -246,7 +395,7 @@ class ChatEngine:
 
         return results
 
-    async def _execute_single(self, cmd: MappedCommand, session_id: str) -> str:
+    async def _execute_single(self, cmd: MappedCommand, session_id: str, original_query: str = "") -> str:
         """Execute a single mapped command and return its output as text.
 
         For operations that map to existing OSA agent capabilities, we delegate
@@ -267,7 +416,11 @@ class ChatEngine:
 
         if op in osa_mapping and self._orchestrator:
             agent_name, sub_agent = osa_mapping[op]
-            query = params.get("query", params.get("topic", cmd.description))
+            # Prefer extracted params, but fall back to original user query
+            # so the DAG task contains the user's actual intent.
+            query = params.get("query", params.get("topic", ""))
+            if not query or len(query.split()) <= 3:
+                query = original_query or cmd.description
 
             from octane.models.dag import TaskDAG, TaskNode
             dag = TaskDAG(
@@ -425,18 +578,15 @@ class ChatEngine:
         )
 
         try:
-            async for chunk in self._bodega.chat_stream(
+            raw = self._bodega.chat_stream(
                 prompt=prompt,
                 system=system,
                 tier=ModelTier.REASON,
                 temperature=0.4,
                 max_tokens=1024,
-            ):
-                if "<think>" in chunk or "</think>" in chunk:
-                    chunk = re.sub(r"<think>.*?</think>", "", chunk, flags=re.DOTALL)
-                    chunk = re.sub(r"<think>.*$", "", chunk, flags=re.DOTALL)
-                if chunk:
-                    yield chunk
+            )
+            async for chunk in _strip_think_stream(raw):
+                yield chunk
         except Exception as exc:
             logger.warning("synthesis_failed", error=str(exc))
             for r in results:
@@ -479,18 +629,15 @@ class ChatEngine:
                 f"Share this with the user naturally, as if you're recalling a conversation."
             )
             try:
-                async for chunk in self._bodega.chat_stream(
+                raw = self._bodega.chat_stream(
                     prompt=prompt,
                     system=system,
                     tier=ModelTier.REASON,
                     temperature=0.4,
                     max_tokens=800,
-                ):
-                    if "<think>" in chunk or "</think>" in chunk:
-                        chunk = re.sub(r"<think>.*?</think>", "", chunk, flags=re.DOTALL)
-                        chunk = re.sub(r"<think>.*$", "", chunk, flags=re.DOTALL)
-                    if chunk:
-                        yield chunk
+                )
+                async for chunk in _strip_think_stream(raw):
+                    yield chunk
             except Exception:
                 yield prior_context
         else:

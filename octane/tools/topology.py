@@ -348,7 +348,7 @@ TOPOLOGIES: dict[str, Topology] = {
             ),
             ModelTier.REASON: ModelConfig(
                 model_id="axe-stealth-37b",
-                model_path="srswti/axe-stealth-37b-4bit",
+                model_path="srswti/axe-stealth-37b",
                 model_type="multimodal",
                 context_length=131072,      # 128K context window
                 max_concurrency=2,          # 37b is heavy — limit concurrency

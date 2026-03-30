@@ -332,7 +332,7 @@ class Synthesizer:
         synthesis_tokens = 3000 if deep else 768
         synthesis_tier = ModelTier.REASON if deep else ModelTier.MID
         synthesis_system = _deep_synthesis_system() if deep else _full_text_system()
-        synthesis_timeout = 120.0 if deep else 40.0  # REASON model is slower
+        synthesis_timeout = 120.0 if deep else 60.0  # REASON model is slower
 
         logger.info(
             "synthesize_with_content_start",
@@ -377,10 +377,17 @@ class Synthesizer:
                     timeout=synthesis_timeout,
                 )
                 return _strip_think(result.strip())
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "full_text_synthesis_failed",
+                    error=f"synthesis timeout ({synthesis_timeout}s)",
+                    fallback="plain",
+                    deep=deep,
+                )
             except Exception as exc:
                 logger.warning(
                     "full_text_synthesis_failed",
-                    error=str(exc),
+                    error=str(exc) or type(exc).__name__,
                     fallback="plain",
                     deep=deep,
                 )

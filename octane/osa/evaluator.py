@@ -355,9 +355,10 @@ class Evaluator:
         # Try tiers in order - REASON first, then MID, then FAST
         for tier in (ModelTier.REASON, ModelTier.MID, ModelTier.FAST):
             try:
-                # Stream tokens, stripping <think>...</think> blocks inline.
-                raw_buffer = ""
-                think_done = False
+                # Stream tokens, skipping <think>...</think> blocks per-chunk.
+                # Unlike the old buffering approach, this yields real content
+                # immediately — never buffers the entire think block.
+                inside_think = False
                 streamed_any = False
 
                 async for chunk in self._bodega.chat_stream(
@@ -368,37 +369,33 @@ class Evaluator:
                     max_tokens=max_tokens,
                 ):
                     streamed_any = True
-                    raw_buffer += chunk
 
-                    if not think_done:
-                        # Still waiting to determine if there's a think block
-                        if "</think>" in raw_buffer:
-                            # Strip the entire think block and start streaming
-                            clean = re.sub(r"<think>.*?</think>", "", raw_buffer, flags=re.DOTALL).lstrip()
-                            think_done = True
-                            if clean:
-                                yield clean
-                                raw_buffer = ""
-                        elif "<think>" not in raw_buffer and len(raw_buffer) > 20:
-                            # No think block started after 20 chars — safe to stream
-                            think_done = True
-                            yield raw_buffer
-                            raw_buffer = ""
-                        # else: still accumulating — keep buffering
+                    if inside_think:
+                        if "</think>" in chunk:
+                            _, _, after = chunk.partition("</think>")
+                            inside_think = False
+                            after = re.sub(r"<\|[^|]*\|>", "", after)
+                            if after:
+                                yield after
+                        # else: still inside think block — skip chunk
+                        continue
+
+                    if "<think>" in chunk:
+                        before, _, rest = chunk.partition("<think>")
+                        before = re.sub(r"<\|[^|]*\|>", "", before)
+                        if before:
+                            yield before
+                        if "</think>" in rest:
+                            _, _, after = rest.partition("</think>")
+                            after = re.sub(r"<\|[^|]*\|>", "", after)
+                            if after:
+                                yield after
+                        else:
+                            inside_think = True
                     else:
-                        # think block is done — stream chunks directly
-                        yield chunk
-                        raw_buffer = ""
-
-                # Flush any remaining buffered content
-                if raw_buffer:
-                    # Strip complete <think>...</think> blocks
-                    clean = re.sub(r"<think>.*?</think>", "", raw_buffer, flags=re.DOTALL)
-                    # Also strip incomplete <think> blocks that never closed (truncated output)
-                    clean = re.sub(r"<think>.*$", "", clean, flags=re.DOTALL)
-                    clean = clean.strip()
-                    if clean:
-                        yield clean
+                        clean = re.sub(r"<\|[^|]*\|>", "", chunk)
+                        if clean:
+                            yield clean
 
                 # If we streamed successfully, we're done
                 if streamed_any:

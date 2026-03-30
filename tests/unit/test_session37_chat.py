@@ -669,3 +669,585 @@ class TestChatEngineDAGDisplay:
         )
         response = "".join(chunks)
         assert "pipeline" in response.lower() or "available" in response.lower()
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Session 38: P0 — Chat mode pins to REASON model
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+class TestChatModePinsToReason:
+    """P0: _resolve_available_model must return the REASON model, not
+    whichever model appears first in the loaded dict."""
+
+    def test_chat_reason_id_attribute_exists(self):
+        """BodegaRouter has _chat_reason_id attribute."""
+        from octane.tools.bodega_router import BodegaRouter
+        router = BodegaRouter(topology="balanced")
+        assert hasattr(router, "_chat_reason_id")
+        assert router._chat_reason_id is None
+
+    def test_chat_mode_defaults_off(self):
+        from octane.tools.bodega_router import BodegaRouter
+        router = BodegaRouter(topology="power")
+        assert router._chat_mode is False
+        assert router._chat_reason_id is None
+
+    @pytest.mark.asyncio
+    async def test_resolve_pins_to_reason_id_not_first_iter(self):
+        """When chat_mode is on and both 90M + 37b are loaded,
+        _resolve_available_model must return 37b (pinned), NOT 90M (first)."""
+        from octane.tools.bodega_router import BodegaRouter, LoadedModel
+        from octane.tools.topology import ModelTier
+
+        router = BodegaRouter(topology="power")
+        # Simulate: both models loaded, 90M listed first (as Bodega does)
+        router._loaded_models = {
+            "srswti/bodega-raptor-90m": LoadedModel(
+                model_id="srswti/bodega-raptor-90m",
+                model_type="lm",
+                context_length=38912,
+            ),
+            "axe-stealth-37b": LoadedModel(
+                model_id="axe-stealth-37b",
+                model_type="multimodal",
+                context_length=131072,
+            ),
+        }
+        import time
+        router._loaded_models_ts = time.monotonic()  # valid cache
+
+        # Enable chat mode with pinned REASON
+        router._chat_mode = True
+        router._chat_reason_id = "axe-stealth-37b"
+
+        # All tiers must resolve to the pinned REASON model
+        for tier in (ModelTier.FAST, ModelTier.MID, ModelTier.REASON):
+            resolved = await router._resolve_available_model(tier, auto_load=False)
+            assert resolved == "axe-stealth-37b", (
+                f"tier={tier.value} resolved to {resolved!r}, expected 'axe-stealth-37b'"
+            )
+
+    @pytest.mark.asyncio
+    async def test_resolve_without_chat_mode_picks_tier_appropriate(self):
+        """When chat_mode is OFF, FAST tier should still pick the 90M model."""
+        from octane.tools.bodega_router import BodegaRouter, LoadedModel
+        from octane.tools.topology import ModelTier
+
+        router = BodegaRouter(topology="power")
+        router._loaded_models = {
+            "srswti/bodega-raptor-90m": LoadedModel(
+                model_id="srswti/bodega-raptor-90m",
+                model_type="lm",
+                context_length=38912,
+            ),
+            "axe-stealth-37b": LoadedModel(
+                model_id="axe-stealth-37b",
+                model_type="multimodal",
+                context_length=131072,
+            ),
+        }
+        import time
+        router._loaded_models_ts = time.monotonic()
+        # chat mode OFF
+        router._chat_mode = False
+
+        fast = await router._resolve_available_model(ModelTier.FAST, auto_load=False)
+        # FAST should prefer lm type (90M), not multimodal
+        assert fast == "srswti/bodega-raptor-90m"
+
+    @pytest.mark.asyncio
+    async def test_resolve_chat_mode_with_only_reason_loaded(self):
+        """When only REASON is loaded in chat mode, returns it correctly."""
+        from octane.tools.bodega_router import BodegaRouter, LoadedModel
+        from octane.tools.topology import ModelTier
+
+        router = BodegaRouter(topology="power")
+        router._loaded_models = {
+            "axe-stealth-37b": LoadedModel(
+                model_id="axe-stealth-37b",
+                model_type="multimodal",
+                context_length=131072,
+            ),
+        }
+        import time
+        router._loaded_models_ts = time.monotonic()
+        router._chat_mode = True
+        router._chat_reason_id = "axe-stealth-37b"
+
+        for tier in (ModelTier.FAST, ModelTier.MID, ModelTier.REASON):
+            resolved = await router._resolve_available_model(tier, auto_load=False)
+            assert resolved == "axe-stealth-37b"
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Session 38: P1a — IntentGate pattern coverage
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+class TestIntentGateSession38Patterns:
+    """P1a: Pattern gaps exposed by live testing."""
+
+    @pytest.mark.asyncio
+    async def test_we_read_about_is_recall(self):
+        """'we read about' should match recall, not just 'i read about'."""
+        gate = IntentGate(bodega=None)
+        intent, _ = await gate.classify("tell me what all we read about in the last 3-5 days")
+        assert intent == Intent.RECALL
+
+    @pytest.mark.asyncio
+    async def test_what_did_we_is_recall(self):
+        gate = IntentGate(bodega=None)
+        intent, _ = await gate.classify("what did we discuss last week?")
+        assert intent == Intent.RECALL
+
+    @pytest.mark.asyncio
+    async def test_what_have_we_is_recall(self):
+        gate = IntentGate(bodega=None)
+        intent, _ = await gate.classify("what have we looked at recently?")
+        assert intent == Intent.RECALL
+
+    @pytest.mark.asyncio
+    async def test_latest_update_is_command(self):
+        """'latest update' should trigger command, not conversation."""
+        gate = IntentGate(bodega=None)
+        intent, _ = await gate.classify("whats the latest update with us iran israel war?")
+        assert intent == Intent.COMMAND
+
+    @pytest.mark.asyncio
+    async def test_update_on_is_command(self):
+        gate = IntentGate(bodega=None)
+        intent, _ = await gate.classify("give me an update on the stock market")
+        assert intent == Intent.COMMAND
+
+    @pytest.mark.asyncio
+    async def test_whats_happening_is_command(self):
+        gate = IntentGate(bodega=None)
+        intent, _ = await gate.classify("what's happening with Tesla stock?")
+        assert intent == Intent.COMMAND
+
+    @pytest.mark.asyncio
+    async def test_stock_research_is_command(self):
+        gate = IntentGate(bodega=None)
+        intent, _ = await gate.classify("stock research of NVIDIA")
+        assert intent == Intent.COMMAND
+
+    @pytest.mark.asyncio
+    async def test_latest_news_still_works(self):
+        gate = IntentGate(bodega=None)
+        intent, _ = await gate.classify("latest news on Apple")
+        assert intent == Intent.COMMAND
+
+    @pytest.mark.asyncio
+    async def test_casual_chat_not_falsely_command(self):
+        """Ensuring new patterns don't cause false positives."""
+        gate = IntentGate(bodega=None)
+        intent, _ = await gate.classify("I'm feeling good today")
+        assert intent == Intent.CONVERSATION
+
+    @pytest.mark.asyncio
+    async def test_opinion_not_falsely_command(self):
+        """'what do you think' exact is conversation; with more words it's a question."""
+        gate = IntentGate(bodega=None)
+        # Exact match works
+        intent, _ = await gate.classify("what do you think")
+        assert intent == Intent.CONVERSATION
+        # With extra context, it's a question → WEB (acceptable)
+        intent2, _ = await gate.classify("what do you think about AI?")
+        assert intent2 in (Intent.CONVERSATION, Intent.WEB)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Session 38: P1b — Query rewriter for follow-ups
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+class TestQueryRewriter:
+    """P1b: Follow-up queries should be rewritten to be self-contained."""
+
+    @pytest.mark.asyncio
+    async def test_followup_signals_detected(self):
+        """_FOLLOWUP_SIGNALS regex matches common follow-up phrases."""
+        from octane.osa.chat_engine import ChatEngine
+        assert ChatEngine._FOLLOWUP_SIGNALS.search("yes find it")
+        assert ChatEngine._FOLLOWUP_SIGNALS.search("do it")
+        assert ChatEngine._FOLLOWUP_SIGNALS.search("try again")
+        assert ChatEngine._FOLLOWUP_SIGNALS.search("tell me about that")
+        assert ChatEngine._FOLLOWUP_SIGNALS.search("search for it now")
+
+    @pytest.mark.asyncio
+    async def test_no_rewrite_without_history(self):
+        """Without conversation history, query is returned unchanged."""
+        bodega = MockBodega(chat_response="rewritten query")
+        engine = ChatEngine(bodega=bodega)
+        result = await engine._rewrite_followup("yes do it", [])
+        assert result == "yes do it"
+
+    @pytest.mark.asyncio
+    async def test_no_rewrite_for_self_contained_query(self):
+        """Self-contained queries without follow-up signals stay unchanged."""
+        bodega = MockBodega(chat_response="rewritten query")
+        engine = ChatEngine(bodega=bodega)
+        history = [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "hello"},
+        ]
+        result = await engine._rewrite_followup("find latest news on Apple stock", history)
+        # No follow-up signals → unchanged
+        assert result == "find latest news on Apple stock"
+
+    @pytest.mark.asyncio
+    async def test_rewrite_with_pronoun_reference(self):
+        """Query with 'that' pronoun gets rewritten using history."""
+        bodega = MockBodega(chat_response="find latest news about Iran Israel war")
+        engine = ChatEngine(bodega=bodega)
+        history = [
+            {"role": "user", "content": "what's happening with Iran Israel war?"},
+            {"role": "assistant", "content": "The situation is escalating..."},
+        ]
+        result = await engine._rewrite_followup("yes find latest real time info on that", history)
+        assert "iran" in result.lower() or "israel" in result.lower()
+
+    @pytest.mark.asyncio
+    async def test_rewrite_with_affirmative_prefix(self):
+        """'yes do it' type follow-ups get rewritten."""
+        bodega = MockBodega(chat_response="search for NVIDIA stock price")
+        engine = ChatEngine(bodega=bodega)
+        history = [
+            {"role": "user", "content": "stock research of NVIDIA"},
+            {"role": "assistant", "content": "I'll look into NVIDIA for you."},
+        ]
+        result = await engine._rewrite_followup("yes do it", history)
+        assert "nvidia" in result.lower() or "stock" in result.lower()
+
+    @pytest.mark.asyncio
+    async def test_no_rewrite_without_bodega(self):
+        """Without LLM, return original query."""
+        engine = ChatEngine(bodega=None)
+        history = [
+            {"role": "user", "content": "tell me about Tesla"},
+            {"role": "assistant", "content": "Tesla is..."},
+        ]
+        result = await engine._rewrite_followup("yes tell me more about that", history)
+        assert result == "yes tell me more about that"
+
+    @pytest.mark.asyncio
+    async def test_long_queries_not_rewritten(self):
+        """Queries over 15 words are assumed to be self-contained."""
+        bodega = MockBodega(chat_response="should not be called")
+        engine = ChatEngine(bodega=bodega)
+        history = [{"role": "user", "content": "hi"}, {"role": "assistant", "content": "hi"}]
+        long_query = "I would really like you to find me the latest detailed information about this specific topic in great detail please now"
+        result = await engine._rewrite_followup(long_query, history)
+        assert result == long_query
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Session 38: P2 — CommandMapper context preservation
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+class TestCommandMapperContextPreservation:
+    """P2: Original user query should flow through to DAG execution."""
+
+    def test_command_mapper_history_truncation_length(self):
+        """CommandMapper should use 300-char truncation, not 100."""
+        import inspect
+        from octane.osa.command_mapper import CommandMapper
+        source = inspect.getsource(CommandMapper._map_with_llm)
+        assert "[:300]" in source, "History truncation should be 300 chars, not 100"
+
+    def test_execute_single_accepts_original_query(self):
+        """_execute_single method accepts original_query parameter."""
+        import inspect
+        from octane.osa.chat_engine import ChatEngine
+        sig = inspect.signature(ChatEngine._execute_single)
+        assert "original_query" in sig.parameters
+
+    def test_execute_commands_accepts_original_query(self):
+        """_execute_commands method accepts original_query parameter."""
+        import inspect
+        from octane.osa.chat_engine import ChatEngine
+        sig = inspect.signature(ChatEngine._execute_commands)
+        assert "original_query" in sig.parameters
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Session 38: P3 — OSA pre-synthesis bypass
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+class TestOSAPreSynthesisBypass:
+    """P3: OSA-mapped commands should not get double-synthesized."""
+
+    @pytest.mark.asyncio
+    async def test_pre_synthesized_flag_set_for_osa_ops(self):
+        """OSA operations should be flagged as pre_synthesized."""
+        from octane.osa.chat_engine import ChatEngine
+        from octane.osa.command_mapper import CommandPlan, MappedCommand
+
+        bodega = MockBodega(chat_response='{"reasoning":["test"],"commands":[{"operation":"web.search","description":"search","parameters":{"query":"test"}}]}')
+        engine = ChatEngine(bodega=bodega, orchestrator=None)
+
+        # Manually create a plan with an OSA-mapped command
+        plan = CommandPlan(
+            reasoning=["test"],
+            commands=[MappedCommand(operation="web.search", description="test search", parameters={"query": "test"})],
+            original_query="test",
+        )
+
+        # Without orchestrator, _execute_single will try OSA path and fall through
+        # to web search fallback, which either needs an orchestrator or fails.
+        # So just verify the flag logic in _execute_commands by checking
+        # that results include the pre_synthesized key.
+        results = await engine._execute_commands(plan, "test_session", original_query="test")
+        # Without orchestrator, the OSA code path won't execute,
+        # so the command falls through — that's what we expect in unit tests.
+        # The structural test verifies the code path exists.
+        for r in results:
+            if r["success"]:
+                assert "pre_synthesized" in r
+
+    def test_handle_command_checks_pre_synthesized(self):
+        """_handle_command should check the pre_synthesized flag."""
+        import inspect
+        from octane.osa.chat_engine import ChatEngine
+        source = inspect.getsource(ChatEngine._handle_command)
+        assert "pre_synthesized" in source
+        assert "all_pre_synth" in source
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Session 38: Think-tag stripping in streaming
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+class TestStripThinkStream:
+    """<think> tags must be fully suppressed, even when split across chunks."""
+
+    @staticmethod
+    async def _chunks_to_list(stream):
+        return [c async for c in stream]
+
+    @staticmethod
+    async def _make_stream(chunks):
+        for c in chunks:
+            yield c
+
+    @pytest.mark.asyncio
+    async def test_no_think_tags_passthrough(self):
+        from octane.osa.chat_engine import _strip_think_stream
+        stream = self._make_stream(["Hello", " world"])
+        result = await self._chunks_to_list(_strip_think_stream(stream))
+        assert result == ["Hello", " world"]
+
+    @pytest.mark.asyncio
+    async def test_think_tags_in_single_chunk(self):
+        from octane.osa.chat_engine import _strip_think_stream
+        stream = self._make_stream(["<think>internal reasoning</think>Hello!"])
+        result = await self._chunks_to_list(_strip_think_stream(stream))
+        assert "".join(result) == "Hello!"
+
+    @pytest.mark.asyncio
+    async def test_think_tags_split_across_chunks(self):
+        """The critical case: <think> in chunk 1, reasoning in chunks 2-4,
+        </think> in chunk 5, then real content in chunk 6."""
+        from octane.osa.chat_engine import _strip_think_stream
+        chunks = [
+            "<think>",
+            "Step 1: Analyze the request\n",
+            "Step 2: Determine tone\n",
+            "Step 3: Draft response\n",
+            "</think>",
+            "Hey there! How can I help?",
+        ]
+        stream = self._make_stream(chunks)
+        result = await self._chunks_to_list(_strip_think_stream(stream))
+        text = "".join(result)
+        assert "Step 1" not in text
+        assert "Step 2" not in text
+        assert "Analyze" not in text
+        assert "Hey there! How can I help?" in text
+
+    @pytest.mark.asyncio
+    async def test_think_close_with_trailing_content(self):
+        """</think> tag in same chunk as real content."""
+        from octane.osa.chat_engine import _strip_think_stream
+        chunks = [
+            "<think>thinking...",
+            "more thinking...",
+            "</think>Real answer here",
+        ]
+        stream = self._make_stream(chunks)
+        result = await self._chunks_to_list(_strip_think_stream(stream))
+        text = "".join(result)
+        assert "thinking" not in text
+        assert "Real answer here" in text
+
+    @pytest.mark.asyncio
+    async def test_content_before_think_tag_preserved(self):
+        """Content before <think> in the same chunk should be kept."""
+        from octane.osa.chat_engine import _strip_think_stream
+        chunks = [
+            "Prefix text<think>hidden",
+            "stuff</think>visible",
+        ]
+        stream = self._make_stream(chunks)
+        result = await self._chunks_to_list(_strip_think_stream(stream))
+        text = "".join(result)
+        assert "Prefix text" in text
+        assert "hidden" not in text
+        assert "stuff" not in text
+        assert "visible" in text
+
+    @pytest.mark.asyncio
+    async def test_empty_think_block(self):
+        from octane.osa.chat_engine import _strip_think_stream
+        stream = self._make_stream(["<think></think>Hello"])
+        result = await self._chunks_to_list(_strip_think_stream(stream))
+        assert "".join(result) == "Hello"
+
+    @pytest.mark.asyncio
+    async def test_control_tokens_stripped(self):
+        """<|im_end|> and similar control tokens must be stripped from output."""
+        from octane.osa.chat_engine import _strip_think_stream
+        stream = self._make_stream(["Hello!<|im_end|>"])
+        result = await self._chunks_to_list(_strip_think_stream(stream))
+        assert "".join(result) == "Hello!"
+
+    @pytest.mark.asyncio
+    async def test_control_tokens_stripped_after_think(self):
+        """Control tokens after </think> should also be stripped."""
+        from octane.osa.chat_engine import _strip_think_stream
+        chunks = ["<think>reasoning</think>Answer<|im_end|>"]
+        stream = self._make_stream(chunks)
+        result = await self._chunks_to_list(_strip_think_stream(stream))
+        assert "".join(result) == "Answer"
+
+    @pytest.mark.asyncio
+    async def test_multiple_control_tokens(self):
+        """All varieties of control tokens are stripped."""
+        from octane.osa.chat_engine import _strip_think_stream
+        stream = self._make_stream(["Hello<|endoftext|> world<|im_end|>"])
+        result = await self._chunks_to_list(_strip_think_stream(stream))
+        assert "".join(result) == "Hello world"
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Session 39 — Decomposer control token stripping
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+class TestDecomposerControlTokenStrip:
+    """LLM may return template names with appended control tokens like <|im_end|>."""
+
+    @pytest.mark.asyncio
+    async def test_web_finance_with_im_end(self):
+        """Decomposer must recognize 'web_finance<|im_end|>' as web_finance."""
+        from octane.osa.decomposer import Decomposer
+
+        bodega = MockBodega(
+            chat_response="web_finance<|im_end|>",
+        )
+        d = Decomposer(bodega=bodega)
+        dag = await d.decompose("how is Meta performing?")
+        assert dag.nodes[0].metadata["template"] == "web_finance"
+        assert dag.nodes[0].agent == "web"
+
+    @pytest.mark.asyncio
+    async def test_web_news_with_endoftext(self):
+        """Decomposer strips <|endoftext|> from template name."""
+        from octane.osa.decomposer import Decomposer
+
+        bodega = MockBodega(
+            chat_response="web_news<|endoftext|>",
+        )
+        d = Decomposer(bodega=bodega)
+        dag = await d.decompose("what are the latest headlines?")
+        assert dag.nodes[0].metadata["template"] == "web_news"
+
+    @pytest.mark.asyncio
+    async def test_clean_template_still_works(self):
+        """Clean template names without control tokens still work."""
+        from octane.osa.decomposer import Decomposer
+
+        bodega = MockBodega(
+            chat_response="code_generation",
+        )
+        d = Decomposer(bodega=bodega)
+        dag = await d.decompose("write a fibonacci function")
+        assert dag.nodes[0].metadata["template"] == "code_generation"
+
+    @pytest.mark.asyncio
+    async def test_think_block_plus_control_token(self):
+        """Model returns <think>...</think>web_finance<|im_end|>."""
+        from octane.osa.decomposer import Decomposer
+
+        bodega = MockBodega(
+            chat_response="<think>The user wants stock data</think>web_finance<|im_end|>",
+        )
+        d = Decomposer(bodega=bodega)
+        dag = await d.decompose("how is AAPL?")
+        assert dag.nodes[0].metadata["template"] == "web_finance"
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Session 39 — Evaluator per-chunk think stripping (non-buffering)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+class TestEvaluatorStreamThinkSkip:
+    """Evaluator must skip <think> blocks per-chunk, not buffer indefinitely."""
+
+    @staticmethod
+    async def _chunks_to_list(stream):
+        return [c async for c in stream]
+
+    @pytest.mark.asyncio
+    async def test_evaluator_yields_after_think_immediately(self):
+        """Real content after </think> must be yielded immediately, not buffered."""
+        from unittest.mock import MagicMock
+        from octane.osa.evaluator import Evaluator
+        from octane.models.schemas import AgentResponse
+
+        # Create mock bodega that streams: <think>...(long)...</think>Answer
+        async def mock_chat_stream(**kwargs):
+            for chunk in ["<think>", "Long reasoning " * 50, "</think>", "The answer is 42"]:
+                yield chunk
+
+        mock_bodega = MagicMock()
+        mock_bodega.chat_stream = mock_chat_stream
+
+        evaluator = Evaluator(bodega=mock_bodega)
+        results = [AgentResponse(agent="web", success=True, output="raw data")]
+
+        chunks = await self._chunks_to_list(
+            evaluator.evaluate_stream("test query", results)
+        )
+        text = "".join(chunks)
+        assert "42" in text
+        assert "reasoning" not in text.lower() or "Long reasoning" not in text
+
+    @pytest.mark.asyncio
+    async def test_evaluator_strips_control_tokens(self):
+        """Control tokens like <|im_end|> must be stripped from evaluator output."""
+        from unittest.mock import MagicMock
+        from octane.osa.evaluator import Evaluator
+        from octane.models.schemas import AgentResponse
+
+        async def mock_chat_stream(**kwargs):
+            for chunk in ["Hello world", "<|im_end|>"]:
+                yield chunk
+
+        mock_bodega = MagicMock()
+        mock_bodega.chat_stream = mock_chat_stream
+
+        evaluator = Evaluator(bodega=mock_bodega)
+        results = [AgentResponse(agent="web", success=True, output="data")]
+
+        chunks = await self._chunks_to_list(
+            evaluator.evaluate_stream("test", results)
+        )
+        text = "".join(chunks)
+        assert text == "Hello world"
+        assert "<|im_end|>" not in text

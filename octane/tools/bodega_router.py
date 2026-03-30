@@ -102,6 +102,10 @@ class BodegaRouter:
         # Cache — {model_id: LoadedModel}.  Invalidated on TTL expiry or manual call.
         self._loaded_models: dict[str, LoadedModel] | None = None
         self._loaded_models_ts: float = 0.0  # monotonic timestamp of last fetch
+        # Chat mode: when True, auto-loading is disabled. All tiers resolve
+        # to the pinned REASON model.
+        self._chat_mode: bool = False
+        self._chat_reason_id: str | None = None  # exact model ID to pin in chat mode
         logger.debug("bodega_router_init", topology=self._topology.name)
 
     # ── Server health & wait ──────────────────────────────────────────────────
@@ -123,13 +127,28 @@ class BodegaRouter:
             max_attempts:  Stop after this many attempts (None = infinite).
         """
         attempt = 0
-        print(
+        # First probe: distinguish "server down" from "server up, no models"
+        initial_msg = (
             "\n[Octane] Bodega inference engine not reachable at "
             f"{self._client.base_url}\n"
-            "         Start the engine and Octane will pick it up automatically.\n",
-            file=sys.stderr,
-            flush=True,
+            "         Start the engine and Octane will pick it up automatically.\n"
         )
+        try:
+            probe = await self._client.health()
+            if probe.get("status") == "ok":
+                self._loaded_models = None
+                return
+            # Server responded but no model is ready yet — that's fine,
+            # prepare_for_chat() will load one.  Return immediately.
+            print(
+                "\n[Octane] Bodega is online (no models loaded yet).\n",
+                file=sys.stderr, flush=True,
+            )
+            self._loaded_models = None
+            return
+        except Exception:
+            pass
+        print(initial_msg, file=sys.stderr, flush=True)
         while True:
             attempt += 1
             if max_attempts is not None and attempt > max_attempts:
@@ -144,6 +163,16 @@ class BodegaRouter:
                         flush=True,
                     )
                     self._loaded_models = None  # force fresh discovery
+                    return
+                # Server responded (reachable) but no model loaded —
+                # return so prepare_for_chat() can load one.
+                if health.get("status") in ("unhealthy",):
+                    print(
+                        f"[Octane] Bodega is online (attempt {attempt}, no models loaded yet).\n",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    self._loaded_models = None
                     return
             except Exception:
                 pass
@@ -292,20 +321,26 @@ class BodegaRouter:
     ) -> str | None:
         """Resolve a tier to an actually-loaded model ID, or None.
 
-        Matching strategy (tried in order):
-          1. Direct match   — topology model_id == loaded model ID
-          2. Path match     — topology model_path.lower() == loaded ID.lower()
-                             handles Bodega registering models by full HF path
-          3. Tier-aware fallback:
-               ALL tiers  → prefer lm over multimodal (multimodal CB not yet
-                            supported by Bodega; avoids routing to vision models
-                            for text-only synthesis).
-          4. Auto-load — load the topology model from Bodega admin API if a
-             type-based fallback was not found.  Skipped for REASON when any
-             lm model is already available (prevents downloading a large model
-             when a capable lm is ready).
+        When ``_chat_mode`` is True, auto-loading is disabled and we return
+        the pinned REASON model ID (set by ``prepare_for_chat``), regardless
+        of what other models may be loaded.
         """
+        # In chat mode, never auto-load — use whatever is already loaded.
+        if self._chat_mode:
+            auto_load = False
+
         loaded = await self._fetch_loaded_models()
+
+        # Chat-mode fast path: return the pinned REASON model for any tier.
+        if self._chat_mode and self._chat_reason_id:
+            # Verify the pinned model is still loaded; if not, fall through.
+            if self._chat_reason_id in loaded:
+                return self._chat_reason_id
+            # Also check by path match (Bodega may report a different ID form)
+            for loaded_id in loaded:
+                if self._chat_reason_id.lower() in loaded_id.lower() or loaded_id.lower() in self._chat_reason_id.lower():
+                    return loaded_id
+            logger.warning("chat_mode_pinned_model_not_found", pinned=self._chat_reason_id, loaded=list(loaded.keys()))
 
         if not loaded:
             if auto_load:
@@ -410,57 +445,33 @@ class BodegaRouter:
 
     # ── Chat premium mode ─────────────────────────────────────────────────────
 
-    async def prepare_for_chat(
-        self,
-        *,
-        on_status: Any | None = None,
-    ) -> dict[str, Any]:
+    async def prepare_for_chat(self) -> dict[str, Any]:
         """Prepare the inference engine for chat premium mode.
 
-        Unloads all models except REASON, then ensures the REASON-tier
-        model is loaded.  Returns a status dict with details.
+        1. Check what models are loaded.
+        2. Unload ALL of them.
+        3. Load the REASON-tier model.
 
-        Args:
-            on_status: Optional callable(msg: str) for progress messages.
+        Returns a status dict: ``{"model": str|None, "unloaded": list[str]}``.
         """
-        def _emit(msg: str) -> None:
-            if on_status:
-                on_status(msg)
-
-        result: dict[str, Any] = {
-            "unloaded": [],
-            "loaded_model": None,
-            "already_ready": False,
-        }
-
         reason_cfg = self._topology.resolve_config(ModelTier.REASON)
         reason_id = reason_cfg.model_id
-        reason_path = reason_cfg.model_path
 
+        result: dict[str, Any] = {"model": None, "unloaded": []}
+
+        # 1. Check loaded models
         loaded = await self._fetch_loaded_models()
-        if not loaded:
-            _emit("No models currently loaded")
+        loaded_ids = list(loaded.keys())
 
-        # Check if REASON is already the only model loaded
-        loaded_ids = set(loaded.keys())
-        reason_already = reason_id in loaded_ids or any(
-            lid.lower() == reason_path.lower() for lid in loaded_ids
-        )
-
-        non_reason = [
-            mid for mid in loaded_ids
-            if mid != reason_id and mid.lower() != reason_path.lower()
-        ]
-
-        if reason_already and not non_reason:
-            result["already_ready"] = True
-            result["loaded_model"] = reason_id
-            _emit(f"{reason_id} already loaded exclusively")
+        # If REASON is the only model loaded, nothing to do.
+        if loaded_ids == [reason_id]:
+            result["model"] = reason_id
+            self._chat_mode = True
+            self._chat_reason_id = reason_id
             return result
 
-        # Unload all non-REASON models
-        for model_id in non_reason:
-            _emit(f"Unloading {model_id}...")
+        # 2. Unload ALL loaded models
+        for model_id in loaded_ids:
             try:
                 await self._client.unload_model_by_id(model_id)
                 result["unloaded"].append(model_id)
@@ -470,25 +481,25 @@ class BodegaRouter:
 
         self.invalidate_model_cache()
 
-        # Load REASON if not already loaded
-        if not reason_already:
-            _emit(f"Loading {reason_id}...")
-            try:
-                params = reason_cfg.to_load_params()
-                client = await self._client._get_client()
-                resp = await client.post("/v1/admin/load-model", json=params)
-                resp.raise_for_status()
-                load_result = resp.json()
-                if load_result.get("status") == "loaded":
-                    self.invalidate_model_cache()
-                    result["loaded_model"] = reason_id
-                    _emit(f"{reason_id} loaded")
-                else:
-                    logger.warning("chat_reason_load_unexpected", result=load_result)
-            except Exception as exc:
-                logger.warning("chat_reason_load_failed", error=str(exc))
-        else:
-            result["loaded_model"] = reason_id
+        # 3. Load REASON
+        try:
+            params = reason_cfg.to_load_params()
+            client = await self._client._get_client()
+            resp = await client.post("/v1/admin/load-model", json=params)
+            resp.raise_for_status()
+            load_result = resp.json()
+            if load_result.get("status") == "loaded":
+                self.invalidate_model_cache()
+                result["model"] = reason_id
+            else:
+                logger.warning("chat_reason_load_unexpected", result=load_result)
+        except Exception as exc:
+            logger.warning("chat_reason_load_failed", error=str(exc))
+
+        # Enable chat mode — prevent auto-loading other models
+        if result["model"]:
+            self._chat_mode = True
+            self._chat_reason_id = result["model"]
 
         return result
 
@@ -690,6 +701,10 @@ class BodegaRouter:
             "temperature": temperature,
             "max_tokens": max_tokens,
             "stream": True,
+            # Qwen3 models: suppress <think> reasoning in output.
+            # The client-side _strip_think_stream filter handles cases
+            # where the server ignores this parameter.
+            "chat_template_kwargs": {"enable_thinking": False},
         }
 
         async with httpx.AsyncClient(

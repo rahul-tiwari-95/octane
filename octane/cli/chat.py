@@ -31,9 +31,13 @@ def register(app: typer.Typer) -> None:
 
 def chat(
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Enable debug logging"),
+    dev_mode: bool = typer.Option(False, "--dev-mode", "--dev", help="Developer mode: show all logs and intent classifications"),
 ):
     """💬 Interactive multi-turn chat session with Octane."""
-    if not verbose:
+    if dev_mode:
+        from octane.utils import setup_logging
+        setup_logging(level_override="debug")
+    elif not verbose:
         # Chat mode suppresses info-level logs for a clean UX.
         # Only warnings/errors will appear.
         from octane.utils import setup_logging
@@ -41,10 +45,10 @@ def chat(
     else:
         from octane.utils import setup_logging
         setup_logging(level_override="debug")
-    asyncio.run(_chat())
+    asyncio.run(_chat(dev_mode=dev_mode))
 
 
-async def _chat():
+async def _chat(dev_mode: bool = False):
     from octane.osa.orchestrator import Orchestrator
     from octane.osa.chat_engine import ChatEngine
     from octane.tools.topology import detect_topology, get_topology, ModelTier
@@ -69,58 +73,40 @@ async def _chat():
     assistant_name = persona.get("assistant_name", "octane")
     display_name = assistant_name.capitalize()
 
-    # ── Premium mode banner ──────────────────────────────────────────────
+    # ── Detect topology ──────────────────────────────────────────────────
     topo_name = detect_topology()
     topo = get_topology(topo_name)
     reason_cfg = topo.resolve_config(ModelTier.REASON)
-
-    console.print(Panel(
-        f"[bold green]{display_name} Chat[/]\n"
-        "[dim]Chat is Octane's premium mode — natural conversation that\n"
-        "spawns commands, searches, and analysis behind the scenes.\n\n"
-        f"[yellow]⚡ Will load [bold]{reason_cfg.model_id}[/bold] exclusively.\n"
-        "   Other models will be unloaded to free memory.\n"
-        "   May require more RAM and energy on battery.[/]\n\n"
-        "Type your message and press Enter. "
-        "Use [bold cyan]/help[/bold cyan] for slash commands, "
-        f"[bold]exit[/bold] or [bold]quit[/bold] to end.[/]",
-        border_style="green",
-    ))
 
     # ── Pre-flight: wait for Bodega ──────────────────────────────────────
     with console.status("[dim]Connecting to Bodega...[/]", spinner="dots"):
         status = await osa.pre_flight(wait_for_bodega=True)
 
-    # ── Prepare inference engine: unload all, load REASON ────────────────
-    if status["bodega_reachable"] and hasattr(osa.bodega, 'prepare_for_chat'):
-        with console.status(
-            f"[dim]Preparing {reason_cfg.model_id} for chat...[/]",
-            spinner="dots",
-        ):
-            prep = await osa.bodega.prepare_for_chat(
-                on_status=lambda msg: None,  # silent — spinner handles UI
+    if not status["bodega_reachable"]:
+        console.print(f"[yellow]⚠ {status.get('note', 'Bodega offline')}[/]")
+    else:
+        # ── Prepare: unload everything, load REASON ──────────────────
+        console.print(
+            f"[bold yellow]Please wait, Octane is initializing "
+            f"{reason_cfg.model_id}...[/]"
+        )
+        prep = await osa.bodega.prepare_for_chat()
+        if prep.get("model"):
+            console.print(f"[green]✓[/] [bold]{prep['model']}[/] ready")
+        else:
+            console.print(
+                f"[yellow]⚠ Could not load {reason_cfg.model_id}. "
+                "Chat will use the best available model.[/]"
             )
 
-        if prep.get("already_ready"):
-            console.print(f"[dim]🧠 {reason_cfg.model_id} ready · topology: {topo_name}[/]")
-        else:
-            unloaded = prep.get("unloaded", [])
-            if unloaded:
-                console.print(f"[dim]  ⏏ Unloaded: {', '.join(unloaded)}[/]")
-            loaded = prep.get("loaded_model")
-            if loaded:
-                console.print(f"[dim]🧠 {loaded} loaded · topology: {topo_name}[/]")
-            else:
-                console.print(
-                    f"[yellow]⚠ Could not load {reason_cfg.model_id}. "
-                    "Chat will use the best available model.[/]"
-                )
-    elif status["bodega_reachable"] and status["model_loaded"]:
-        model_display = (status.get("model") or "").split("/")[-1] or "model loaded"
-        console.print(f"[dim]🧠 {model_display} ready · topology: {topo_name}[/]")
-    else:
-        note = status.get("note", "Bodega offline")
-        console.print(f"[yellow]⚠ {note}[/]")
+    # ── Banner ───────────────────────────────────────────────────────────
+    console.print(Panel(
+        f"[bold green]{display_name} Chat[/]\n"
+        "Type your message and press Enter. "
+        "Use [bold cyan]/help[/bold cyan] for slash commands, "
+        f"[bold]exit[/bold] or [bold]quit[/bold] to end.",
+        border_style="green",
+    ))
 
     console.print()  # blank line before first prompt
 
@@ -285,6 +271,26 @@ async def _chat():
             conversation_history = conversation_history[-12:]
 
     console.print(f"[dim]Session {session_id} — {turn} turn(s)[/]")
+
+    # ── Cleanup: unload all models loaded during the session ──────────────
+    with console.status("[dim]Unloading models to free memory...[/]", spinner="dots"):
+        try:
+            loaded = await osa.bodega.list_models()
+            model_ids = [
+                m["id"] for m in loaded.get("data", [])
+                if isinstance(m, dict) and "id" in m
+            ]
+            for mid in model_ids:
+                try:
+                    await osa.bodega._client.unload_model_by_id(mid)
+                    console.print(f"[dim]✓ {mid} unloaded[/]")
+                except Exception:
+                    pass
+            osa.bodega._chat_mode = False
+            osa.bodega._chat_reason_id = None
+            osa.bodega.invalidate_model_cache()
+        except Exception:
+            pass
 
 
 def _print_synapse_trace(synapse, correlation_id: str) -> None:

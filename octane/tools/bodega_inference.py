@@ -404,13 +404,26 @@ class BodegaInferenceClient:
     # ---- Health & Info ----
 
     async def health(self) -> dict[str, Any]:
-        """Check server health."""
+        """Check server health.
+
+        vLLM returns HTTP 503 with ``{"status": "unhealthy", ...}`` when the
+        server is running but no models are loaded.  We return that JSON body
+        as-is instead of converting it to a generic error so callers can
+        distinguish "server reachable, no models" from "server down".
+        """
         for attempt in range(2):
             client = await self._get_client()
             try:
                 response = await client.get("/health")
+                # Return the JSON body even for non-2xx (e.g. 503 "unhealthy")
+                try:
+                    body = response.json()
+                except Exception:
+                    body = None
+                if body and isinstance(body, dict) and "status" in body:
+                    return body
                 response.raise_for_status()
-                return response.json()
+                return {"status": "ok"}
             except (BrokenPipeError, ConnectionResetError, OSError,
                     httpx.ConnectError, httpx.RemoteProtocolError) as e:
                 if attempt == 0:

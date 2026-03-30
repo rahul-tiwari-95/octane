@@ -196,7 +196,7 @@ class BodegaIntelClient:
         """
         try:
             response = await self._request(
-                "get", "/api/v1/news/search",
+                "get", "/api/v1/news/api/v1/news/search",
                 params={
                     "q": query,
                     "period": period,
@@ -217,7 +217,7 @@ class BodegaIntelClient:
     async def news_headlines(self) -> dict[str, Any]:
         """Get top breaking news headlines."""
         try:
-            response = await self._request("get", "/api/v1/news/headlines")
+            response = await self._request("get", "/api/v1/news/api/v1/news/headlines")
             response.raise_for_status()
             return response.json()
         except httpx.HTTPError as e:
@@ -228,7 +228,7 @@ class BodegaIntelClient:
         """Get news by topic (TECHNOLOGY, BUSINESS, SCIENCE, etc.)."""
         try:
             response = await self._request(
-                "get", f"/api/v1/news/topics/{topic}",
+                "get", f"/api/v1/news/api/v1/news/topics/{topic}",
                 params={"period": period},
             )
             response.raise_for_status()
@@ -416,7 +416,7 @@ class BodegaIntelClient:
         """Get trending news topics."""
         try:
             response = await self._request(
-                "get","/api/v1/news/trending")
+                "get","/api/v1/news/api/v1/news/trending")
             response.raise_for_status()
             return response.json()
         except httpx.HTTPError as e:
@@ -428,7 +428,7 @@ class BodegaIntelClient:
         try:
             response = await self._request(
                 "get",
-                f"/api/v1/news/locations/{location}",
+                f"/api/v1/news/api/v1/news/locations/{location}",
                 params={"period": period},
             )
             response.raise_for_status()
@@ -442,7 +442,7 @@ class BodegaIntelClient:
         try:
             response = await self._request(
                 "get",
-                f"/api/v1/news/sites/{domain}",
+                f"/api/v1/news/api/v1/news/sites/{domain}",
                 params={"period": period},
             )
             response.raise_for_status()

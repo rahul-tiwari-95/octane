@@ -285,7 +285,7 @@ class CommandMapper:
             parts = []
             for entry in recent:
                 role = "User" if entry["role"] == "user" else "Assistant"
-                parts.append(f"{role}: {entry['content'][:100]}")
+                parts.append(f"{role}: {entry['content'][:300]}")
             context = "Recent conversation:\n" + "\n".join(parts) + "\n\n"
 
         prompt = f'{context}User request: "{query}"'

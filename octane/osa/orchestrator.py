@@ -99,22 +99,25 @@ class Orchestrator:
         try:
             health = await self.bodega.health()
             if health.get("status") != "ok" and wait_for_bodega:
-                # Server is down — wait until it comes up, then re-check
+                # Server is down or has no models — wait until it comes up
                 await self.bodega.wait_for_server()
                 health = await self.bodega.health()
 
-            if health.get("status") == "ok":
+            # Accept both "ok" (models loaded) and "unhealthy" with a valid
+            # HTTP response (server reachable but no models yet — prepare_for_chat
+            # will load one).
+            if health.get("status") == "ok" or ("status" in health and health["status"] != "error"):
                 status["bodega_reachable"] = True
 
                 model_info = await self.bodega.current_model()
-                if "error" not in model_info and model_info:
+                if "error" not in model_info and model_info and model_info.get("loaded"):
                     status["model_loaded"] = True
                     status["model"] = model_info.get("model_path") or model_info.get("model")
                     # Surface all loaded models for the topology display
                     status["all_models"] = model_info.get("all_models", [])
                 else:
-                    status["note"] = "Bodega reachable but no model loaded — LLM features disabled"
-                    logger.warning("bodega_no_model_loaded")
+                    status["note"] = "Bodega reachable, model will be loaded by prepare_for_chat"
+                    logger.info("bodega_reachable_no_model")
             else:
                 status["note"] = "Bodega server not reachable — using keyword fallback"
                 logger.warning("bodega_unreachable")

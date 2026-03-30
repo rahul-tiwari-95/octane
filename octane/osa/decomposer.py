@@ -244,7 +244,8 @@ class Decomposer:
         else:
             # No closing </think> — might be truncated. Strip any opening <think> and everything after it.
             cleaned = re.sub(r"<think>.*", "", raw, flags=re.DOTALL).strip()
-        
+        # Strip leaked model control tokens (e.g. <|im_end|>, <|endoftext|>)
+        cleaned = re.sub(r"<\|[^|]*\|>", "", cleaned).strip()        
         if not cleaned:
             # If we stripped everything, the model only produced <think> content — return None to fall back
             logger.warning("llm_returned_only_think_block", raw=raw[:100])
