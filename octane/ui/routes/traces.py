@@ -80,3 +80,29 @@ async def get_trace(trace_id: str) -> dict[str, Any]:
         "events": events,
         "event_count": len(events),
     }
+
+
+@router.get("/traces-events/recent")
+async def recent_events(limit: int = 200) -> dict[str, Any]:
+    """Return flattened recent Synapse events for globe seeding.
+
+    Reads the N most recent trace files and returns all their events,
+    sorted by timestamp descending, capped at *limit*.
+    """
+    if not _TRACE_DIR.is_dir():
+        return {"events": [], "total": 0}
+    trace_files = sorted(
+        _TRACE_DIR.glob("*.jsonl"),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
+    all_events: list[dict[str, Any]] = []
+    for tf in trace_files[:30]:  # read up to 30 recent traces
+        events = _load_trace(tf.stem)
+        all_events.extend(events)
+        if len(all_events) >= limit:
+            break
+    # Sort by timestamp descending, cap
+    all_events.sort(key=lambda e: e.get("timestamp", ""), reverse=True)
+    capped = all_events[:limit]
+    return {"events": capped, "total": len(capped)}

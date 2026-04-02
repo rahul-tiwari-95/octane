@@ -17,6 +17,12 @@ interface ModelsData {
   total_models: number;
 }
 
+interface DashboardData {
+  system: {
+    ram_total_gb: number;
+  };
+}
+
 function formatCtx(n: number): string {
   if (n >= 1024) return `${Math.round(n / 1024)}K`;
   return `${n}`;
@@ -29,7 +35,9 @@ function formatMem(mb: number): string {
 
 export function ModelPanel() {
   const { data } = useApi<ModelsData>('/api/models', 5000);
+  const { data: dashData } = useApi<DashboardData>('/api/dashboard', 10000);
 
+  const totalRamGb = dashData?.system?.ram_total_gb || 64;
   const statusColor = data?.engine_status === 'ok' ? 'var(--green)' : 'var(--red)';
   const statusLabel = data?.engine_status === 'ok' ? 'ONLINE' : 'OFFLINE';
 
@@ -84,7 +92,7 @@ export function ModelPanel() {
                 <div style={{ marginTop: '4px' }}>
                   <Gauge
                     label=""
-                    value={Math.min((m.memory_mb / 1024 / 64) * 100, 100)}
+                    value={Math.min((m.memory_mb / 1024 / totalRamGb) * 100, 100)}
                     color={m.type === 'multimodal' ? 'var(--purple)' : 'var(--cyan)'}
                     suffix="GB"
                   />

@@ -1,17 +1,23 @@
 """octane extract — Content extraction from YouTube, arXiv, PDF, EPUB.
 
 Usage:
-    octane extract "https://youtube.com/watch?v=..."
-    octane extract "2408.09869"                        # arXiv ID
-    octane extract ./path/to/paper.pdf --quality deep
-    octane extract ./path/to/book.epub
-    octane extract --search-youtube "attention mechanisms"
-    octane extract --search-arxiv "retrieval augmented generation"
+    octane extract run "https://youtube.com/watch?v=..."
+    octane extract run "2408.09869"                        # arXiv ID
+    octane extract run ./path/to/paper.pdf --quality deep
+    octane extract run ./path/to/book.epub
+    octane extract search-youtube "attention mechanisms"
+    octane extract search-arxiv "retrieval augmented generation"
+
+Pipe usage:
+    octane search web "NVDA" --json | octane extract stdin --json
+    octane search arxiv "RAG" --urls-only | octane extract stdin --json
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
+import sys
 
 import typer
 
@@ -31,6 +37,97 @@ def extract_run(
 ):
     """Extract content from a source and display results."""
     asyncio.run(_extract_run(source, quality, source_type, show_chunks, output, open_folder))
+
+
+@extract_app.command("stdin")
+def extract_stdin_cmd(
+    output_json: bool = typer.Option(False, "--json", help="Output structured JSON to stdout."),
+    quality: str = typer.Option("auto", help="Extraction quality: fast, deep, or auto."),
+    top_n: int = typer.Option(10, "--top-n", help="Max pages to extract."),
+):
+    """Read URLs from stdin and extract content.
+
+    Accepts two input formats:
+      1. Plain text — one URL per line
+      2. JSON — from ``octane search --json`` (reads .results[].url)
+
+    Examples::
+
+        octane search web "NVDA" --json | octane extract stdin --json
+        octane search arxiv "RAG" --urls-only | octane extract stdin --json
+        echo "https://example.com" | octane extract stdin
+    """
+    asyncio.run(_extract_stdin(output_json, quality, top_n))
+
+
+async def _extract_stdin(output_json: bool, quality: str, top_n: int):
+    from octane.agents.web.content_extractor import ContentExtractor
+
+    if sys.stdin.isatty():
+        print("Error: no input on stdin. Pipe data in.", file=sys.stderr)
+        raise typer.Exit(1)
+
+    raw_input = sys.stdin.read().strip()
+    if not raw_input:
+        print("Error: empty stdin.", file=sys.stderr)
+        raise typer.Exit(1)
+
+    urls: list[str] = []
+    # Try JSON first (from octane search --json)
+    try:
+        data = json.loads(raw_input)
+        if isinstance(data, dict) and "results" in data:
+            for r in data["results"]:
+                u = r.get("url", "")
+                if u:
+                    urls.append(u)
+        elif isinstance(data, list):
+            for item in data:
+                if isinstance(item, str):
+                    urls.append(item)
+                elif isinstance(item, dict):
+                    u = item.get("url", "")
+                    if u:
+                        urls.append(u)
+    except (json.JSONDecodeError, TypeError):
+        # Plain text — one URL/ID per line
+        for line in raw_input.splitlines():
+            line = line.strip()
+            if line and not line.startswith("#"):
+                urls.append(line)
+
+    if not urls:
+        print("Error: no URLs found in stdin.", file=sys.stderr)
+        raise typer.Exit(1)
+
+    extractor = ContentExtractor()
+    extracted = await extractor.extract_batch(urls[:top_n], top_n=top_n)
+    usable = [
+        a for a in extracted
+        if a.text and a.method not in ("unavailable", "failed")
+    ]
+
+    if output_json:
+        items = []
+        for a in usable:
+            items.append({
+                "url": a.url,
+                "title": a.title,
+                "text": a.text,
+                "word_count": a.word_count,
+                "method": a.method,
+            })
+        print(json.dumps({"extracted": items, "total": len(items)}, indent=2))
+    else:
+        from rich.panel import Panel
+        console.print(f"[bold]Extracted {len(usable)}/{len(urls)} pages[/]\n")
+        for a in usable:
+            preview = a.text[:300] + "..." if len(a.text) > 300 else a.text
+            console.print(Panel(
+                f"[dim]{a.url}[/]\n[bold]{a.title}[/]\n\n{preview}",
+                border_style="green",
+                title=f"{a.word_count:,} words · {a.method}",
+            ))
 
 
 @extract_app.command("youtube-login")

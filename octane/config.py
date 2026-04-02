@@ -34,6 +34,16 @@ class OctaneSettings(BaseSettings):
         description="API key for Bodega Intelligence (Bearer token)",
     )
 
+    # --- LAN Access ---
+    lan_access: bool = Field(
+        default=False,
+        description="Bind services to 0.0.0.0 for LAN access",
+    )
+    lan_token: str = Field(
+        default="",
+        description="Bearer token required for LAN API access",
+    )
+
     # --- Legacy per-service URLs (kept for fallback reference) ---
     bodega_search_url: str = Field(default="http://localhost:44469")
     bodega_finance_url: str = Field(default="http://localhost:44469")

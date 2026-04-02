@@ -36,7 +36,7 @@ export function Header() {
         }}>
           OCTANE
         </span>
-        <span style={{
+        <span className="header-subtitle" style={{
           color: 'var(--text-dim)',
           fontSize: '10px',
           letterSpacing: '2px',
@@ -49,6 +49,9 @@ export function Header() {
       <nav style={{ display: 'flex', gap: '4px' }}>
         <NavLink to="/" style={navStyle} end>
           Dashboard
+        </NavLink>
+        <NavLink to="/portfolio" style={navStyle}>
+          Portfolio
         </NavLink>
         <NavLink to="/terminal" style={navStyle}>
           Terminal
@@ -80,7 +83,7 @@ export function Header() {
           }} />
           {connected ? 'LIVE' : 'OFFLINE'}
         </span>
-        <span style={{
+        <span className="header-host" style={{
           color: 'var(--green-dim)',
           letterSpacing: '1px',
         }}>

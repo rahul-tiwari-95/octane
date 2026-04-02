@@ -39,3 +39,23 @@ sandbox/oct_env/
 *.dmg
 *.pkg
 *.iso
+
+# Sensitive / private data
+SessionHistory/
+test_runs/
+context/
+nvda_brief.json
+sample_data/
+assets/
+
+# Temporary test / debug scripts
+test_chatdb.py
+_test_pw_fetch.py
+comparison.md
+comparison2.md
+demo.cast
+demo.sh
+
+# Broken pip version pins (spurious files)
+=0.24
+=8.0

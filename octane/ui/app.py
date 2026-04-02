@@ -19,7 +19,7 @@ from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
-from octane.ui.routes import dashboard, models, traces, research, system, queries
+from octane.ui.routes import dashboard, models, traces, research, system, queries, portfolio_api, charts
 from octane.ui.routes.ws import router as ws_router
 from octane.ui.auth import router as auth_router
 
@@ -76,6 +76,8 @@ def create_app() -> FastAPI:
     app.include_router(research.router, prefix="/api")
     app.include_router(system.router, prefix="/api")
     app.include_router(queries.router, prefix="/api")
+    app.include_router(portfolio_api.router, prefix="/api")
+    app.include_router(charts.router, prefix="/api")
     app.include_router(auth_router, prefix="/api")
 
     # WebSocket routes

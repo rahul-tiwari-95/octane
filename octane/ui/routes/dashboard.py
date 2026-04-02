@@ -51,9 +51,21 @@ def _recent_traces(limit: int = 10) -> list[dict[str, Any]]:
         last = events[-1]
         query = ""
         for e in events:
-            if e.get("event_type") == "ingress":
-                query = e.get("payload", {}).get("query", "")[:120]
-                break
+            et = e.get("event_type", "")
+            p = e.get("payload", {})
+            if et == "ingress":
+                query = (
+                    p.get("query")
+                    or p.get("q")
+                    or p.get("text")
+                    or ""
+                )
+                if query:
+                    break
+            # Fallback: decomposition or dispatch events often carry the query
+            if not query and et in ("decomposition", "dispatch"):
+                query = p.get("original_query", "") or p.get("query", "")
+        query = query[:120]
         total_ms = sum(e.get("duration_ms", 0) for e in events)
         success = not any(e.get("error") for e in events)
         results.append({

@@ -81,6 +81,7 @@ class DaemonLifecycle:
 
         # Background tasks
         self._aging_task: asyncio.Task | None = None
+        self._imessage_shadow = None
 
     def resolve_topology(self) -> str:
         """Resolve 'auto' to actual topology name."""
@@ -638,6 +639,9 @@ class DaemonLifecycle:
             await self.model_manager.start()
             self._aging_task = asyncio.create_task(self._aging_loop())
 
+            # Start iMessage shadow if configured
+            await self._start_imessage_shadow()
+
             # Mark as running
             await self.state.set_status(DaemonStatus.RUNNING)
 
@@ -687,6 +691,13 @@ class DaemonLifecycle:
             await self.state.set_status(DaemonStatus.STOPPING)
 
         # Stop background tasks
+        if self._imessage_shadow:
+            try:
+                await self._imessage_shadow.stop()
+                logger.info("imessage_shadow_stopped")
+            except Exception as exc:
+                logger.warning("imessage_shadow_stop_error", error=str(exc))
+
         if self._aging_task and not self._aging_task.done():
             self._aging_task.cancel()
             try:
@@ -724,6 +735,44 @@ class DaemonLifecycle:
 
     async def _aging_loop(self) -> None:
         """Background task: periodic priority aging for queued tasks."""
+
+    async def _start_imessage_shadow(self) -> None:
+        """Start iMessage shadow if config exists and is enabled."""
+        import json as _json
+
+        config_file = Path.home() / ".octane" / "macos" / "imessage" / "config.json"
+        if not config_file.exists():
+            return
+
+        try:
+            cfg = _json.loads(config_file.read_text())
+        except (ValueError, OSError):
+            return
+
+        if not cfg.get("enabled"):
+            return
+
+        contacts = cfg.get("approved_contacts", [])
+        if not contacts:
+            return
+
+        try:
+            from octane.macos.imessage_shadow import IMessageShadow
+
+            shadow = IMessageShadow(
+                approved_contacts=contacts,
+                allow_self=cfg.get("allow_self", False),
+                poll_interval=cfg.get("poll_interval", 5.0),
+            )
+            await shadow.start()
+            self._imessage_shadow = shadow
+            logger.info(
+                "imessage_shadow_started",
+                contacts=len(contacts),
+                allow_self=cfg.get("allow_self", False),
+            )
+        except Exception as exc:
+            logger.warning("imessage_shadow_start_failed", error=str(exc))
         try:
             while True:
                 await asyncio.sleep(AGING_INTERVAL_SEC)

@@ -19,6 +19,7 @@ def register_all(app: typer.Typer) -> None:
         extract,
         files,
         health,
+        macos,
         model,
         portfolio,
         power,
@@ -26,8 +27,10 @@ def register_all(app: typer.Typer) -> None:
         project,
         recall,
         research,
+        search,
         stats,
         store,
+        synthesize,
         trace,
         ui,
         vault,
@@ -61,5 +64,8 @@ def register_all(app: typer.Typer) -> None:
     app.add_typer(portfolio.portfolio_app, name="portfolio")
     app.add_typer(extract.extract_app,   name="extract")
     app.add_typer(recall.recall_app,     name="recall")
+    app.add_typer(search.search_app,     name="search")
+    app.add_typer(synthesize.synthesize_app, name="synthesize")
     app.add_typer(ui.ui_app,             name="ui")
+    app.add_typer(macos.macos_app,       name="macos")
     audit.register(app)

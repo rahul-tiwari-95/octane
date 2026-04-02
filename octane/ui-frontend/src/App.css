@@ -67,23 +67,71 @@
 }
 
 /* ── Responsive ── */
-@media (max-width: 1100px) {
+
+/* Tablet: 768–1200px — 2-column layout, smaller globe */
+@media (max-width: 1200px) {
   .hero-row {
-    grid-template-columns: 1fr;
+    grid-template-columns: 1fr 1fr;
   }
 
-  .cell-globe,
-  .cell-vitals,
-  .cell-models {
+  .cell-vitals {
     grid-column: 1;
   }
 
+  .cell-models {
+    grid-column: 2;
+  }
+
   .cell-globe {
+    grid-column: 1 / -1;
     min-height: 350px;
   }
 
   .bottom-row {
+    grid-template-columns: 1fr 1fr;
+  }
+}
+
+/* Mobile: <768px — single column, hide globe */
+@media (max-width: 768px) {
+  .app-main {
+    padding: 8px;
+    overflow-y: auto;
+  }
+
+  .hero-row {
     grid-template-columns: 1fr;
+    gap: 8px;
+  }
+
+  .cell-vitals,
+  .cell-models,
+  .cell-globe {
+    grid-column: 1;
+  }
+
+  .cell-globe {
+    display: none;  /* globe too heavy for mobile */
+  }
+
+  .bottom-row {
+    grid-template-columns: 1fr;
+    gap: 8px;
+  }
+
+  .cell-events {
+    max-height: 300px;
+  }
+}
+
+/* Mobile header adjustments */
+@media (max-width: 600px) {
+  header {
+    padding: 0 10px !important;
+  }
+  .header-subtitle,
+  .header-host {
+    display: none;
   }
 }
 
@@ -97,4 +145,66 @@
 .app-main::-webkit-scrollbar-thumb {
   background: var(--border);
   border-radius: 3px;
+}
+
+/* ── Portfolio Grid ── */
+.portfolio-grid {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 12px;
+}
+
+.pf-row {
+  display: grid;
+  gap: 12px;
+}
+
+.pf-row-top {
+  grid-template-columns: 1fr 1fr 1fr;
+}
+
+.pf-row-mid {
+  grid-template-columns: 1.5fr 1fr;
+}
+
+.pf-row-holdings {
+  grid-template-columns: 1fr;
+}
+
+.pf-row-research {
+  grid-template-columns: 1fr 1.2fr 0.8fr;
+}
+
+.pf-cell {
+  min-height: 0;
+  overflow: hidden;
+}
+
+/* Portfolio responsive: tablet */
+@media (max-width: 1200px) {
+  .pf-row-top {
+    grid-template-columns: 1fr 1fr;
+  }
+  .pf-corr {
+    grid-column: 1 / -1;
+  }
+  .pf-row-research {
+    grid-template-columns: 1fr 1fr;
+  }
+  .pf-trust {
+    grid-column: 1 / -1;
+  }
+}
+
+/* Portfolio responsive: mobile */
+@media (max-width: 768px) {
+  .pf-row-top,
+  .pf-row-mid,
+  .pf-row-research {
+    grid-template-columns: 1fr;
+  }
+  .pf-corr,
+  .pf-trust {
+    grid-column: 1;
+  }
 }

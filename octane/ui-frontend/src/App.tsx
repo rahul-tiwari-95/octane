@@ -1,6 +1,7 @@
 import { BrowserRouter, useLocation } from 'react-router-dom';
 import { Header } from './components/Header';
 import { Dashboard } from './pages/Dashboard';
+import { PortfolioPage } from './pages/PortfolioPage';
 import { TerminalPage } from './pages/TerminalPage';
 import { EventsProvider } from './context/EventsContext';
 import './App.css';
@@ -8,13 +9,18 @@ import './App.css';
 function AppContent() {
   const location = useLocation();
   const onTerminal = location.pathname.startsWith('/terminal');
+  const onPortfolio = location.pathname.startsWith('/portfolio');
+  const onDashboard = !onTerminal && !onPortfolio;
 
   return (
     <div className="app-shell">
       <Header />
       <main className="app-main">
         {/* Dashboard: mount/unmount with route */}
-        {!onTerminal && <Dashboard />}
+        {onDashboard && <Dashboard />}
+
+        {/* Portfolio: mount/unmount with route */}
+        {onPortfolio && <PortfolioPage />}
 
         {/* Terminal: always mounted, CSS show/hide for session persistence */}
         <div style={{

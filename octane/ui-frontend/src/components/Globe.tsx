@@ -211,6 +211,7 @@ export function Globe() {
   const [globeMaterial] = useState(
     () => new MeshPhongMaterial({ color: '#080818', transparent: true, opacity: 0.9 }),
   );
+  const [historicalPoints, setHistoricalPoints] = useState<DataPoint[]>([]);
 
   // Auto-rotate
   useEffect(() => {
@@ -221,6 +222,20 @@ export function Globe() {
         controls.autoRotateSpeed = 0.3;
       }
     }
+  }, []);
+
+  // Seed globe with historical events on mount
+  useEffect(() => {
+    fetch('/api/traces-events/recent?limit=200')
+      .then((res) => (res.ok ? res.json() : { events: [] }))
+      .then((data) => {
+        const pts: DataPoint[] = [];
+        for (const event of (data.events || [])) {
+          pts.push(...eventToPoints(event as SynapseEvent));
+        }
+        setHistoricalPoints(pts.slice(-120));
+      })
+      .catch(() => {});
   }, []);
 
   // Always show ambient baseline nodes so globe never looks empty
@@ -246,8 +261,8 @@ export function Globe() {
   }, [events]);
 
   const dataPoints = useMemo(
-    () => [...ambientPoints, ...eventPoints],
-    [ambientPoints, eventPoints],
+    () => [...ambientPoints, ...historicalPoints, ...eventPoints],
+    [ambientPoints, historicalPoints, eventPoints],
   );
 
   // Rings — pulsing circles at the 5 most recent event locations
