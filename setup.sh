@@ -23,6 +23,39 @@ echo -e "${BOLD}${BLUE}🔥  Octane Setup${NC}  —  Apple Silicon"
 echo -e "    $(date '+%Y-%m-%d %H:%M')"
 echo ""
 
+# ── Platform checks ───────────────────────────────────────────────────────────
+[[ "$(uname -s)" == "Darwin" ]] || fail "Octane requires macOS"
+[[ "$(uname -m)" == "arm64" ]] || fail "Octane requires Apple Silicon (arm64)"
+
+MACOS_MAJOR="$(sw_vers -productVersion | cut -d. -f1)"
+if [[ "${MACOS_MAJOR}" -lt 16 ]]; then
+  fail "Octane requires macOS Tahoe 16.x or newer because BodegaOS Sensors depends on it"
+fi
+
+# ── Preflight: BodegaOS Sensors ────────────────────────────────────────────────
+# Octane depends on BodegaOS Sensors for all AI inference.
+# It is a native macOS app distributed as a .dmg — not a pip package.
+BODEGA_RUNNING=$(curl -sf http://localhost:44468/health 2>/dev/null | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('status',''))" 2>/dev/null || echo "")
+if [[ "${BODEGA_RUNNING}" == "ok" ]]; then
+  echo -e "  ${GREEN}✓${NC}  BodegaOS Sensors is running at localhost:44468"
+else
+  echo -e "  ${YELLOW}!${NC}  BodegaOS Sensors not detected at localhost:44468"
+  echo ""
+  echo -e "  Octane requires ${BOLD}BodegaOS Sensors${NC} for AI inference."
+  echo -e "  To install it, run:"
+  echo ""
+  echo -e "      ${YELLOW}bash scripts/install_sensors.sh${NC}"
+  echo ""
+  echo -e "  That script will download the correct .dmg for your Mac,"
+  echo -e "  guide you through installation, and wait until the Inference"
+  echo -e "  Engine toggle turns green before continuing."
+  echo ""
+  echo -e "  ${BOLD}Press Enter to continue setup anyway${NC} (you can install"
+  echo -e "  BodegaOS Sensors later and then run: octane health)"
+  read -r _
+fi
+echo ""
+
 # ── Parse flags ────────────────────────────────────────────────────────────────
 SKIP_BREW=0
 SKIP_PLAYWRIGHT=0
@@ -37,7 +70,7 @@ done
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PYTHON="${REPO_ROOT}/.venv/bin/python3"
 
-# Homebrew prefix (works on both Apple Silicon and Intel)
+# Homebrew prefix
 BREW_PREFIX="$(brew --prefix 2>/dev/null || echo /opt/homebrew)"
 
 PG_VERSION="16"
@@ -251,26 +284,32 @@ else
   warn "Postgres:  not responding (start: brew services start postgresql@${PG_VERSION})"
 fi
 
-# Bodega
-BODEGA_STATUS=$(curl -sf http://localhost:44468/health 2>/dev/null | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('status','?'))" 2>/dev/null || echo "unreachable")
-if [[ "${BODEGA_STATUS}" == "ok" ]]; then
+# BodegaOS Sensors
+BODEGA_FINAL=$(curl -sf http://localhost:44468/health 2>/dev/null | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('status',''))" 2>/dev/null || echo "")
+if [[ "${BODEGA_FINAL}" == "ok" ]]; then
   MODEL_COUNT=$(curl -sf http://localhost:44468/health 2>/dev/null | python3 -c "import sys,json; d=json.load(sys.stdin); print(len(d.get('models_detail',[])))" 2>/dev/null || echo "?")
-  ok "Bodega:    localhost:44468 ✓  (${MODEL_COUNT} model(s) loaded)"
+  ok "BodegaOS:  localhost:44468 ✓  (${MODEL_COUNT} model(s) loaded)"
 else
-  warn "Bodega:    not running — start it separately, then run: octane health"
+  warn "BodegaOS:  not running"
+  warn "           Install: bash scripts/install_sensors.sh"
+  warn "           Then launch BodegaOS Sensors and enable the Inference Engine toggle"
 fi
 
 # ── 6. Final summary ───────────────────────────────────────────────────────────
 echo ""
 echo -e "${BOLD}${GREEN}✅  Setup complete${NC}"
 echo ""
-echo -e "  Commands available via: ${YELLOW}.venv/bin/octane${NC}  or  ${YELLOW}python3 -m octane${NC}"
+echo -e "  Activate: ${YELLOW}source .venv/bin/activate${NC}"
 echo ""
 echo -e "  ${BOLD}Quick start:${NC}"
-echo -e "    ${YELLOW}python3 -m octane health${NC}                       # system status"
-echo -e "    ${YELLOW}python3 -m octane ask 'NVDA stock price'${NC}       # single query"
-echo -e "    ${YELLOW}python3 -m octane investigate 'Is NVDA overvalued'${NC} # deep research"
+echo -e "    ${YELLOW}octane health${NC}                                  # system status"
+echo -e "    ${YELLOW}octane ask 'hello'${NC}                             # quick test"
+echo -e "    ${YELLOW}octane ask 'explain transformers' --deep 4${NC}     # deep research"
+echo -e "    ${YELLOW}octane ui start${NC}                                # Mission Control → localhost:44480"
 echo ""
 echo -e "  ${BOLD}Run tests:${NC}"
-echo -e "    ${YELLOW}.venv/bin/python3 -m pytest -q${NC}"
+echo -e "    ${YELLOW}python -m pytest -q${NC}"
+echo ""
+echo -e "  ${BOLD}Need BodegaOS Sensors?${NC}"
+echo -e "    ${YELLOW}bash scripts/install_sensors.sh${NC}"
 echo ""
